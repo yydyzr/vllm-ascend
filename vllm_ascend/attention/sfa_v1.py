@@ -21,7 +21,7 @@ from vllm.v1.attention.backend import (
 from vllm.v1.kv_cache_interface import AttentionSpec
 from vllm.v1.worker.utils import select_common_block_size
 
-from vllm_ascend.ascend_config import get_ascend_config
+from vllm_ascend.ascend_config import KV_OFFLOAD_MODE_FUSED_OVERLAP, get_ascend_config
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 from vllm_ascend.attention.attention_mask import AttentionMaskBuilder
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
@@ -310,6 +310,10 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
         )
         ascend_config = get_ascend_config()
         self.use_offload = ascend_config.use_offload
+        self.kv_offload_mode = ascend_config.kv_offload_mode
+        self.use_fused_overlap_offload = (
+            self.use_offload and self.kv_offload_mode == KV_OFFLOAD_MODE_FUSED_OVERLAP
+        )
 
         self.block_size = vllm_config.cache_config.block_size
         # Match the logical block size selected for BlockTable.
@@ -629,6 +633,10 @@ class AscendSFAImpl(MLAAttentionImpl):
 
         ascend_config = get_ascend_config()
         self.use_offload = ascend_config.use_offload
+        self.kv_offload_mode = ascend_config.kv_offload_mode
+        self.use_fused_overlap_offload = (
+            self.use_offload and self.kv_offload_mode == KV_OFFLOAD_MODE_FUSED_OVERLAP
+        )
         self.enable_shared_expert_dp = ascend_config.enable_shared_expert_dp
         self.vllm_config = get_current_vllm_config()
         kv_transfer_config = self.vllm_config.kv_transfer_config

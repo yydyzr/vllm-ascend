@@ -26,7 +26,7 @@ from vllm.v1.utils import CpuGpuBuffer
 from memfabric_hybrid import offload
 
 from vllm_ascend import envs
-from vllm_ascend.ascend_config import get_ascend_config
+from vllm_ascend.ascend_config import KV_OFFLOAD_MODE_FUSED_OVERLAP, get_ascend_config
 from vllm_ascend.distributed.kv_transfer.sfa_kv_offload.config_data import (
     SFAKVOffloadConnectorMetadata,
     LayerMultiBlockReqMeta,
@@ -164,6 +164,10 @@ class SFAKVOffloadWorker:
         self.pcp_rank = get_pcp_group().rank_in_group if self.pcp_size > 1 else 0
         ascend_config = get_ascend_config()
         self.use_offload = ascend_config.use_offload
+        self.kv_offload_mode = ascend_config.kv_offload_mode
+        self.use_fused_overlap_offload = (
+            self.use_offload and self.kv_offload_mode == KV_OFFLOAD_MODE_FUSED_OVERLAP
+        )
 
         self.kv_role = vllm_config.kv_transfer_config.kv_role
         self.group_block_sizes = self._infer_group_block_sizes(vllm_config, kv_cache_config)

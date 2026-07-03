@@ -13,7 +13,11 @@ from vllm.v1.kv_cache_interface import (
 )
 from vllm.v1.request import Request
 
-from vllm_ascend.ascend_config import get_ascend_config, init_ascend_config
+from vllm_ascend.ascend_config import (
+    KV_OFFLOAD_MODE_FUSED_OVERLAP,
+    get_ascend_config,
+    init_ascend_config,
+)
 from vllm_ascend.distributed.kv_transfer.sfa_kv_offload.config_data import (
     SFAKVOffloadConnectorMetadata,
     ReqMeta,
@@ -60,6 +64,10 @@ class SFAKVOffloadlScheduler:
         init_ascend_config(vllm_config)
         ascend_config = get_ascend_config()
         self.use_offload = ascend_config.use_offload
+        self.kv_offload_mode = ascend_config.kv_offload_mode
+        self.use_fused_overlap_offload = (
+            self.use_offload and self.kv_offload_mode == KV_OFFLOAD_MODE_FUSED_OVERLAP
+        )
         self.kv_role = vllm_config.kv_transfer_config.kv_role
         self.pcp_size = getattr(vllm_config.parallel_config, "prefill_context_parallel_size", 1)
         self.dcp_size = getattr(vllm_config.parallel_config, "decode_context_parallel_size", 1)

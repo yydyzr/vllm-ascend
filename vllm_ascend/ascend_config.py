@@ -24,6 +24,16 @@ if TYPE_CHECKING:
     from vllm.config import VllmConfig
 
 
+KV_OFFLOAD_MODE_LEGACY = "legacy"
+KV_OFFLOAD_MODE_FUSED_OVERLAP = "fused_overlap"
+VALID_KV_OFFLOAD_MODES = frozenset(
+    {
+        KV_OFFLOAD_MODE_LEGACY,
+        KV_OFFLOAD_MODE_FUSED_OVERLAP,
+    }
+)
+
+
 class LRUResidentCacheConfig:
     """
     Configuration for the compact LRU resident KV cache path.
@@ -347,6 +357,21 @@ class AscendConfig:
         self.rejection_sampler_config = RejectionSamplerConfig(rejection_sampler_config)
 
         self.use_offload = bool(additional_config.get("use_offload", False))
+        if self.use_offload:
+            self.kv_offload_mode = additional_config.get("kv_offload_mode", KV_OFFLOAD_MODE_LEGACY)
+            if not isinstance(self.kv_offload_mode, str):
+                raise ValueError(
+                    f"additional_config.kv_offload_mode must be a string, "
+                    f"got {type(self.kv_offload_mode).__name__}."
+                )
+            if self.kv_offload_mode not in VALID_KV_OFFLOAD_MODES:
+                valid_modes = ", ".join(sorted(VALID_KV_OFFLOAD_MODES))
+                raise ValueError(
+                    f"Unsupported kv_offload_mode: {self.kv_offload_mode!r}. "
+                    f"Supported modes are: {valid_modes}."
+                )
+        else:
+            self.kv_offload_mode = KV_OFFLOAD_MODE_LEGACY
         self.lru_resident_cache_config = LRUResidentCacheConfig(
             additional_config.get("lru_resident_cache_config", {})
         )

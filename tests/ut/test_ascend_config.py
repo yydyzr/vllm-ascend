@@ -22,6 +22,8 @@ from vllm.config import KVTransferConfig, VllmConfig
 
 from tests.ut.base import TestBase
 from vllm_ascend.ascend_config import (
+    KV_OFFLOAD_MODE_FUSED_OVERLAP,
+    KV_OFFLOAD_MODE_LEGACY,
     ShortRequestFirstConfig,
     clear_ascend_config,
     get_ascend_config,
@@ -66,6 +68,7 @@ class TestAscendConfig(TestBase):
         ascend_config = init_ascend_config(test_vllm_config)
         self.assertFalse(ascend_config.multistream_overlap_shared_expert)
         self.assertFalse(ascend_config.enable_kv_nz)
+        self.assertEqual(ascend_config.kv_offload_mode, KV_OFFLOAD_MODE_LEGACY)
 
         ascend_compilation_config = ascend_config.ascend_compilation_config
         self.assertTrue(ascend_compilation_config.fuse_norm_quant)
@@ -88,10 +91,14 @@ class TestAscendConfig(TestBase):
             "eplb_config": {"num_redundant_experts": 2},
             "refresh": True,
             "enable_kv_nz": False,
+            "use_offload": True,
+            "kv_offload_mode": KV_OFFLOAD_MODE_FUSED_OVERLAP,
         }
         ascend_config = init_ascend_config(test_vllm_config)
         self.assertEqual(ascend_config.eplb_config.num_redundant_experts, 2)
         self.assertTrue(ascend_config.multistream_overlap_shared_expert)
+        self.assertTrue(ascend_config.use_offload)
+        self.assertEqual(ascend_config.kv_offload_mode, KV_OFFLOAD_MODE_FUSED_OVERLAP)
 
         ascend_compilation_config = ascend_config.ascend_compilation_config
         self.assertFalse(ascend_compilation_config.fuse_norm_quant)
@@ -408,6 +415,42 @@ class TestAscendConfig(TestBase):
         test_vllm_config.additional_config = {"dump_config": "/tmp/config.json"}
         with self.assertRaises(ValueError):
             init_ascend_config(test_vllm_config)
+
+    @_clean_up_ascend_config
+    @patch("vllm_ascend.platform.NPUPlatform.check_and_update_config")
+    def test_init_ascend_config_rejects_invalid_kv_offload_mode(self, mock_fix_incompatible_config):
+        test_vllm_config = VllmConfig()
+        test_vllm_config.additional_config = {
+            "use_offload": True,
+            "kv_offload_mode": "unknown",
+        }
+        with self.assertRaisesRegex(ValueError, "Unsupported kv_offload_mode"):
+            init_ascend_config(test_vllm_config)
+
+    @_clean_up_ascend_config
+    @patch("vllm_ascend.platform.NPUPlatform.check_and_update_config")
+    def test_init_ascend_config_rejects_non_string_kv_offload_mode(self, mock_fix_incompatible_config):
+        test_vllm_config = VllmConfig()
+        test_vllm_config.additional_config = {
+            "use_offload": True,
+            "kv_offload_mode": 1,
+        }
+        with self.assertRaisesRegex(ValueError, "kv_offload_mode must be a string"):
+            init_ascend_config(test_vllm_config)
+
+    @_clean_up_ascend_config
+    @patch("vllm_ascend.platform.NPUPlatform.check_and_update_config")
+    def test_init_ascend_config_ignores_kv_offload_mode_when_offload_disabled(
+        self, mock_fix_incompatible_config
+    ):
+        test_vllm_config = VllmConfig()
+        test_vllm_config.additional_config = {
+            "use_offload": False,
+            "kv_offload_mode": "unknown",
+        }
+        ascend_config = init_ascend_config(test_vllm_config)
+        self.assertFalse(ascend_config.use_offload)
+        self.assertEqual(ascend_config.kv_offload_mode, KV_OFFLOAD_MODE_LEGACY)
 
     @_clean_up_ascend_config
     @patch("vllm_ascend.platform.NPUPlatform.check_and_update_config")
