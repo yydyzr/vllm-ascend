@@ -45,7 +45,9 @@ def _make_vllm_config(kv_offload_mode: str):
         "use_offload": True,
         "kv_offload_mode": kv_offload_mode,
     }
+    vllm_config.kv_transfer_config = MagicMock()
     vllm_config.kv_transfer_config.kv_role = "kv_producer"
+    vllm_config.kv_transfer_config.kv_connector_extra_config = {}
     vllm_config.parallel_config.prefill_context_parallel_size = 1
     vllm_config.parallel_config.decode_context_parallel_size = 1
     init_ascend_config(vllm_config)
