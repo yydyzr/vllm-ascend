@@ -229,7 +229,43 @@ class SFAKVOffloadWorker:
         self.load_stream = torch_npu.npu.Stream()
         self.save_stream = None
         self.side_compute_stream = torch_npu.npu.Stream()
-        self.allocate_dram_size = 128 * 1024 * 1024 * 1024 # TODO get from config
+        if self.use_fused_overlap_offload:
+            self.fused_step_requests: list[ReqMeta] = []
+            self._fused_req_meta_by_id: dict[str, ReqMeta] = {}
+            self.d2h_save_event = torch_npu.npu.Event()
+            self.fused_offload_token_start_cpu = torch.full(
+                [self.max_num_reqs],
+                -1,
+                dtype=torch.int32,
+                device='cpu',
+                pin_memory=True,
+            )
+            self.fused_offload_num_tokens_cpu = torch.zeros(
+                [self.max_num_reqs],
+                dtype=torch.int32,
+                device='cpu',
+                pin_memory=True,
+            )
+            self.d2h_slot_mapping_cpu = torch.empty(
+                [self.max_num_tokens],
+                dtype=torch.int32,
+                device='cpu',
+                pin_memory=True,
+            )
+            self.d2h_token_to_req_cpu = torch.empty(
+                [self.max_num_tokens],
+                dtype=torch.int32,
+                device='cpu',
+                pin_memory=True,
+            )
+            self.d2h_cum_query_lens_cpu = torch.empty(
+                [self.max_num_reqs],
+                dtype=torch.int32,
+                device='cpu',
+                pin_memory=True,
+            )
+        dram_size_gb = 64 if self.use_fused_overlap_offload else 128
+        self.allocate_dram_size = dram_size_gb * 1024 * 1024 * 1024 # TODO get from config
         logger.info(
             f"SFAKVOffloadWoker start init CPU KV pool with {self.allocate_dram_size / 1024 / 1024 / 1024} GB dram, "
             "it might be time consuming, please wait."
@@ -389,12 +425,12 @@ class SFAKVOffloadWorker:
             else:
                 raise ValueError("SFA KV Offload only support layerwise now.")
 
-            if self.tp_rank == 0:
+            if self.tp_rank == 0 or self.use_fused_overlap_offload:
                 npu_block_num = self.num_blocks
                 # we need 4 * npu_blocks of cpu_blocks to fully store all offload blocks (dskv32, 512/128)
                 # but you may want to set this to 1 in debug case in case of allocating to much dram
                 # TODO remove this and directly compute from model config before merge
-                cpu_block_num_multiple = 4
+                cpu_block_num_multiple = 1 if self.use_fused_overlap_offload else 4
                 cpu_block_num = npu_block_num * cpu_block_num_multiple
                 cpu_cache_size = cpu_block_num * self.block_size * (512 + 64) * torch.bfloat16.itemsize * self.num_layers
                 logger.info(f'KV offload allocate {cpu_block_num} cpu blocks, size = {cpu_cache_size / 1024 / 1024 / 1024} GB')
@@ -522,19 +558,25 @@ class SFAKVOffloadWorker:
             # sparse h2d (sparse_copy related)
             self.addr_k_bases: list[int] = [t.data_ptr() for t in self.topk_buffers_k]
             self.addr_v_bases: list[int] = [t.data_ptr() for t in self.topk_buffers_v]
-            self.gvas_k_bases: list[int] = []
-            self.gvas_v_bases: list[int] = []
-            gvas_k_tensor = torch.zeros([self.num_layers], dtype=torch.int64, device='npu')
-            gvas_v_tensor = torch.zeros([self.num_layers], dtype=torch.int64, device='npu')
-            if self.tp_rank == 0:
+            if self.use_fused_overlap_offload:
+                self.gvas_k_bases = [t.data_ptr() for t in self.k_caches_cpu]
+                self.gvas_v_bases = [t.data_ptr() for t in self.v_caches_cpu]
+                self.npu_k_bases = [t.data_ptr() for t in self.k_caches_npu]
+                self.npu_v_bases = [t.data_ptr() for t in self.v_caches_npu]
+            else:
+                self.gvas_k_bases = []
+                self.gvas_v_bases = []
+                gvas_k_tensor = torch.zeros([self.num_layers], dtype=torch.int64, device='npu')
+                gvas_v_tensor = torch.zeros([self.num_layers], dtype=torch.int64, device='npu')
+                if self.tp_rank == 0:
+                    for layer_id in range(self.num_layers):
+                        gvas_k_tensor[layer_id] = self.k_caches_cpu[layer_id].data_ptr()
+                        gvas_v_tensor[layer_id] = self.v_caches_cpu[layer_id].data_ptr()
+                self.tp_group.broadcast(gvas_k_tensor, src=0)
+                self.tp_group.broadcast(gvas_v_tensor, src=0)
                 for layer_id in range(self.num_layers):
-                    gvas_k_tensor[layer_id] = self.k_caches_cpu[layer_id].data_ptr()
-                    gvas_v_tensor[layer_id] = self.v_caches_cpu[layer_id].data_ptr()
-            self.tp_group.broadcast(gvas_k_tensor, src=0)
-            self.tp_group.broadcast(gvas_v_tensor, src=0)
-            for layer_id in range(self.num_layers):
-                self.gvas_k_bases.append(gvas_k_tensor[layer_id].item())
-                self.gvas_v_bases.append(gvas_v_tensor[layer_id].item())
+                    self.gvas_k_bases.append(gvas_k_tensor[layer_id].item())
+                    self.gvas_v_bases.append(gvas_v_tensor[layer_id].item())
 
             gvas_buffer_offset = 0
             gvas_buffer_size_bytes = self.max_num_topk_rows * self.sfa_sparse_topk * 2 * 8 # 2: k+v, 8: int64
@@ -568,11 +610,60 @@ class SFAKVOffloadWorker:
             assert self.size_buffer_npu.shape == torch.Size([self.max_num_topk_rows * self.sfa_sparse_topk * 2])
             assert self.num_tokens_buffer_npu.shape == torch.Size([1])
 
+            if self.use_fused_overlap_offload:
+                # fused_overlap d2h: gvas/addr buffers follow H2D naming (CPU/NPU bases).
+                # batch_copy still copies gvas->addr, so pass addr(NPU src) first for D2H.
+                d2h_max_copies = self.max_num_tokens * 2
+                d2h_gvas_offset = 0
+                d2h_gvas_size_bytes = d2h_max_copies * 8
+                d2h_addr_offset = d2h_gvas_offset + d2h_gvas_size_bytes
+                d2h_addr_size_bytes = d2h_max_copies * 8
+                d2h_size_offset = d2h_addr_offset + d2h_addr_size_bytes
+                d2h_size_size_bytes = d2h_max_copies * 4
+                d2h_num_tokens_offset = d2h_size_offset + d2h_size_size_bytes
+                d2h_num_tokens_size_bytes = 4
+                d2h_batch_copy_args_size_bytes = (
+                    d2h_gvas_size_bytes + d2h_addr_size_bytes + d2h_size_size_bytes + d2h_num_tokens_size_bytes
+                )
+                self.d2h_batch_copy_args_buffer_cpu = torch.zeros(
+                    [d2h_batch_copy_args_size_bytes], dtype=torch.int8, device='cpu', pin_memory=True
+                )
+                self.d2h_batch_copy_args_buffer_npu = torch.zeros(
+                    [d2h_batch_copy_args_size_bytes], dtype=torch.int8, device='npu'
+                )
+                self.d2h_gvas_buffer_cpu = self.d2h_batch_copy_args_buffer_cpu[
+                    d2h_gvas_offset:d2h_gvas_offset + d2h_gvas_size_bytes
+                ].view(torch.int64)
+                self.d2h_addr_buffer_cpu = self.d2h_batch_copy_args_buffer_cpu[
+                    d2h_addr_offset:d2h_addr_offset + d2h_addr_size_bytes
+                ].view(torch.int64)
+                self.d2h_size_buffer_cpu = self.d2h_batch_copy_args_buffer_cpu[
+                    d2h_size_offset:d2h_size_offset + d2h_size_size_bytes
+                ].view(torch.int32)
+                self.d2h_num_tokens_buffer_cpu = self.d2h_batch_copy_args_buffer_cpu[
+                    d2h_num_tokens_offset:d2h_num_tokens_offset + d2h_num_tokens_size_bytes
+                ].view(torch.int32)
+                self.d2h_gvas_buffer_npu = self.d2h_batch_copy_args_buffer_npu[
+                    d2h_gvas_offset:d2h_gvas_offset + d2h_gvas_size_bytes
+                ].view(torch.int64)
+                self.d2h_addr_buffer_npu = self.d2h_batch_copy_args_buffer_npu[
+                    d2h_addr_offset:d2h_addr_offset + d2h_addr_size_bytes
+                ].view(torch.int64)
+                self.d2h_size_buffer_npu = self.d2h_batch_copy_args_buffer_npu[
+                    d2h_size_offset:d2h_size_offset + d2h_size_size_bytes
+                ].view(torch.int32)
+                self.d2h_num_tokens_buffer_npu = self.d2h_batch_copy_args_buffer_npu[
+                    d2h_num_tokens_offset:d2h_num_tokens_offset + d2h_num_tokens_size_bytes
+                ].view(torch.int32)
+
     def start_load_kv(self, metadata: SFAKVOffloadConnectorMetadata):
         # return
         self.current_layer_save = 0
         self.current_layer_load = 0
         req_id_to_block_ids: dict[str, list[int]] = {}
+        if self.use_fused_overlap_offload:
+            self.fused_step_requests = []
+            self._fused_req_meta_by_id = {}
         for layer_save_task in self.layer_save_tasks:
             layer_save_task.clear()
         self.pending_save_layer_ids.clear()
@@ -581,6 +672,11 @@ class SFAKVOffloadWorker:
             event.clear()
         for request in metadata.requests:
             req_id_to_block_ids[request.req_id] = request.block_ids_cpu
+            if self.use_fused_overlap_offload:
+                if request.offload_num_tokens > 0:
+                    self.fused_step_requests.append(request)
+                    self._fused_req_meta_by_id[request.req_id] = request
+                continue
             if self.tp_rank > 0 or request.num_new_offload_blocks <= 0:
                 continue # no new blocks to save
             self.process_layer_data(request)
@@ -604,6 +700,93 @@ class SFAKVOffloadWorker:
             cpu_block_table_np[i][:len(cpu_block_ids)] = np.array([cpu_block_ids], dtype=np.int32)
         self.cpu_block_table.copy_to_gpu(num_reqs)
 
+        if self.use_fused_overlap_offload:
+            self.fused_offload_token_start_cpu.fill_(-1)
+            self.fused_offload_num_tokens_cpu.zero_()
+            for req_idx, req_id in enumerate(self.req_ids[:num_reqs]):
+                req_meta = self._fused_req_meta_by_id.get(req_id)
+                if req_meta is None:
+                    continue
+                self.fused_offload_token_start_cpu[req_idx] = req_meta.offload_token_start
+                self.fused_offload_num_tokens_cpu[req_idx] = req_meta.offload_num_tokens
+
+    def _compute_step_offload_addrs_cpu(
+        self,
+        args: tuple[int, int, int],
+    ) -> None:
+        num_actual_tokens, num_reqs, layer_id = args
+        if num_actual_tokens <= 0:
+            self.d2h_num_tokens_buffer_cpu.zero_()
+            return
+
+        block_size_bytes_k = self.block_size * self.token_size_bytes_k
+        block_size_bytes_v = self.block_size * self.token_size_bytes_v
+        npu_k_base = self.npu_k_bases[layer_id]
+        npu_v_base = self.npu_v_bases[layer_id]
+        cpu_k_base = self.gvas_k_bases[layer_id]
+        cpu_v_base = self.gvas_v_bases[layer_id]
+
+        slots = self.d2h_slot_mapping_cpu[:num_actual_tokens]
+        token_to_req = self.d2h_token_to_req_cpu[:num_actual_tokens]
+        cum_query_lens = self.d2h_cum_query_lens_cpu[:num_reqs]
+        cpu_block_table = self.cpu_block_table_host_buffer[:num_reqs]
+        offload_token_start = self.fused_offload_token_start_cpu[:num_reqs]
+        offload_num_tokens = self.fused_offload_num_tokens_cpu[:num_reqs]
+
+        copy_idx = 0
+        for batch_idx in range(num_actual_tokens):
+            req_idx = int(token_to_req[batch_idx].item())
+            if req_idx < 0 or req_idx >= num_reqs:
+                continue
+            if int(offload_num_tokens[req_idx].item()) <= 0:
+                continue
+
+            query_start = 0 if req_idx == 0 else int(cum_query_lens[req_idx - 1].item())
+            local_offset = batch_idx - query_start
+            if local_offset < 0 or local_offset >= int(offload_num_tokens[req_idx].item()):
+                continue
+
+            slot = int(slots[batch_idx].item())
+            if slot < 0:
+                continue
+
+            global_pos = int(offload_token_start[req_idx].item()) + local_offset
+            npu_block_id = slot // self.block_size
+            offset_in_block = slot % self.block_size
+            cpu_block_idx = global_pos // self.block_size
+            cpu_block_id = int(cpu_block_table[req_idx, cpu_block_idx].item())
+            if cpu_block_id <= 0:
+                continue
+
+            self.d2h_gvas_buffer_cpu[copy_idx] = (
+                cpu_k_base
+                + cpu_block_id * block_size_bytes_k
+                + offset_in_block * self.token_size_bytes_k
+            )
+            self.d2h_addr_buffer_cpu[copy_idx] = (
+                npu_k_base
+                + npu_block_id * block_size_bytes_k
+                + offset_in_block * self.token_size_bytes_k
+            )
+            copy_idx += 1
+            self.d2h_gvas_buffer_cpu[copy_idx] = (
+                cpu_v_base
+                + cpu_block_id * block_size_bytes_v
+                + offset_in_block * self.token_size_bytes_v
+            )
+            self.d2h_addr_buffer_cpu[copy_idx] = (
+                npu_v_base
+                + npu_block_id * block_size_bytes_v
+                + offset_in_block * self.token_size_bytes_v
+            )
+            copy_idx += 1
+
+        num_k_copies = copy_idx // 2
+        if num_k_copies > 0:
+            self.d2h_size_buffer_cpu[:num_k_copies].fill_(self.token_size_bytes_k)
+            self.d2h_size_buffer_cpu[num_k_copies:copy_idx].fill_(self.token_size_bytes_v)
+        self.d2h_num_tokens_buffer_cpu[0] = copy_idx
+
     def save_cpu(self, layer_id: int | None = None) -> None:
         if layer_id is None:
             layer_id = self.current_layer_save
@@ -622,9 +805,71 @@ class SFAKVOffloadWorker:
         self.kv_send_thread.add_request(list(self.layer_save_tasks[layer_id]))
 
     def save_kv_layer(self, layer_name: str) -> None:
+        if self.use_fused_overlap_offload:
+            return
         if _is_current_stream_capturing():
             return
         self.save_cpu(self._get_offload_layer_id(layer_name))
+
+    def save_current_kv_tokens(
+        self,
+        layer_name: str,
+        slot_mapping: torch.Tensor,
+        token_to_req: torch.Tensor,
+        cum_query_lens: torch.Tensor,
+        num_actual_tokens: int,
+        num_reqs: int,
+        capturing: bool = False,
+    ) -> None:
+        """Immediately copy current-step main MLA KV tokens from NPU to CPU via batch_copy."""
+        if not self.use_fused_overlap_offload or num_actual_tokens <= 0 or num_reqs <= 0:
+            return
+        if not self.fused_step_requests:
+            return
+
+        layer_id = self._get_offload_layer_id(layer_name)
+        self.d2h_slot_mapping_cpu[:num_actual_tokens].copy_(
+            slot_mapping[:num_actual_tokens], non_blocking=capturing
+        )
+        self.d2h_token_to_req_cpu[:num_actual_tokens].copy_(
+            token_to_req[:num_actual_tokens], non_blocking=capturing
+        )
+        self.d2h_cum_query_lens_cpu[:num_reqs].copy_(
+            cum_query_lens[:num_reqs], non_blocking=capturing
+        )
+        self.cpu_block_table_host_buffer[:num_reqs].copy_(
+            self.cpu_block_table.gpu[:num_reqs], non_blocking=capturing
+        )
+
+        args = (num_actual_tokens, num_reqs, layer_id)
+        current_compute_stream = torch_npu.npu.current_stream()
+        if capturing:
+            subscribed_compute_streams = get_subscribed_compute_streams()
+            if current_compute_stream not in subscribed_compute_streams:
+                torch_npu.npu._subscribe_report(current_compute_stream)
+                subscribed_compute_streams.add(current_compute_stream)
+            torch_npu.npu._launch_host_func(
+                current_compute_stream,
+                self._compute_step_offload_addrs_cpu,
+                args,
+            )
+        else:
+            self._compute_step_offload_addrs_cpu(args)
+
+        self.d2h_batch_copy_args_buffer_npu.copy_(
+            self.d2h_batch_copy_args_buffer_cpu, non_blocking=capturing
+        )
+        # D2H: gvas/addr buffers use H2D naming (CPU/NPU); swap batch_copy args for NPU->CPU.
+        batch_copy(
+            self.d2h_addr_buffer_npu,
+            self.d2h_gvas_buffer_npu,
+            self.d2h_size_buffer_npu,
+            self.d2h_num_tokens_buffer_npu,
+            self.k_caches_npu[layer_id].device,
+        )
+        self.d2h_save_event.record(current_compute_stream)
+        if not capturing:
+            self.d2h_save_event.synchronize()
 
     def wait_for_save(self):
         assert self.use_layerwise

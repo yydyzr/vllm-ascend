@@ -34,6 +34,7 @@ from vllm_ascend.attention.utils import (
     enable_cp,
     get_sfa_qsfa_packed_head_dim,
     maybe_record_attention_compute_start,
+    maybe_save_current_kv_tokens_to_connector,
     maybe_save_kv_layer_to_connector,
     trans_rope_weight,
     transdata,
@@ -1266,6 +1267,45 @@ class AscendSFAImpl(MLAAttentionImpl):
     def _get_full_kv(self, k, attn_metadata):
         return k
 
+    def _maybe_save_current_kv_tokens_for_fused_overlap(
+        self,
+        layer_name: str,
+        kv_cache: tuple[torch.Tensor, ...] | None,
+        attn_metadata: M,
+        slot_mapping: torch.Tensor,
+        cum_query_lens: torch.Tensor,
+    ) -> None:
+        if not self.use_fused_overlap_offload or kv_cache is None:
+            return
+
+        num_actual_tokens = attn_metadata.num_actual_tokens
+        if num_actual_tokens <= 0:
+            return
+
+        num_reqs = attn_metadata.num_decodes + attn_metadata.num_prefills
+        if num_reqs <= 0:
+            return
+
+        if attn_metadata.token_to_req is None:
+            token_to_req = torch.arange(
+                num_actual_tokens,
+                dtype=torch.int32,
+                device=slot_mapping.device,
+            )
+        else:
+            token_to_req = attn_metadata.token_to_req[:num_actual_tokens]
+
+        forward_context = get_forward_context()
+        maybe_save_current_kv_tokens_to_connector(
+            layer_name,
+            slot_mapping[:num_actual_tokens],
+            token_to_req,
+            cum_query_lens[:num_reqs],
+            num_actual_tokens,
+            num_reqs,
+            forward_context.capturing,
+        )
+
     def exec_kv(
         self,
         kv_no_split: torch.Tensor,
@@ -1821,6 +1861,13 @@ class AscendSFAImpl(MLAAttentionImpl):
                 slot_mapping=slot_mapping,
                 num_input_tokens=num_input_tokens,
             )
+            self._maybe_save_current_kv_tokens_for_fused_overlap(
+                layer_name,
+                kv_cache,
+                attn_metadata,
+                slot_mapping,
+                actual_seq_lengths_query,
+            )
             if self.has_indexer:
                 k_li, k_li_scale = self.indexer_select_pre_process(
                     x=hidden_states,
@@ -1887,6 +1934,15 @@ class AscendSFAImpl(MLAAttentionImpl):
                     slot_mapping_sfa.view(-1, 1),
                     packed_kv.view(-1, packed_head_dim),
                 )
+
+            kv_slot_mapping = slot_mapping_cp if self.enable_dsa_cp else slot_mapping
+            self._maybe_save_current_kv_tokens_for_fused_overlap(
+                layer_name,
+                kv_cache,
+                attn_metadata,
+                kv_slot_mapping,
+                actual_seq_lengths_query,
+            )
 
             if self.enable_dsa_cp:
                 assert k_pe is not None
