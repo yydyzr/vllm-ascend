@@ -5,6 +5,7 @@ from typing import Any
 from vllm.config import VllmConfig
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorMetadata
 from vllm.logger import logger
+from vllm.utils.math_utils import cdiv
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import (
@@ -132,9 +133,19 @@ class SFAKVOffloadlScheduler:
 
         for request in scheduler_output.scheduled_new_reqs:
             block_ids_npu = request.block_ids[-1].copy() # NOTE dskv32 sparse offload, 0 for indexer and 1 for ori kv_cache
-            num_tokens_to_compute = request.num_computed_tokens + _num_finalized_scheduled_tokens(
-                scheduler_output, request.req_id)
-            num_new_offload_blocks = num_tokens_to_compute // self._block_size
+            num_new_tokens = _num_finalized_scheduled_tokens(scheduler_output, request.req_id)
+            num_tokens_to_compute = request.num_computed_tokens + num_new_tokens
+            if self.use_fused_overlap_offload:
+                num_blocks_needed = cdiv(num_tokens_to_compute, self._block_size)
+                offload_token_start = request.num_computed_tokens
+                offload_num_tokens = num_new_tokens
+                num_tokens_after_step = num_tokens_to_compute
+            else:
+                num_blocks_needed = num_tokens_to_compute // self._block_size
+                offload_token_start = 0
+                offload_num_tokens = 0
+                num_tokens_after_step = 0
+            num_new_offload_blocks = num_blocks_needed
             block_ids_cpu = self.cpu_block_manager.allocate_block(num_new_offload_blocks)
             request_tracker = RequestTracker(
                 req_id=request.req_id,
@@ -146,6 +157,9 @@ class SFAKVOffloadlScheduler:
             req_meta = ReqMeta.from_request_tracker(
                 request_tracker,
                 num_new_offload_blocks=num_new_offload_blocks,
+                num_tokens_after_step=num_tokens_after_step,
+                offload_token_start=offload_token_start,
+                offload_num_tokens=offload_num_tokens,
             )
             if req_meta is not None:
                 meta.add_request(req_meta)
@@ -174,15 +188,27 @@ class SFAKVOffloadlScheduler:
                     )
                 num_computed_token = cached_reqs.num_computed_tokens[i]
                 num_tokens_after_step = num_computed_token + num_new_tokens
-                num_blocks_after_step = num_tokens_after_step // self._block_size # pcp/dcp not considered now
                 num_offloaded_blocks = len(request_tracker.allocated_block_ids_cpu)
-                num_new_offload_blocks = max(num_blocks_after_step - num_offloaded_blocks, 0)
+                if self.use_fused_overlap_offload:
+                    num_blocks_needed = cdiv(num_tokens_after_step, self._block_size)
+                    num_new_offload_blocks = max(num_blocks_needed - num_offloaded_blocks, 0)
+                    offload_token_start = num_computed_token
+                    offload_num_tokens = num_new_tokens
+                else:
+                    num_blocks_after_step = num_tokens_after_step // self._block_size # pcp/dcp not considered now
+                    num_new_offload_blocks = max(num_blocks_after_step - num_offloaded_blocks, 0)
+                    offload_token_start = 0
+                    offload_num_tokens = 0
+                    num_tokens_after_step = 0
                 new_block_ids_cpu = self.cpu_block_manager.allocate_block(num_new_offload_blocks)
                 request_tracker.update(new_block_ids_npu, new_block_ids_cpu)
 
                 req_meta = ReqMeta.from_request_tracker(
                     request_tracker,
                     num_new_offload_blocks=num_new_offload_blocks,
+                    num_tokens_after_step=num_tokens_after_step,
+                    offload_token_start=offload_token_start,
+                    offload_num_tokens=offload_num_tokens,
                 )
             if req_meta is not None:
                 meta.add_request(req_meta)

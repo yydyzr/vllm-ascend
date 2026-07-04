@@ -23,6 +23,8 @@ class RequestTracker:
     # step. The decode-filled range [num_offloaded:num_blocks_after_step] is the
     # offload source. (num_offloaded == len(allocated_block_ids_cpu).)
     main_hbm_ids: list[int] = field(default_factory=list)
+    # fused_overlap: count of main MLA tokens already saved to CPU.
+    num_cpu_saved_tokens: int = 0
 
     def update(
         self,
@@ -54,11 +56,19 @@ class ReqMeta:
     # num_new_offload_blocks + sfa_worker.process_layer_data.
     offload_src_hbm_ids: list[int] = field(default_factory=list)
     offload_dst_cpu_ids: list[int] = field(default_factory=list)
+    # fused_overlap: per-step token-range offload metadata.
+    num_tokens_after_step: int = 0
+    offload_token_start: int = 0
+    offload_num_tokens: int = 0
 
     @staticmethod
     def from_request_tracker(
         tracker: RequestTracker,
+        *,
         num_new_offload_blocks: int = 0,
+        num_tokens_after_step: int = 0,
+        offload_token_start: int = 0,
+        offload_num_tokens: int = 0,
     ) -> ReqMeta | None:
         """Create the request metadata from a request tracker."""
         return ReqMeta(
@@ -68,6 +78,9 @@ class ReqMeta:
             num_new_offload_blocks=num_new_offload_blocks,
             num_full=tracker.num_full,
             partial_hbm_bid=tracker.partial_hbm_bid,
+            num_tokens_after_step=num_tokens_after_step,
+            offload_token_start=offload_token_start,
+            offload_num_tokens=offload_num_tokens,
         )
 
 
