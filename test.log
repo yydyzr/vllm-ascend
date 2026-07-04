@@ -1,0 +1,147 @@
+============================= test session starts ==============================
+platform linux -- Python 3.11.10, pytest-8.3.2, pluggy-1.6.0
+rootdir: /home/s886374/fused/vllm-ascend
+configfile: pyproject.toml
+plugins: xdist-3.6.1, anyio-4.13.0
+collected 4 items
+
+tests/ut/kv_offload/test_sfa_kv_offload_scheduler.py FFFF                [100%]
+
+=================================== FAILURES ===================================
+_ TestSFAKVOffloadSchedulerMetadata.test_fused_decode_allocates_partial_cpu_block _
+
+self = <tests.ut.kv_offload.test_sfa_kv_offload_scheduler.TestSFAKVOffloadSchedulerMetadata testMethod=test_fused_decode_allocates_partial_cpu_block>
+_mock = <MagicMock name='check_and_update_config' id='281455506153744'>
+
+    def test_fused_decode_allocates_partial_cpu_block(self, _mock):
+>       scheduler = self._make_scheduler(KV_OFFLOAD_MODE_FUSED_OVERLAP)
+
+tests/ut/kv_offload/test_sfa_kv_offload_scheduler.py:112: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/ut/kv_offload/test_sfa_kv_offload_scheduler.py:82: in _make_scheduler
+    vllm_config = _make_vllm_config(kv_offload_mode)
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+kv_offload_mode = 'fused_overlap'
+
+    def _make_vllm_config(kv_offload_mode: str):
+        vllm_config = VllmConfig()
+        vllm_config.additional_config = {
+            "use_offload": True,
+            "kv_offload_mode": kv_offload_mode,
+        }
+>       vllm_config.kv_transfer_config.kv_role = "kv_producer"
+E       AttributeError: 'NoneType' object has no attribute 'kv_role'
+
+tests/ut/kv_offload/test_sfa_kv_offload_scheduler.py:48: AttributeError
+----------------------------- Captured stdout call -----------------------------
+INFO 07-04 16:57:56 [scheduler.py:239] Chunked prefill is enabled with max_num_batched_tokens=2048.
+INFO 07-04 16:57:56 [vllm.py:999] Asynchronous scheduling is enabled.
+INFO 07-04 16:57:56 [kernel.py:270] Final IR op priority after setting platform defaults: IrOpPriorityConfig(rms_norm=['native'], fused_add_rms_norm=['native'])
+INFO 07-04 16:57:56 [compilation.py:321] Enabled custom fusions: norm_quant, act_quant
+_ TestSFAKVOffloadSchedulerMetadata.test_fused_decode_into_existing_partial_block _
+
+self = <tests.ut.kv_offload.test_sfa_kv_offload_scheduler.TestSFAKVOffloadSchedulerMetadata testMethod=test_fused_decode_into_existing_partial_block>
+_mock = <MagicMock name='check_and_update_config' id='281455505719440'>
+
+    def test_fused_decode_into_existing_partial_block(self, _mock):
+>       scheduler = self._make_scheduler(KV_OFFLOAD_MODE_FUSED_OVERLAP)
+
+tests/ut/kv_offload/test_sfa_kv_offload_scheduler.py:136: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/ut/kv_offload/test_sfa_kv_offload_scheduler.py:82: in _make_scheduler
+    vllm_config = _make_vllm_config(kv_offload_mode)
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+kv_offload_mode = 'fused_overlap'
+
+    def _make_vllm_config(kv_offload_mode: str):
+        vllm_config = VllmConfig()
+        vllm_config.additional_config = {
+            "use_offload": True,
+            "kv_offload_mode": kv_offload_mode,
+        }
+>       vllm_config.kv_transfer_config.kv_role = "kv_producer"
+E       AttributeError: 'NoneType' object has no attribute 'kv_role'
+
+tests/ut/kv_offload/test_sfa_kv_offload_scheduler.py:48: AttributeError
+----------------------------- Captured stdout call -----------------------------
+INFO 07-04 16:57:56 [kernel.py:270] Final IR op priority after setting platform defaults: IrOpPriorityConfig(rms_norm=['native'], fused_add_rms_norm=['native'])
+_ TestSFAKVOffloadSchedulerMetadata.test_fused_prefill_chunk_spans_multiple_blocks _
+
+self = <tests.ut.kv_offload.test_sfa_kv_offload_scheduler.TestSFAKVOffloadSchedulerMetadata testMethod=test_fused_prefill_chunk_spans_multiple_blocks>
+_mock = <MagicMock name='check_and_update_config' id='281455506186832'>
+
+    def test_fused_prefill_chunk_spans_multiple_blocks(self, _mock):
+>       scheduler = self._make_scheduler(KV_OFFLOAD_MODE_FUSED_OVERLAP)
+
+tests/ut/kv_offload/test_sfa_kv_offload_scheduler.py:159: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/ut/kv_offload/test_sfa_kv_offload_scheduler.py:82: in _make_scheduler
+    vllm_config = _make_vllm_config(kv_offload_mode)
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+kv_offload_mode = 'fused_overlap'
+
+    def _make_vllm_config(kv_offload_mode: str):
+        vllm_config = VllmConfig()
+        vllm_config.additional_config = {
+            "use_offload": True,
+            "kv_offload_mode": kv_offload_mode,
+        }
+>       vllm_config.kv_transfer_config.kv_role = "kv_producer"
+E       AttributeError: 'NoneType' object has no attribute 'kv_role'
+
+tests/ut/kv_offload/test_sfa_kv_offload_scheduler.py:48: AttributeError
+----------------------------- Captured stdout call -----------------------------
+INFO 07-04 16:57:56 [kernel.py:270] Final IR op priority after setting platform defaults: IrOpPriorityConfig(rms_norm=['native'], fused_add_rms_norm=['native'])
+_ TestSFAKVOffloadSchedulerMetadata.test_legacy_decode_does_not_allocate_partial_cpu_block _
+
+self = <tests.ut.kv_offload.test_sfa_kv_offload_scheduler.TestSFAKVOffloadSchedulerMetadata testMethod=test_legacy_decode_does_not_allocate_partial_cpu_block>
+_mock = <MagicMock name='check_and_update_config' id='281455504488976'>
+
+    def test_legacy_decode_does_not_allocate_partial_cpu_block(self, _mock):
+>       scheduler = self._make_scheduler(KV_OFFLOAD_MODE_LEGACY)
+
+tests/ut/kv_offload/test_sfa_kv_offload_scheduler.py:90: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/ut/kv_offload/test_sfa_kv_offload_scheduler.py:82: in _make_scheduler
+    vllm_config = _make_vllm_config(kv_offload_mode)
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+kv_offload_mode = 'legacy'
+
+    def _make_vllm_config(kv_offload_mode: str):
+        vllm_config = VllmConfig()
+        vllm_config.additional_config = {
+            "use_offload": True,
+            "kv_offload_mode": kv_offload_mode,
+        }
+>       vllm_config.kv_transfer_config.kv_role = "kv_producer"
+E       AttributeError: 'NoneType' object has no attribute 'kv_role'
+
+tests/ut/kv_offload/test_sfa_kv_offload_scheduler.py:48: AttributeError
+----------------------------- Captured stdout call -----------------------------
+INFO 07-04 16:57:56 [kernel.py:270] Final IR op priority after setting platform defaults: IrOpPriorityConfig(rms_norm=['native'], fused_add_rms_norm=['native'])
+=============================== warnings summary ===============================
+../../../../usr/local/python3.11.10/lib/python3.11/site-packages/torch/jit/_script.py:362: 14 warnings
+  /usr/local/python3.11.10/lib/python3.11/site-packages/torch/jit/_script.py:362: DeprecationWarning: `torch.jit.script_method` is deprecated. Please switch to `torch.compile` or `torch.export`.
+    warnings.warn(
+
+../../../../usr/local/python3.11.10/lib/python3.11/site-packages/opentelemetry/util/_importlib_metadata.py:32
+  /usr/local/python3.11.10/lib/python3.11/site-packages/opentelemetry/util/_importlib_metadata.py:32: DeprecationWarning: SelectableGroups dict interface is deprecated. Use select.
+    return EntryPoints(ep for group_eps in eps.values() for ep in group_eps)
+
+<frozen importlib._bootstrap>:241
+  <frozen importlib._bootstrap>:241: DeprecationWarning: builtin type SwigPyPacked has no __module__ attribute
+
+<frozen importlib._bootstrap>:241
+  <frozen importlib._bootstrap>:241: DeprecationWarning: builtin type SwigPyObject has no __module__ attribute
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+=========================== short test summary info ============================
+FAILED tests/ut/kv_offload/test_sfa_kv_offload_scheduler.py::TestSFAKVOffloadSchedulerMetadata::test_fused_decode_allocates_partial_cpu_block
+FAILED tests/ut/kv_offload/test_sfa_kv_offload_scheduler.py::TestSFAKVOffloadSchedulerMetadata::test_fused_decode_into_existing_partial_block
+FAILED tests/ut/kv_offload/test_sfa_kv_offload_scheduler.py::TestSFAKVOffloadSchedulerMetadata::test_fused_prefill_chunk_spans_multiple_blocks
+FAILED tests/ut/kv_offload/test_sfa_kv_offload_scheduler.py::TestSFAKVOffloadSchedulerMetadata::test_legacy_decode_does_not_allocate_partial_cpu_block
+======================== 4 failed, 17 warnings in 0.11s ========================
