@@ -464,6 +464,31 @@ def maybe_save_kv_layer_to_connector(
     connector.save_kv_layer(layer_name, kv_cache_layer, attn_metadata)
 
 
+def maybe_save_current_kv_tokens_to_connector(
+    layer_name: str,
+    slot_mapping: torch.Tensor,
+    token_to_req: torch.Tensor | None,
+    cum_query_lens: torch.Tensor,
+    num_actual_tokens: int,
+    num_reqs: int,
+    capturing: bool = False,
+) -> None:
+    if not has_kv_transfer_group() or not is_v1_kv_transfer_group():
+        return
+    connector = get_kv_transfer_group()
+    if not hasattr(connector, "save_current_kv_tokens"):
+        return
+    connector.save_current_kv_tokens(
+        layer_name,
+        slot_mapping,
+        token_to_req,
+        cum_query_lens,
+        num_actual_tokens,
+        num_reqs,
+        capturing,
+    )
+
+
 def set_connector_req_ids(req_ids):
     if not has_kv_transfer_group() or not is_v1_kv_transfer_group():
         return
