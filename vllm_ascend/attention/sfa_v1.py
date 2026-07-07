@@ -1137,11 +1137,7 @@ class AscendSFAImpl(MLAAttentionImpl):
             return
 
         if attn_metadata.token_to_req is None:
-            token_to_req = torch.arange(
-                num_actual_tokens,
-                dtype=torch.int32,
-                device=slot_mapping.device,
-            )
+            raise RuntimeError("SFA fused_overlap offload decode requires token_to_req metadata")
         else:
             token_to_req = attn_metadata.token_to_req[:num_actual_tokens]
 
