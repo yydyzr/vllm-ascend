@@ -112,6 +112,9 @@ class SFAKVOffloadConnector(KVConnectorBase_V1, SupportsHMA):
             capturing,
         )
 
+    def get_fused_overlap_cpu_kv_inputs(self, layer_name: str):
+        return self.connector_worker.get_fused_overlap_cpu_kv_inputs(layer_name)
+
     def wait_for_save(self):
         self.connector_worker.wait_for_save()
 

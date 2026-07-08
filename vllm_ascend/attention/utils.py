@@ -574,6 +574,19 @@ def maybe_save_current_kv_tokens_to_connector(
     )
 
 
+def get_fused_overlap_cpu_kv_inputs(
+    layer_name: str,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    if not has_kv_transfer_group() or not is_v1_kv_transfer_group():
+        raise RuntimeError("fused_overlap offload requires v1 kv transfer group")
+    connector = get_kv_transfer_group()
+    if not hasattr(connector, "get_fused_overlap_cpu_kv_inputs"):
+        raise RuntimeError(
+            "fused_overlap offload requires get_fused_overlap_cpu_kv_inputs connector method"
+        )
+    return connector.get_fused_overlap_cpu_kv_inputs(layer_name)
+
+
 def set_connector_req_ids(req_ids):
     if not has_kv_transfer_group() or not is_v1_kv_transfer_group():
         return
