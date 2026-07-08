@@ -438,6 +438,21 @@ class SFAKVOffloadWorker:
                 self._empty_aligned_cpu_tensor([cpu_block_num, self.block_size, 1, 64], dtype=torch.bfloat16)
                 for _ in range(self.num_layers)
             ]
+            if self.use_fused_overlap_offload:
+                logger.info(
+                    "[fused_overlap_offload][init] layer_count=%s cpu_block_num=%s "
+                    "k_cpu_shape=%s rope_cpu_shape=%s k_cpu_device=%s rope_cpu_device=%s "
+                    "k_cpu_ptr=%s rope_cpu_ptr=%s cpu_block_table_shape=%s",
+                    self.num_layers,
+                    cpu_block_num,
+                    tuple(self.k_caches_cpu[0].shape),
+                    tuple(self.v_caches_cpu[0].shape),
+                    self.k_caches_cpu[0].device,
+                    self.v_caches_cpu[0].device,
+                    self.k_caches_cpu[0].data_ptr(),
+                    self.v_caches_cpu[0].data_ptr(),
+                    tuple(self.cpu_block_table.gpu.shape),
+                )
 
             # topk cache reuse related
             self.lru_workspace_threads = 8
@@ -587,7 +602,7 @@ class SFAKVOffloadWorker:
 
             if self.use_fused_overlap_offload:
                 # fused_overlap d2h: gvas/addr buffers follow H2D naming (CPU/NPU bases).
-                # batch_copy still copies gvas->addr, so pass addr(NPU src) first for D2H.
+                # sparse_copy copies gvas->addr, so pass addr(NPU src) first for D2H.
                 d2h_max_copies = self.max_num_tokens * 2
                 d2h_gvas_offset = 0
                 d2h_gvas_size_bytes = d2h_max_copies * 8
@@ -726,8 +741,9 @@ class SFAKVOffloadWorker:
 
             global_pos = int(offload_token_start[req_idx].item()) + local_offset
             npu_block_id = slot // self.block_size
-            offset_in_block = slot % self.block_size
+            npu_offset_in_block = slot % self.block_size
             cpu_block_idx = global_pos // self.block_size
+            cpu_offset_in_block = global_pos % self.block_size
             cpu_block_id = int(cpu_block_table[req_idx, cpu_block_idx].item())
             if cpu_block_id <= 0:
                 return None
@@ -735,22 +751,22 @@ class SFAKVOffloadWorker:
             gva_k = (
                 cpu_k_base
                 + cpu_block_id * block_size_bytes_k
-                + offset_in_block * self.token_size_bytes_k
+                + cpu_offset_in_block * self.token_size_bytes_k
             )
             addr_k = (
                 npu_k_base
                 + npu_block_id * block_size_bytes_k
-                + offset_in_block * self.token_size_bytes_k
+                + npu_offset_in_block * self.token_size_bytes_k
             )
             gva_v = (
                 cpu_v_base
                 + cpu_block_id * block_size_bytes_v
-                + offset_in_block * self.token_size_bytes_v
+                + cpu_offset_in_block * self.token_size_bytes_v
             )
             addr_v = (
                 npu_v_base
                 + npu_block_id * block_size_bytes_v
-                + offset_in_block * self.token_size_bytes_v
+                + npu_offset_in_block * self.token_size_bytes_v
             )
             return gva_k, addr_k, gva_v, addr_v
 
@@ -806,6 +822,14 @@ class SFAKVOffloadWorker:
             return
         self.save_cpu(self._get_offload_layer_id(layer_name))
 
+    def get_fused_overlap_cpu_kv_inputs(self, layer_name: str):
+        layer_id = self._get_offload_layer_id(layer_name)
+        return (
+            self.k_caches_cpu[layer_id],
+            self.v_caches_cpu[layer_id],
+            self.cpu_block_table.gpu,
+        )
+
     def save_current_kv_tokens(
         self,
         layer_name: str,
@@ -816,7 +840,7 @@ class SFAKVOffloadWorker:
         num_reqs: int,
         capturing: bool = False,
     ) -> None:
-        """Immediately copy current-step main MLA KV tokens from NPU to CPU via batch_copy."""
+        """Immediately copy current-step main MLA KV tokens from NPU to CPU."""
         if not self.use_fused_overlap_offload or num_actual_tokens <= 0 or num_reqs <= 0:
             return
         if not self.fused_step_requests:
@@ -851,11 +875,37 @@ class SFAKVOffloadWorker:
         else:
             self._compute_step_offload_addrs_cpu(args)
 
+        if not capturing:
+            copy_count = int(self.d2h_num_tokens_buffer_cpu[0].item())
+            if not getattr(self, "_fused_overlap_d2h_logged", False):
+                logger.info(
+                    "[fused_overlap_offload][d2h] first submit layer_id=%s "
+                    "num_actual_tokens=%s num_reqs=%s copy_count=%s "
+                    "slot_shape=%s token_to_req_shape=%s cum_query_lens_shape=%s",
+                    layer_id,
+                    num_actual_tokens,
+                    num_reqs,
+                    copy_count,
+                    tuple(slot_mapping[:num_actual_tokens].shape),
+                    tuple(token_to_req[:num_actual_tokens].shape),
+                    tuple(cum_query_lens[:num_reqs].shape),
+                )
+                self._fused_overlap_d2h_logged = True
+            if envs.VLLM_ASCEND_SFA_DEBUG:
+                logger.info(
+                    "[fused_overlap_offload][d2h][debug] layer_id=%s "
+                    "num_actual_tokens=%s num_reqs=%s copy_count=%s",
+                    layer_id,
+                    num_actual_tokens,
+                    num_reqs,
+                    copy_count,
+                )
+
         self.d2h_batch_copy_args_buffer_npu.copy_(
             self.d2h_batch_copy_args_buffer_cpu, non_blocking=capturing
         )
-        # D2H: gvas/addr buffers use H2D naming (CPU/NPU); swap batch_copy args for NPU->CPU.
-        batch_copy(
+        # D2H: gvas/addr buffers use H2D naming (CPU/NPU); swap sparse_copy args for NPU->CPU.
+        offload.sparse_copy(
             self.d2h_addr_buffer_npu,
             self.d2h_gvas_buffer_npu,
             self.d2h_size_buffer_npu,
