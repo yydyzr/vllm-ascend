@@ -231,6 +231,31 @@ class SFAPDCpuOffloadConsumerWorker:
         if self.sfa_worker is not None:
             self.sfa_worker.set_req_ids(req_ids)
 
+    def save_current_kv_tokens(
+        self,
+        layer_name: str,
+        slot_mapping: torch.Tensor,
+        token_to_req: torch.Tensor,
+        cum_query_lens: torch.Tensor,
+        num_actual_tokens: int,
+        num_reqs: int,
+        capturing: bool = False,
+    ) -> None:
+        assert self.sfa_worker is not None
+        self.sfa_worker.save_current_kv_tokens(
+            layer_name,
+            slot_mapping,
+            token_to_req,
+            cum_query_lens,
+            num_actual_tokens,
+            num_reqs,
+            capturing,
+        )
+
+    def get_fused_overlap_cpu_kv_inputs(self, layer_name: str):
+        assert self.sfa_worker is not None
+        return self.sfa_worker.get_fused_overlap_cpu_kv_inputs(layer_name)
+
     def prepare_lru_resident_and_load(
         self,
         layer_name: str,

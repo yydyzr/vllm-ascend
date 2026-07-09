@@ -6,6 +6,12 @@ import torch
 
 from vllm_ascend.attention import utils as attention_utils
 from vllm_ascend.attention.sfa_v1 import AscendSFAImpl
+from vllm_ascend.distributed.kv_transfer.sfa_pd_cpu_offload.connector import (
+    SFAPDCpuOffloadConnector,
+)
+from vllm_ascend.distributed.kv_transfer.sfa_pd_cpu_offload.worker import (
+    SFAPDCpuOffloadConsumerWorker,
+)
 
 
 def _make_impl() -> AscendSFAImpl:
@@ -164,3 +170,90 @@ def test_get_fused_overlap_cpu_kv_inputs_rejects_connector_without_accessor():
         pytest.raises(RuntimeError, match="get_fused_overlap_cpu_kv_inputs connector method"),
     ):
         attention_utils.get_fused_overlap_cpu_kv_inputs("layer.0")
+
+
+def test_sfa_pd_connector_exposes_fused_overlap_cpu_kv_inputs():
+    expected = (
+        torch.zeros((1, 4, 1, 3)),
+        torch.zeros((1, 4, 1, 1)),
+        torch.zeros((1, 1), dtype=torch.int32),
+    )
+    connector = object.__new__(SFAPDCpuOffloadConnector)
+    connector.connector_worker = SimpleNamespace(
+        get_fused_overlap_cpu_kv_inputs=lambda layer_name: expected,
+    )
+
+    assert connector.get_fused_overlap_cpu_kv_inputs("model.layers.0.self_attn") is expected
+
+
+def test_sfa_pd_connector_forwards_current_step_kv_save():
+    calls = []
+    connector = object.__new__(SFAPDCpuOffloadConnector)
+    connector.connector_worker = SimpleNamespace(
+        save_current_kv_tokens=lambda *args: calls.append(args),
+    )
+    slot_mapping = torch.tensor([3, 4], dtype=torch.int64)
+    token_to_req = torch.tensor([0, 1], dtype=torch.int32)
+    cum_query_lens = torch.tensor([1, 2], dtype=torch.int32)
+
+    connector.save_current_kv_tokens(
+        "model.layers.0.self_attn",
+        slot_mapping,
+        token_to_req,
+        cum_query_lens,
+        2,
+        2,
+        True,
+    )
+
+    assert calls == [
+        (
+            "model.layers.0.self_attn",
+            slot_mapping,
+            token_to_req,
+            cum_query_lens,
+            2,
+            2,
+            True,
+        )
+    ]
+
+
+def test_sfa_pd_consumer_worker_forwards_fused_overlap_hooks_to_composed_sfa_worker():
+    expected = (
+        torch.zeros((1, 4, 1, 3)),
+        torch.zeros((1, 4, 1, 1)),
+        torch.zeros((1, 1), dtype=torch.int32),
+    )
+    calls = []
+    worker = object.__new__(SFAPDCpuOffloadConsumerWorker)
+    worker.sfa_worker = SimpleNamespace(
+        get_fused_overlap_cpu_kv_inputs=lambda layer_name: expected,
+        save_current_kv_tokens=lambda *args: calls.append(args),
+    )
+    slot_mapping = torch.tensor([3], dtype=torch.int64)
+    token_to_req = torch.tensor([0], dtype=torch.int32)
+    cum_query_lens = torch.tensor([1], dtype=torch.int32)
+
+    assert worker.get_fused_overlap_cpu_kv_inputs("model.layers.0.self_attn") is expected
+    worker.save_current_kv_tokens(
+        "model.layers.0.self_attn",
+        slot_mapping,
+        token_to_req,
+        cum_query_lens,
+        1,
+        1,
+        False,
+    )
+
+    assert calls == [
+        (
+            "model.layers.0.self_attn",
+            slot_mapping,
+            token_to_req,
+            cum_query_lens,
+            1,
+            1,
+            False,
+        )
+    ]
