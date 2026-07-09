@@ -8,19 +8,17 @@ Background:
   valid MTE destination.
 
 Baseline: tests/e2e/nightly/single_node/ops/singlecard_ops/test_mla_preprocess.py
-uses NPU kv_cache / kv_cache_rope. This test keeps the same op call shape, but
-allocates the KV caches from the offload host pool.
 
 Run (on NPU host with memfabric_hybrid installed):
-  pytest -sv \\
-    tests/e2e/nightly/single_node/ops/singlecard_ops/test_mla_preprocess_offload_cpu_cache.py
+  python tests/e2e/nightly/single_node/ops/singlecard_ops/test_mla_preprocess_offload_cpu_cache.py
 """
 
 from __future__ import annotations
 
 import gc
+import sys
+import traceback
 
-import pytest
 import torch
 import torch_npu
 
@@ -28,22 +26,22 @@ from vllm_ascend.utils import enable_custom_op
 
 enable_custom_op()
 
-# DRAM pool size for offload.initialize; 1GB is enough for this tiny case.
 _OFFLOAD_DRAM_BYTES = 1 * 1024 * 1024 * 1024
+CACHE_MODE = "krope_ctkv"
 
 
 def _require_offload():
     try:
         from memfabric_hybrid import offload
     except ImportError as e:
-        pytest.skip(f"memfabric_hybrid not installed: {e}")
+        raise RuntimeError(f"memfabric_hybrid not installed: {e}") from e
     return offload
 
 
 def _init_offload(offload, device_id: int = 0) -> None:
     ret = offload.initialize(device_id, _OFFLOAD_DRAM_BYTES)
     if ret != 0:
-        pytest.skip(f"offload.initialize failed, ret={ret}")
+        raise RuntimeError(f"offload.initialize failed, ret={ret}")
 
 
 def _build_npu_inputs(token_num: int, head_num: int, dtype: torch.dtype):
@@ -74,7 +72,6 @@ def _build_npu_inputs(token_num: int, head_num: int, dtype: torch.dtype):
     wuk = torch.randn((head_num, 128, 512), dtype=dtype).npu()
     wuk = torch_npu.npu_format_cast(wuk, 29)
 
-    # Deterministic slot so we know which cache location should be written.
     slotmapping = torch.zeros((token_num,), dtype=torch.int32).npu()
 
     ctkv_scale = torch.randn((1,), dtype=dtype).npu()
@@ -164,22 +161,19 @@ def _run_mla_preprocess(
     return q_nope_out, q_rope_out
 
 
-@pytest.mark.parametrize("cache_mode", ["krope_ctkv"])
 @torch.inference_mode()
-def test_mla_preprocess_write_offload_cpu_kv_cache(cache_mode: str):
-    """Can MLAPO write kv_cache_out into offload.empty CPU tensors?"""
+def case_write_offload_cpu_kv_cache() -> None:
+    """Can MLAPO write kv_cache_out into offload.empty host tensors?"""
+    print("[case1] write into offload.empty host kv_cache ...")
     offload = _require_offload()
-    device_id = torch.npu.current_device()
-    _init_offload(offload, device_id=int(device_id))
+    device_id = int(torch.npu.current_device())
+    _init_offload(offload, device_id=device_id)
 
     token_num = 1
     head_num = 2
     block_num = 1
     block_size = 128
     dtype = torch.bfloat16
-
-    # Same logical layout as test_mla_preprocess.py (NZ-shaped views).
-    # Note: npu_format_cast(29) is NPU-only; CPU tensors keep the same shape.
     kv_shape = (block_num, head_num * 512 // 32, block_size, 32)
     rope_shape = (block_num, head_num * 64 // 16, block_size, 16)
 
@@ -188,7 +182,6 @@ def test_mla_preprocess_write_offload_cpu_kv_cache(cache_mode: str):
     assert kv_cache_cpu.device.type == "cpu"
     assert kv_cache_rope_cpu.device.type == "cpu"
 
-    # Fill with a known sentinel so we can detect writes.
     kv_cache_cpu.fill_(0)
     kv_cache_rope_cpu.fill_(0)
     kv_before = kv_cache_cpu.clone()
@@ -198,45 +191,46 @@ def test_mla_preprocess_write_offload_cpu_kv_cache(cache_mode: str):
 
     try:
         q_nope_out, q_rope_out = _run_mla_preprocess(
-            cache_mode=cache_mode,
+            cache_mode=CACHE_MODE,
             kv_cache=kv_cache_cpu,
             kv_cache_rope=kv_cache_rope_cpu,
             inputs=inputs,
         )
     except Exception as e:
-        pytest.fail(
+        raise RuntimeError(
             "mla_preprocess failed when kv_cache / kv_cache_rope are "
-            f"offload.empty CPU tensors: {type(e).__name__}: {e}"
-        )
+            f"offload.empty host tensors: {type(e).__name__}: {e}"
+        ) from e
     finally:
         try:
             offload.uninitialize()
         except Exception:
             pass
 
-    # Q outputs are still on NPU and should be produced.
     assert q_nope_out.device.type == "npu"
     assert q_rope_out.device.type == "npu"
     assert torch.isfinite(q_nope_out.float()).all()
     assert torch.isfinite(q_rope_out.float()).all()
 
-    # Core check: did the op mutate the offload CPU KV buffers?
     kv_changed = not torch.equal(kv_cache_cpu, kv_before)
     rope_changed = not torch.equal(kv_cache_rope_cpu, rope_before)
-    assert kv_changed or rope_changed, (
-        "mla_preprocess returned without error, but offload.empty (MTE-visible) "
-        "host kv_cache / kv_cache_rope were not modified. Either the op did not "
-        "treat the host ptr as an MTE destination, or the write landed elsewhere."
-    )
+    print(f"  kv_cache changed={kv_changed}, rope_cache changed={rope_changed}")
+    if not (kv_changed or rope_changed):
+        raise AssertionError(
+            "mla_preprocess returned without error, but offload.empty (MTE-visible) "
+            "host kv_cache / kv_cache_rope were not modified. Either the op did not "
+            "treat the host ptr as an MTE destination, or the write landed elsewhere."
+        )
+    print("[case1] PASS")
 
 
-@pytest.mark.parametrize("cache_mode", ["krope_ctkv"])
 @torch.inference_mode()
-def test_mla_preprocess_offload_cpu_vs_npu_kv_cache(cache_mode: str):
-    """Compare CPU-offload cache write against the normal NPU cache path."""
+def case_offload_cpu_vs_npu_kv_cache() -> None:
+    """Compare host-offload cache write against the normal NPU cache path."""
+    print("[case2] compare offload host cache vs NPU cache ...")
     offload = _require_offload()
-    device_id = torch.npu.current_device()
-    _init_offload(offload, device_id=int(device_id))
+    device_id = int(torch.npu.current_device())
+    _init_offload(offload, device_id=device_id)
 
     token_num = 1
     head_num = 2
@@ -246,12 +240,11 @@ def test_mla_preprocess_offload_cpu_vs_npu_kv_cache(cache_mode: str):
     kv_shape = (block_num, head_num * 512 // 32, block_size, 32)
     rope_shape = (block_num, head_num * 64 // 16, block_size, 16)
 
-    # Shared NPU inputs; run NPU-cache path first as reference.
     inputs = _build_npu_inputs(token_num, head_num, dtype)
     kv_cache_npu = torch.zeros(kv_shape, dtype=dtype, device="npu")
     kv_cache_rope_npu = torch.zeros(rope_shape, dtype=dtype, device="npu")
     q_nope_npu, q_rope_npu = _run_mla_preprocess(
-        cache_mode=cache_mode,
+        cache_mode=CACHE_MODE,
         kv_cache=kv_cache_npu,
         kv_cache_rope=kv_cache_rope_npu,
         inputs=inputs,
@@ -264,42 +257,52 @@ def test_mla_preprocess_offload_cpu_vs_npu_kv_cache(cache_mode: str):
 
     try:
         q_nope_cpu_path, q_rope_cpu_path = _run_mla_preprocess(
-            cache_mode=cache_mode,
+            cache_mode=CACHE_MODE,
             kv_cache=kv_cache_cpu,
             kv_cache_rope=kv_cache_rope_cpu,
             inputs=inputs,
         )
     except Exception as e:
-        pytest.fail(
-            "CPU-offload kv_cache path crashed while NPU path succeeded: "
+        raise RuntimeError(
+            "host-offload kv_cache path crashed while NPU path succeeded: "
             f"{type(e).__name__}: {e}"
-        )
+        ) from e
     finally:
         try:
             offload.uninitialize()
         except Exception:
             pass
 
-    # Q side should still match the NPU-cache path (same inputs).
     torch.testing.assert_close(q_nope_cpu_path, q_nope_npu, atol=0, rtol=0)
     torch.testing.assert_close(q_rope_cpu_path, q_rope_npu, atol=0, rtol=0)
-
-    # If direct write works, CPU cache content should match NPU cache.
-    torch.testing.assert_close(
-        kv_cache_cpu,
-        kv_cache_npu.cpu(),
-        atol=0,
-        rtol=0,
-        msg="offload.empty CPU kv_cache content differs from NPU kv_cache",
-    )
-    torch.testing.assert_close(
-        kv_cache_rope_cpu,
-        kv_cache_rope_npu.cpu(),
-        atol=0,
-        rtol=0,
-        msg="offload.empty CPU kv_cache_rope content differs from NPU rope cache",
-    )
+    torch.testing.assert_close(kv_cache_cpu, kv_cache_npu.cpu(), atol=0, rtol=0)
+    torch.testing.assert_close(kv_cache_rope_cpu, kv_cache_rope_npu.cpu(), atol=0, rtol=0)
+    print("[case2] PASS")
 
     gc.collect()
     torch.npu.empty_cache()
     torch.npu.reset_peak_memory_stats()
+
+
+def main() -> int:
+    cases = [
+        case_write_offload_cpu_kv_cache,
+        case_offload_cpu_vs_npu_kv_cache,
+    ]
+    failed = 0
+    for case in cases:
+        try:
+            case()
+        except Exception:
+            failed += 1
+            print(f"[{case.__name__}] FAIL")
+            traceback.print_exc()
+    if failed:
+        print(f"\n{failed}/{len(cases)} case(s) failed")
+        return 1
+    print(f"\nAll {len(cases)} case(s) passed")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
