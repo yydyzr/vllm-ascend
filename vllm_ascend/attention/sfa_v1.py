@@ -28,7 +28,7 @@ from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 from vllm_ascend.attention.attention_mask import AttentionMaskBuilder
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
 from vllm_ascend.attention.context_parallel.common_cp import AscendPCPMetadata
-from vllm_ascend.attention.fused_overlap_debug import dump_op_inputs
+from vllm_ascend.attention.fused_overlap_debug import dump_op_inputs, dump_op_output
 from vllm_ascend.attention.mla_v1 import MAX_O_PROJ_PREFETCH_SIZE, MLAPO_MAX_SUPPORTED_TOKENS
 from vllm_ascend.attention.utils import (
     AscendCommonAttentionMetadata,
@@ -1516,6 +1516,26 @@ class AscendSFAImpl(MLAAttentionImpl):
             )
         return topk_indices.contiguous()
 
+    def _get_first_decode_dump_location(self, layer_name: str) -> tuple[int, int] | None:
+        if (
+            not envs.VLLM_ASCEND_SFA_DUMP_DIR
+            or self._sfa_decode_debug_dumped
+            or get_forward_context().capturing
+        ):
+            return None
+
+        layer_match = re.search(r"(?:^|\.)layers\.(\d+)(?:\.|$)", layer_name)
+        if layer_match is None:
+            return None
+        layer_id = int(layer_match.group(1))
+        if layer_id != envs.VLLM_ASCEND_SFA_DUMP_LAYER:
+            return None
+
+        rank = self.tp_rank
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            rank = torch.distributed.get_rank()
+        return layer_id, rank
+
     def _maybe_dump_first_decode_op_inputs(
         self,
         *,
@@ -1524,23 +1544,10 @@ class AscendSFAImpl(MLAAttentionImpl):
         op_name: str,
         inputs: dict[str, Any],
     ) -> None:
-        if (
-            not envs.VLLM_ASCEND_SFA_DUMP_DIR
-            or self._sfa_decode_debug_dumped
-            or get_forward_context().capturing
-        ):
+        dump_location = self._get_first_decode_dump_location(layer_name)
+        if dump_location is None:
             return
-
-        layer_match = re.search(r"(?:^|\.)layers\.(\d+)(?:\.|$)", layer_name)
-        if layer_match is None:
-            return
-        layer_id = int(layer_match.group(1))
-        if layer_id != envs.VLLM_ASCEND_SFA_DUMP_LAYER:
-            return
-
-        rank = self.tp_rank
-        if torch.distributed.is_available() and torch.distributed.is_initialized():
-            rank = torch.distributed.get_rank()
+        layer_id, rank = dump_location
         output = dump_op_inputs(
             envs.VLLM_ASCEND_SFA_DUMP_DIR,
             mode=mode,
@@ -1551,12 +1558,41 @@ class AscendSFAImpl(MLAAttentionImpl):
             rank=rank,
             pid=os.getpid(),
         )
-        self._sfa_decode_debug_dumped = True
         logger.warning(
             "[sfa_decode_dump] saved %s op inputs layer=%s path=%s",
             mode,
             layer_name,
             output,
+        )
+
+    def _maybe_dump_first_decode_op_output(
+        self,
+        *,
+        layer_name: str,
+        mode: str,
+        op_name: str,
+        output: torch.Tensor,
+    ) -> None:
+        dump_location = self._get_first_decode_dump_location(layer_name)
+        if dump_location is None:
+            return
+        layer_id, rank = dump_location
+        output_path = dump_op_output(
+            envs.VLLM_ASCEND_SFA_DUMP_DIR,
+            mode=mode,
+            layer_name=layer_name,
+            layer_id=layer_id,
+            op_name=op_name,
+            output=output,
+            rank=rank,
+            pid=os.getpid(),
+        )
+        self._sfa_decode_debug_dumped = True
+        logger.warning(
+            "[sfa_decode_dump] saved %s op output layer=%s path=%s",
+            mode,
+            layer_name,
+            output_path,
         )
 
     def _flatten_selection_buffer(
@@ -1836,6 +1872,12 @@ class AscendSFAImpl(MLAAttentionImpl):
         )
         attn_output = fused_op(**fused_inputs)
         attn_output = attn_output[..., : ql_nope_decode.shape[-1]].contiguous()
+        self._maybe_dump_first_decode_op_output(
+            layer_name=layer_name,
+            mode="fused",
+            op_name="npu_fused_sparse_attention_overlap",
+            output=attn_output,
+        )
         return attn_output
 
     def _execute_sparse_flash_attention_process(
@@ -2001,7 +2043,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                 },
             )
 
-        return DeviceOperator.execute_sparse_flash_attention_process(
+        attn_output = DeviceOperator.execute_sparse_flash_attention_process(
             self,
             ql_nope,
             q_pe,
@@ -2011,6 +2053,14 @@ class AscendSFAImpl(MLAAttentionImpl):
             actual_seq_lengths_query,
             actual_seq_lengths_key,
         )
+        if attn_metadata.num_decodes > 0 and attn_metadata.num_decode_tokens > 0:
+            self._maybe_dump_first_decode_op_output(
+                layer_name=layer_name,
+                mode="sfa",
+                op_name="npu_sparse_flash_attention",
+                output=attn_output[:attn_metadata.num_decode_tokens],
+            )
+        return attn_output
 
     def forward(
         self,
