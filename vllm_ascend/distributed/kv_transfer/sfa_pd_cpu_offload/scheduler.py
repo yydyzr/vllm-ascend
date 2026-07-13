@@ -515,12 +515,14 @@ class SFAPDCpuOffloadScheduler:
             tracker = self._request_trackers[req_id]
             tracker.main_hbm_ids.extend(new_main_hbm_by_req.get(req_id, []))
             if self.use_fused_overlap_offload:
-                if req_id not in num_computed_by_req:
-                    raise RuntimeError(
-                        "PD fused_overlap offload requires cached request metadata "
-                        f"to determine the token-D2H destination: req_id={req_id}"
-                    )
-                num_computed = num_computed_by_req[req_id]
+                # A request can be scheduled before it appears in
+                # scheduled_cached_reqs. In that case use the token count
+                # tracked from remote prefill and prior fused D2H steps; do
+                # not fall back to zero, which would overwrite token 0.
+                num_computed = num_computed_by_req.get(
+                    req_id,
+                    tracker.num_cpu_saved_tokens,
+                )
                 num_new_tokens = _num_finalized_scheduled_tokens(scheduler_output, req_id)
                 num_tokens_after_step = num_computed + num_new_tokens
                 num_blocks_needed = cdiv(num_tokens_after_step, self._main_block_size)
