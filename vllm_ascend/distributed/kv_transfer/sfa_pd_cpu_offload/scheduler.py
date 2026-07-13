@@ -20,10 +20,16 @@ import httpx
 from vllm.config import VllmConfig
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorMetadata
 from vllm.logger import logger
+from vllm.utils.math_utils import cdiv
 from vllm.utils.network_utils import get_ip
 from vllm.v1.kv_cache_interface import KVCacheConfig
 
 from vllm_ascend import envs
+from vllm_ascend.ascend_config import (
+    KV_OFFLOAD_MODE_FUSED_OVERLAP,
+    get_ascend_config,
+    init_ascend_config,
+)
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_connector import (
     MooncakeLayerwiseConnectorScheduler,
     get_external_request_id,
@@ -44,6 +50,12 @@ if TYPE_CHECKING:
 
 _INDEXER_GROUP_IDX = 0
 _MAIN_GROUP_IDX = 1
+
+
+def _num_finalized_scheduled_tokens(scheduler_output: "SchedulerOutput", req_id: str) -> int:
+    num_scheduled_tokens = scheduler_output.num_scheduled_tokens[req_id]
+    draft_tokens = scheduler_output.scheduled_spec_decode_tokens.get(req_id, [])
+    return max(num_scheduled_tokens - len(draft_tokens), 0)
 
 
 class SFAPDProducerScheduler(MooncakeLayerwiseConnectorScheduler):
@@ -78,6 +90,13 @@ class SFAPDCpuOffloadScheduler:
         self.kv_cache_config = kv_cache_config
         self.use_layerwise = use_layerwise
         self.engine_id = vllm_config.kv_transfer_config.engine_id
+        init_ascend_config(vllm_config)
+        ascend_config = get_ascend_config()
+        self.use_offload = ascend_config.use_offload
+        self.kv_offload_mode = ascend_config.kv_offload_mode
+        self.use_fused_overlap_offload = (
+            self.use_offload and self.kv_offload_mode == KV_OFFLOAD_MODE_FUSED_OVERLAP
+        )
 
         self.block_size = [
             group_spec.kv_cache_spec.block_size
@@ -168,23 +187,29 @@ class SFAPDCpuOffloadScheduler:
         )
         main_hbm_ids = npu_block_ids_by_group[_MAIN_GROUP_IDX] if len(npu_block_ids_by_group) > _MAIN_GROUP_IDX else []
 
-        # Part A: the CPU pool stores only FULL main MLA blocks (floor division).
-        # The optional partial last block stays in HBM — D's logical-last group1
-        # block — so decode can append to it; it is offloaded to CPU once full
-        # (decode offload path). num_offloaded_blocks == len(main_cpu_ids) ==
-        # num_full, so the threshold auto-excludes the partial (decode reads it
-        # from HBM, not the stale CPU copy).
+        # Part A: the CPU pool stores main MLA blocks pulled from P.
+        # Legacy keeps only FULL blocks on CPU (floor division) and leaves the
+        # optional partial last block on HBM for decode append.
+        # fused_overlap only reads CPU full_kv_cache, so allocate/pull with
+        # cdiv and skip the partial-HBM split; decode tokens later go through
+        # token-wise D2H via offload_token_start/offload_num_tokens.
         prompt_len = len(request.prompt_token_ids)
-        num_main_cpu_blocks = prompt_len // self._main_block_size
-        has_partial = (prompt_len % self._main_block_size) != 0
+        if self.use_fused_overlap_offload:
+            num_main_cpu_blocks = cdiv(prompt_len, self._main_block_size) if prompt_len > 0 else 0
+            num_full = num_main_cpu_blocks
+            partial_hbm_bid = None
+        else:
+            num_main_cpu_blocks = prompt_len // self._main_block_size
+            num_full = num_main_cpu_blocks
+            has_partial = (prompt_len % self._main_block_size) != 0
+            partial_hbm_bid = main_hbm_ids[-1] if (has_partial and main_hbm_ids) else None
         main_cpu_ids = self.cpu_block_manager.allocate_block(num_main_cpu_blocks) if num_main_cpu_blocks > 0 else []
-        partial_hbm_bid = main_hbm_ids[-1] if (has_partial and main_hbm_ids) else None
 
         tracker = RequestTracker(
             req_id=request.request_id,
             allocated_block_ids_npu=list(indexer_npu_ids),
             allocated_block_ids_cpu=list(main_cpu_ids),
-            num_full=num_main_cpu_blocks,
+            num_full=num_full,
             partial_hbm_bid=partial_hbm_bid,
             main_hbm_ids=list(main_hbm_ids),
         )
@@ -258,6 +283,10 @@ class SFAPDCpuOffloadScheduler:
             req_id: str,
             offload_src: list[int] | None = None,
             offload_dst: list[int] | None = None,
+            *,
+            offload_token_start: int = 0,
+            offload_num_tokens: int = 0,
+            num_tokens_after_step: int = 0,
         ) -> None:
             tracker = self._request_trackers.get(req_id)
             if tracker is None:
@@ -266,7 +295,8 @@ class SFAPDCpuOffloadScheduler:
                 logger.info(
                     "SFAPDCpuOffload D build meta req %s: main_hbm_ids=%s, "
                     "main_cpu_ids=%s, indexer_npu_ids=%s, num_full=%s, "
-                    "partial_hbm=%s, offload_src=%s, offload_dst=%s",
+                    "partial_hbm=%s, offload_src=%s, offload_dst=%s, "
+                    "offload_token_start=%s, offload_num_tokens=%s",
                     req_id,
                     tracker.main_hbm_ids,
                     tracker.allocated_block_ids_cpu,
@@ -275,6 +305,8 @@ class SFAPDCpuOffloadScheduler:
                     tracker.partial_hbm_bid,
                     offload_src or [],
                     offload_dst or [],
+                    offload_token_start,
+                    offload_num_tokens,
                 )
             meta.add_request(
                 ReqMeta(
@@ -287,15 +319,46 @@ class SFAPDCpuOffloadScheduler:
                     partial_hbm_bid=tracker.partial_hbm_bid,
                     offload_src_hbm_ids=offload_src or [],
                     offload_dst_cpu_ids=offload_dst or [],
+                    num_tokens_after_step=num_tokens_after_step,
+                    offload_token_start=offload_token_start,
+                    offload_num_tokens=offload_num_tokens,
                 )
             )
 
         # Seed every newly-allocated remote-prefill request ONCE (prefill: no
         # decode offload). The worker needs this to build request_map so
         # get_finished can report done_recving.
+        # If the same step also schedules decode tokens under fused_overlap,
+        # emit token-range meta here so save_current_kv_tokens still runs.
         seeded: set[str] = set()
         for req_id in list(self._reqs_need_recv):
-            _add_req(req_id)
+            if (
+                self.use_fused_overlap_offload
+                and req_id in scheduler_output.num_scheduled_tokens
+            ):
+                tracker = self._request_trackers[req_id]
+                tracker.main_hbm_ids.extend(new_main_hbm_by_req.get(req_id, []))
+                num_computed = num_computed_by_req.get(req_id, 0)
+                num_new_tokens = _num_finalized_scheduled_tokens(scheduler_output, req_id)
+                num_tokens_after_step = num_computed + num_new_tokens
+                num_blocks_needed = cdiv(num_tokens_after_step, self._main_block_size)
+                num_offloaded = len(tracker.allocated_block_ids_cpu)
+                num_new_offload_blocks = max(num_blocks_needed - num_offloaded, 0)
+                offload_dst = (
+                    self.cpu_block_manager.allocate_block(num_new_offload_blocks)
+                    if num_new_offload_blocks > 0
+                    else []
+                )
+                if offload_dst:
+                    tracker.allocated_block_ids_cpu.extend(offload_dst)
+                _add_req(
+                    req_id,
+                    offload_token_start=num_computed,
+                    offload_num_tokens=num_new_tokens,
+                    num_tokens_after_step=num_tokens_after_step,
+                )
+            else:
+                _add_req(req_id)
             seeded.add(req_id)
         self._reqs_need_recv.clear()
 
@@ -304,6 +367,8 @@ class SFAPDCpuOffloadScheduler:
         # prompt's full blocks in CPU (num_offloaded starts at num_full) and the
         # partial in HBM; as decode fills the partial (and later blocks), they
         # enter [num_offloaded:num_blocks_after_step] and get offloaded here.
+        # fused_overlap instead allocates CPU blocks by cdiv(token_len) and emits
+        # token-range meta so save_current_kv_tokens can D2H the current step.
         for req_id in list(self._request_trackers):
             if req_id in seeded:
                 continue
@@ -311,8 +376,41 @@ class SFAPDCpuOffloadScheduler:
                 continue
             tracker = self._request_trackers[req_id]
             tracker.main_hbm_ids.extend(new_main_hbm_by_req.get(req_id, []))
-            num_new_tokens = scheduler_output.num_scheduled_tokens[req_id]
             num_computed = num_computed_by_req.get(req_id, 0)
+
+            if self.use_fused_overlap_offload:
+                num_new_tokens = _num_finalized_scheduled_tokens(scheduler_output, req_id)
+                num_tokens_after_step = num_computed + num_new_tokens
+                num_blocks_needed = cdiv(num_tokens_after_step, self._main_block_size)
+                num_offloaded = len(tracker.allocated_block_ids_cpu)
+                num_new_offload_blocks = max(num_blocks_needed - num_offloaded, 0)
+                offload_dst = (
+                    self.cpu_block_manager.allocate_block(num_new_offload_blocks)
+                    if num_new_offload_blocks > 0
+                    else []
+                )
+                if offload_dst:
+                    tracker.allocated_block_ids_cpu.extend(offload_dst)
+                if envs.VLLM_ASCEND_SFA_DEBUG:
+                    logger.info(
+                        "SFAPD fused offload req %s: tokens=[%d:%d) "
+                        "cpu_blocks=%d->%d (+%d)",
+                        req_id,
+                        num_computed,
+                        num_tokens_after_step,
+                        num_offloaded,
+                        len(tracker.allocated_block_ids_cpu),
+                        len(offload_dst),
+                    )
+                _add_req(
+                    req_id,
+                    offload_token_start=num_computed,
+                    offload_num_tokens=num_new_tokens,
+                    num_tokens_after_step=num_tokens_after_step,
+                )
+                continue
+
+            num_new_tokens = scheduler_output.num_scheduled_tokens[req_id]
             num_blocks_after_step = (num_computed + num_new_tokens) // self._main_block_size
             num_offloaded = len(tracker.allocated_block_ids_cpu)
             end = min(num_blocks_after_step, len(tracker.main_hbm_ids))
