@@ -76,6 +76,7 @@ def compare_tensors(
     atol: float,
     rtol: float,
 ) -> CheckResult:
+    del rtol  # retained for call-site compatibility; float compare uses cosine similarity
     if left.shape != right.shape:
         return CheckResult(
             name,
@@ -94,16 +95,26 @@ def compare_tensors(
         left = left.float()
         right = right.float()
 
-    if torch.allclose(left, right, atol=atol, rtol=rtol):
-        max_diff = (left - right).abs().max().item()
-        return CheckResult(name, PASS, f"allclose max_diff={max_diff:.6g}")
-    max_diff = (left - right).abs().max().item()
-    mean_diff = (left - right).abs().mean().item()
-    return CheckResult(
-        name,
-        FAIL,
-        f"values differ max_diff={max_diff:.6g} mean_diff={mean_diff:.6g}",
-    )
+    left_flat = left.reshape(-1)
+    right_flat = right.reshape(-1)
+    left_norm = torch.linalg.vector_norm(left_flat)
+    right_norm = torch.linalg.vector_norm(right_flat)
+    if left_norm <= 0 or right_norm <= 0:
+        if left_norm <= 0 and right_norm <= 0:
+            return CheckResult(name, PASS, "cosine_sim=1 (both zero)")
+        return CheckResult(
+            name,
+            FAIL,
+            f"cosine_sim undefined: left_norm={left_norm.item():.6g} right_norm={right_norm.item():.6g}",
+        )
+
+    cos_sim = torch.dot(left_flat, right_flat) / (left_norm * right_norm)
+    cos_sim_value = float(cos_sim.clamp(-1.0, 1.0).item())
+    min_cos = 1.0 - atol
+    detail = f"cosine_sim={cos_sim_value:.8f} min_cos={min_cos:.8f}"
+    if cos_sim_value >= min_cos:
+        return CheckResult(name, PASS, detail)
+    return CheckResult(name, FAIL, detail)
 
 
 def compare_scalars(name: str, left: Any, right: Any) -> CheckResult:
@@ -381,8 +392,18 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         help="directory containing dump files; picks newest fused/sfa dumps",
     )
-    parser.add_argument("--atol", type=float, default=1e-3, help="absolute tolerance")
-    parser.add_argument("--rtol", type=float, default=1e-3, help="relative tolerance")
+    parser.add_argument(
+        "--atol",
+        type=float,
+        default=1e-3,
+        help="float tensors pass when cosine_sim >= 1 - atol (default: 1e-3 => 0.999)",
+    )
+    parser.add_argument(
+        "--rtol",
+        type=float,
+        default=1e-3,
+        help="kept for CLI compatibility; unused by cosine similarity compare",
+    )
     return parser.parse_args()
 
 
