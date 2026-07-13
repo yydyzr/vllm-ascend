@@ -212,6 +212,7 @@ class SFAPDCpuOffloadScheduler:
             num_full=num_full,
             partial_hbm_bid=partial_hbm_bid,
             main_hbm_ids=list(main_hbm_ids),
+            num_cpu_saved_tokens=prompt_len if self.use_fused_overlap_offload else 0,
         )
         self._request_trackers[request.request_id] = tracker
         self._reqs_need_recv.add(request.request_id)
@@ -327,18 +328,17 @@ class SFAPDCpuOffloadScheduler:
 
         # Seed every newly-allocated remote-prefill request ONCE (prefill: no
         # decode offload). The worker needs this to build request_map so
-        # get_finished can report done_recving.
-        # If the same step also schedules decode tokens under fused_overlap,
-        # emit token-range meta here so save_current_kv_tokens still runs.
+        # get_finished can report done_recving. For fused_overlap, the tracker
+        # records the remote prefill length, which is the correct D2H start for
+        # a same-step first decode before scheduled_cached_reqs is populated.
         seeded: set[str] = set()
         for req_id in list(self._reqs_need_recv):
+            tracker = self._request_trackers[req_id]
             if (
                 self.use_fused_overlap_offload
                 and req_id in scheduler_output.num_scheduled_tokens
             ):
-                tracker = self._request_trackers[req_id]
-                tracker.main_hbm_ids.extend(new_main_hbm_by_req.get(req_id, []))
-                num_computed = num_computed_by_req.get(req_id, 0)
+                num_computed = tracker.num_cpu_saved_tokens
                 num_new_tokens = _num_finalized_scheduled_tokens(scheduler_output, req_id)
                 num_tokens_after_step = num_computed + num_new_tokens
                 num_blocks_needed = cdiv(num_tokens_after_step, self._main_block_size)
@@ -351,6 +351,7 @@ class SFAPDCpuOffloadScheduler:
                 )
                 if offload_dst:
                     tracker.allocated_block_ids_cpu.extend(offload_dst)
+                tracker.num_cpu_saved_tokens = num_tokens_after_step
                 _add_req(
                     req_id,
                     offload_token_start=num_computed,
@@ -376,9 +377,14 @@ class SFAPDCpuOffloadScheduler:
                 continue
             tracker = self._request_trackers[req_id]
             tracker.main_hbm_ids.extend(new_main_hbm_by_req.get(req_id, []))
-            num_computed = num_computed_by_req.get(req_id, 0)
 
             if self.use_fused_overlap_offload:
+                if req_id not in num_computed_by_req:
+                    raise RuntimeError(
+                        "PD fused_overlap offload requires cached request metadata "
+                        f"to determine the token-D2H destination: req_id={req_id}"
+                    )
+                num_computed = num_computed_by_req[req_id]
                 num_new_tokens = _num_finalized_scheduled_tokens(scheduler_output, req_id)
                 num_tokens_after_step = num_computed + num_new_tokens
                 num_blocks_needed = cdiv(num_tokens_after_step, self._main_block_size)
@@ -391,6 +397,7 @@ class SFAPDCpuOffloadScheduler:
                 )
                 if offload_dst:
                     tracker.allocated_block_ids_cpu.extend(offload_dst)
+                tracker.num_cpu_saved_tokens = num_tokens_after_step
                 if envs.VLLM_ASCEND_SFA_DEBUG:
                     logger.info(
                         "SFAPD fused offload req %s: tokens=[%d:%d) "
@@ -410,6 +417,7 @@ class SFAPDCpuOffloadScheduler:
                 )
                 continue
 
+            num_computed = num_computed_by_req.get(req_id, 0)
             num_new_tokens = scheduler_output.num_scheduled_tokens[req_id]
             num_blocks_after_step = (num_computed + num_new_tokens) // self._main_block_size
             num_offloaded = len(tracker.allocated_block_ids_cpu)
