@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compare fused_overlap vs no-offload SFA decode operator dump inputs.
+"""Compare fused_overlap vs no-offload SFA decode operator dumps.
 
 Usage:
   # explicit paths
@@ -34,14 +34,21 @@ class CheckResult:
     detail: str
 
 
-def load_payload(path: Path) -> dict[str, Any]:
+def load_input_payload(path: Path) -> dict[str, Any]:
     payload = torch.load(path, map_location="cpu", weights_only=False)
     if "inputs" not in payload:
         raise ValueError(f"{path} is not an SFA op-input dump (missing 'inputs')")
     return payload
 
 
-def find_latest_dump(dump_dir: Path, mode: str) -> Path:
+def load_output_payload(path: Path) -> dict[str, Any]:
+    payload = torch.load(path, map_location="cpu", weights_only=False)
+    if "output" not in payload:
+        raise ValueError(f"{path} is not an SFA op-output dump (missing 'output')")
+    return payload
+
+
+def find_latest_input_dump(dump_dir: Path, mode: str) -> Path:
     matches = sorted(
         dump_dir.glob(f"sfa_{mode}_inputs_*.pt"),
         key=lambda p: p.stat().st_mtime,
@@ -49,6 +56,10 @@ def find_latest_dump(dump_dir: Path, mode: str) -> Path:
     if not matches:
         raise FileNotFoundError(f"no sfa_{mode}_inputs_*.pt found under {dump_dir}")
     return matches[-1]
+
+
+def infer_output_path(input_path: Path) -> Path:
+    return input_path.with_name(input_path.name.replace("_inputs_", "_output_", 1))
 
 
 def _tensor_info(value: Any) -> str:
@@ -296,9 +307,39 @@ def compare_payloads(
     return results
 
 
+def compare_output_payloads(
+    fused_payload: dict[str, Any],
+    sfa_payload: dict[str, Any],
+    *,
+    atol: float,
+    rtol: float,
+) -> list[CheckResult]:
+    results: list[CheckResult] = []
+    if fused_payload.get("mode") != "fused":
+        results.append(
+            CheckResult("output_payload.mode", WARN, f"expected fused, got {fused_payload.get('mode')!r}")
+        )
+    if sfa_payload.get("mode") != "sfa":
+        results.append(
+            CheckResult("output_payload.mode", WARN, f"expected sfa, got {sfa_payload.get('mode')!r}")
+        )
+    results.append(
+        compare_tensors(
+            "attention_output",
+            fused_payload["output"],
+            sfa_payload["output"],
+            atol=atol,
+            rtol=rtol,
+        )
+    )
+    return results
+
+
 def print_report(
     fused_path: Path,
     sfa_path: Path,
+    fused_output_path: Path | None,
+    sfa_output_path: Path | None,
     fused_payload: dict[str, Any],
     sfa_payload: dict[str, Any],
     results: list[CheckResult],
@@ -310,6 +351,10 @@ def print_report(
     print(f"  layer={fused_payload.get('layer_name')} op={fused_payload.get('op_name')}")
     print(f"sfa:   {sfa_path}")
     print(f"  layer={sfa_payload.get('layer_name')} op={sfa_payload.get('op_name')}")
+    if fused_output_path is not None:
+        print(f"fused output: {fused_output_path}")
+    if sfa_output_path is not None:
+        print(f"sfa output:   {sfa_output_path}")
     print("-" * 72)
 
     counts = {PASS: 0, FAIL: 0, WARN: 0, SKIP: 0}
@@ -329,6 +374,8 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--fused", type=Path, help="path to sfa_fused_inputs_*.pt")
     parser.add_argument("--sfa", type=Path, help="path to sfa_sfa_inputs_*.pt")
+    parser.add_argument("--fused-output", type=Path, help="path to sfa_fused_output_*.pt")
+    parser.add_argument("--sfa-output", type=Path, help="path to sfa_sfa_output_*.pt")
     parser.add_argument(
         "--dump-dir",
         type=Path,
@@ -342,8 +389,8 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
     if args.dump_dir is not None:
-        fused_path = find_latest_dump(args.dump_dir, "fused")
-        sfa_path = find_latest_dump(args.dump_dir, "sfa")
+        fused_path = find_latest_input_dump(args.dump_dir, "fused")
+        sfa_path = find_latest_input_dump(args.dump_dir, "sfa")
     elif args.fused is not None and args.sfa is not None:
         fused_path = args.fused
         sfa_path = args.sfa
@@ -351,15 +398,49 @@ def main() -> int:
         print("error: provide --fused/--sfa or --dump-dir", file=sys.stderr)
         return 2
 
-    fused_payload = load_payload(fused_path)
-    sfa_payload = load_payload(sfa_path)
+    fused_output_path = args.fused_output or infer_output_path(fused_path)
+    sfa_output_path = args.sfa_output or infer_output_path(sfa_path)
+    fused_payload = load_input_payload(fused_path)
+    sfa_payload = load_input_payload(sfa_path)
     results = compare_payloads(
         fused_payload,
         sfa_payload,
         atol=args.atol,
         rtol=args.rtol,
     )
-    return print_report(fused_path, sfa_path, fused_payload, sfa_payload, results)
+    missing_outputs = [
+        path
+        for path in (fused_output_path, sfa_output_path)
+        if not path.is_file()
+    ]
+    if missing_outputs:
+        results.append(
+            CheckResult(
+                "attention_output",
+                WARN,
+                f"output dump missing: {', '.join(str(path) for path in missing_outputs)}",
+            )
+        )
+        fused_output_path = None
+        sfa_output_path = None
+    else:
+        results.extend(
+            compare_output_payloads(
+                load_output_payload(fused_output_path),
+                load_output_payload(sfa_output_path),
+                atol=args.atol,
+                rtol=args.rtol,
+            )
+        )
+    return print_report(
+        fused_path,
+        sfa_path,
+        fused_output_path,
+        sfa_output_path,
+        fused_payload,
+        sfa_payload,
+        results,
+    )
 
 
 if __name__ == "__main__":
