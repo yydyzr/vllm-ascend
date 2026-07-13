@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import threading
+import zlib
 from typing import Optional
 from collections.abc import Generator
 
@@ -212,6 +213,12 @@ class SFAKVOffloadWorker:
         max_block_num = cdiv(self.max_model_len, self.block_size)
         self.cpu_block_table = CpuGpuBuffer(self.max_num_reqs, max_block_num, dtype=torch.int32, device='npu', pin_memory=True)
         self.cpu_block_table_host_buffer = torch.zeros([self.max_num_reqs, max_block_num], dtype=torch.int32, device='cpu', pin_memory=True)
+        self.cpu_block_table_req_hashes = torch.empty(
+            self.max_num_reqs,
+            dtype=torch.int64,
+            device='cpu',
+            pin_memory=True,
+        )
         self.lru_expanded_block_table_cpu = torch.empty(
             [self.max_num_topk_rows, max_block_num],
             dtype=torch.int32,
@@ -688,6 +695,10 @@ class SFAKVOffloadWorker:
         for i, req_id in enumerate(self.req_ids[:num_reqs]):
             cpu_block_ids = req_id_to_block_ids[req_id]
             cpu_block_table_np[i][:len(cpu_block_ids)] = np.array([cpu_block_ids], dtype=np.int32)
+            if envs.VLLM_ASCEND_SFA_DEBUG:
+                self.cpu_block_table_req_hashes[i] = zlib.adler32(
+                    req_id.encode('utf-8')
+                )
         self.cpu_block_table.copy_to_gpu(num_reqs)
 
         if self.use_fused_overlap_offload:
@@ -828,6 +839,7 @@ class SFAKVOffloadWorker:
             self.k_caches_cpu[layer_id],
             self.v_caches_cpu[layer_id],
             self.cpu_block_table.gpu,
+            self.cpu_block_table_req_hashes,
         )
 
     def save_current_kv_tokens(

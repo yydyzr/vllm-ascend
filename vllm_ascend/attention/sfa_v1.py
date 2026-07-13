@@ -1772,7 +1772,22 @@ class AscendSFAImpl(MLAAttentionImpl):
                 f"resident_capacity={self.lru_resident_capacity} block_size={self.block_size}"
             )
 
-        full_kv_cache_cpu, full_k_rope_cpu, full_kv_block_table = get_fused_overlap_cpu_kv_inputs(layer_name)
+        cpu_kv_inputs = get_fused_overlap_cpu_kv_inputs(layer_name)
+        full_kv_cache_cpu, full_k_rope_cpu, full_kv_block_table = cpu_kv_inputs[:3]
+        if envs.VLLM_ASCEND_SFA_DEBUG and not get_forward_context().capturing:
+            assert len(cpu_kv_inputs) == 4
+            assert attn_metadata.req_ids_tensor is not None
+            cpu_block_table_req_hashes = cpu_kv_inputs[3][:num_reqs]
+            req_ids_tensor = (
+                attn_metadata.req_ids_tensor[:num_reqs]
+                .detach()
+                .to(device='cpu', dtype=torch.int64)
+            )
+            assert torch.equal(cpu_block_table_req_hashes, req_ids_tensor), (
+                "fused_overlap CPU block-table request rows are misaligned: "
+                f"cpu_block_table_req_hashes={cpu_block_table_req_hashes.tolist()} "
+                f"req_ids_tensor={req_ids_tensor.tolist()}"
+            )
         full_kv_cache = self._flatten_pa_cache(full_kv_cache_cpu)
         full_k_rope = self._flatten_pa_cache(full_k_rope_cpu)
         full_kv_block_table = self._to_int32_device(full_kv_block_table[:num_reqs], ql_nope_decode.device)
