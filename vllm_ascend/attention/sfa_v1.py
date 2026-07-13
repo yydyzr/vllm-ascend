@@ -1,3 +1,5 @@
+import os
+import re
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, NamedTuple, TypeVar, Tuple
 
@@ -21,12 +23,13 @@ from vllm.v1.attention.backend import (
 from vllm.v1.kv_cache_interface import AttentionSpec
 from vllm.v1.worker.utils import select_common_block_size
 
+from vllm_ascend import envs
 from vllm_ascend.ascend_config import KV_OFFLOAD_MODE_FUSED_OVERLAP, get_ascend_config
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
-from vllm_ascend import envs
 from vllm_ascend.attention.attention_mask import AttentionMaskBuilder
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
 from vllm_ascend.attention.context_parallel.common_cp import AscendPCPMetadata
+from vllm_ascend.attention.fused_overlap_debug import dump_op_inputs
 from vllm_ascend.attention.mla_v1 import MAX_O_PROJ_PREFETCH_SIZE, MLAPO_MAX_SUPPORTED_TOKENS
 from vllm_ascend.attention.utils import (
     SFA_QSFA_TILE_SIZE,
@@ -36,13 +39,13 @@ from vllm_ascend.attention.utils import (
     get_sfa_qsfa_packed_head_dim,
     maybe_record_attention_compute_start,
     get_fused_overlap_cpu_kv_inputs,
+    maybe_prepare_lru_resident_and_load_graph,
     maybe_save_current_kv_tokens_to_connector,
     maybe_save_kv_layer_to_connector,
+    split_decodes_and_prefills,
     trans_rope_weight,
     transdata,
     wait_for_kv_layer_from_connector,
-    split_decodes_and_prefills,
-    maybe_prepare_lru_resident_and_load_graph,
 )
 from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.device.mxfp_compat import FLOAT8_E8M0FNU_DTYPE
@@ -796,6 +799,7 @@ class AscendSFAImpl(MLAAttentionImpl):
         self.fused_overlap_last_req_ids: torch.Tensor | None = None
         self._fused_overlap_selection_capacity: tuple[int, int, int, int] | None = None
         self._fused_overlap_decode_logged = False
+        self._sfa_decode_debug_dumped = False
 
     @staticmethod
     def update_graph_params(
@@ -1708,6 +1712,49 @@ class AscendSFAImpl(MLAAttentionImpl):
             )
         return topk_indices.contiguous()
 
+    def _maybe_dump_first_decode_op_inputs(
+        self,
+        *,
+        layer_name: str,
+        mode: str,
+        op_name: str,
+        inputs: dict[str, Any],
+    ) -> None:
+        if (
+            not envs.VLLM_ASCEND_SFA_DUMP_DIR
+            or self._sfa_decode_debug_dumped
+            or get_forward_context().capturing
+        ):
+            return
+
+        layer_match = re.search(r"(?:^|\.)layers\.(\d+)(?:\.|$)", layer_name)
+        if layer_match is None:
+            return
+        layer_id = int(layer_match.group(1))
+        if layer_id != envs.VLLM_ASCEND_SFA_DUMP_LAYER:
+            return
+
+        rank = self.tp_rank
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            rank = torch.distributed.get_rank()
+        output = dump_op_inputs(
+            envs.VLLM_ASCEND_SFA_DUMP_DIR,
+            mode=mode,
+            layer_name=layer_name,
+            layer_id=layer_id,
+            op_name=op_name,
+            inputs=inputs,
+            rank=rank,
+            pid=os.getpid(),
+        )
+        self._sfa_decode_debug_dumped = True
+        logger.warning(
+            "[sfa_decode_dump] saved %s op inputs layer=%s path=%s",
+            mode,
+            layer_name,
+            output,
+        )
+
     def _flatten_selection_buffer(
         self,
         buffer: torch.Tensor,
@@ -1958,26 +2005,34 @@ class AscendSFAImpl(MLAAttentionImpl):
             )
 
         fused_query = torch.cat([ql_nope_decode, q_pe_decode], dim=-1).contiguous()
-        attn_output = fused_op(
-            query=fused_query,
-            selection_k_rope=selection_k_rope,
-            selection_kv_cache=selection_kv_cache,
-            selection_kv_block_table=selection_block_table,
-            selection_kv_block_status=selection_block_status,
-            selection_topk_indices=topk_indices_decode,
-            full_k_rope=full_k_rope,
-            full_kv_cache=full_kv_cache,
-            full_kv_block_table=full_kv_block_table,
-            full_kv_actual_seq=full_kv_actual_seq,
-            full_q_actual_seq=full_q_actual_seq,
-            scale_value=self.scale,
-            sparse_block_size=1,
-            selection_topk_block_size=1,
-            layout_query="TND",
-            layout_kv="PA_BSND",
-            sparse_mode=3,
+        fused_inputs = {
+            "query": fused_query,
+            "selection_k_rope": selection_k_rope,
+            "selection_kv_cache": selection_kv_cache,
+            "selection_kv_block_table": selection_block_table,
+            "selection_kv_block_status": selection_block_status,
+            "selection_topk_indices": topk_indices_decode,
+            "full_k_rope": full_k_rope,
+            "full_kv_cache": full_kv_cache,
+            "full_kv_block_table": full_kv_block_table,
+            "full_kv_actual_seq": full_kv_actual_seq,
+            "full_q_actual_seq": full_q_actual_seq,
+            "scale_value": self.scale,
+            "sparse_block_size": 1,
+            "selection_topk_block_size": 1,
+            "layout_query": "TND",
+            "layout_kv": "PA_BSND",
+            "sparse_mode": 3,
+        }
+        self._maybe_dump_first_decode_op_inputs(
+            layer_name=layer_name,
+            mode="fused",
+            op_name="npu_fused_sparse_attention_overlap",
+            inputs=fused_inputs,
         )
-        return attn_output[..., : ql_nope_decode.shape[-1]].contiguous()
+        attn_output = fused_op(**fused_inputs)
+        attn_output = attn_output[..., : ql_nope_decode.shape[-1]].contiguous()
+        return attn_output
 
     def _execute_sparse_flash_attention_process(
         self, ql_nope, q_pe, kv_cache, topk_indices, attn_metadata, actual_seq_lengths_query, actual_seq_lengths_key, layer_name="",
@@ -2115,6 +2170,32 @@ class AscendSFAImpl(MLAAttentionImpl):
                 attn_output = padded
 
             return attn_output
+
+        if attn_metadata.num_decodes > 0 and attn_metadata.num_decode_tokens > 0:
+            num_decode_tokens = attn_metadata.num_decode_tokens
+            num_decodes = attn_metadata.num_decodes
+            self._maybe_dump_first_decode_op_inputs(
+                layer_name=layer_name,
+                mode="sfa",
+                op_name="npu_sparse_flash_attention",
+                inputs={
+                    "query": ql_nope[:num_decode_tokens],
+                    "key": kv,
+                    "value": kv,
+                    "sparse_indices": topk_indices[:num_decode_tokens],
+                    "scale_value": self.scale,
+                    "sparse_block_size": 1,
+                    "block_table": block_table[:num_decodes],
+                    "actual_seq_lengths_query": actual_seq_lengths_query[:num_decodes],
+                    "actual_seq_lengths_kv": actual_seq_lengths_key[:num_decodes],
+                    "query_rope": q_pe[:num_decode_tokens],
+                    "key_rope": key_rope,
+                    "layout_query": "TND",
+                    "layout_kv": "PA_BSND",
+                    "sparse_mode": 3,
+                    "attention_mode": 2,
+                },
+            )
 
         return DeviceOperator.execute_sparse_flash_attention_process(
             self,
