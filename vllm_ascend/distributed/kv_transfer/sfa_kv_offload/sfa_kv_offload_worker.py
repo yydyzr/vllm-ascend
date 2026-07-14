@@ -280,8 +280,13 @@ class SFAKVOffloadWorker:
         config = offload.OffloadConfig()
         config.device_id = torch_npu.npu.current_device()
         config.size = self.allocate_dram_size
-        config.world_size = self.tp_size
-        config.rank_id = self.tp_rank
+        if self.use_fused_overlap_offload:
+            # Each TP rank writes and reads its own locally backed host pool.
+            config.world_size = 1
+            config.rank_id = 0
+        else:
+            config.world_size = self.tp_size
+            config.rank_id = self.tp_rank
         offload.initialize(config)
         self.tp_group.barrier()
 

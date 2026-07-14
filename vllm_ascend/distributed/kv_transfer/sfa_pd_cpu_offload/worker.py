@@ -173,9 +173,9 @@ class SFAPDCpuOffloadConsumerWorker:
         # SFA worker allocates k_caches_cpu/v_caches_cpu + LRU buffers here.
         self.sfa_worker.register_kv_caches(kv_caches)
 
-        # The full Main KV CPU pool is TP-shared and allocated only by TP0.
-        # Every rank still runs PD receive because Indexer and partial Main KV
-        # land in rank-local HBM.
+        # Fused overlap gives every TP rank a local Main KV CPU pool. Legacy
+        # keeps the TP-shared pool on TP0. Every rank still runs PD receive
+        # because Indexer and partial Main KV land in rank-local HBM.
         k_caches_cpu = getattr(self.sfa_worker, "k_caches_cpu", None)
         v_caches_cpu = getattr(self.sfa_worker, "v_caches_cpu", None)
 
@@ -371,8 +371,8 @@ class SFAPDCpuOffloadConsumerWorker:
         v_caches_cpu: list[torch.Tensor] | None,
     ) -> None:
         """memfabric pull mode: D does NOT register anything. Only P registers
-        its HBM. Every D rank reads local HBM legs; TP0 also reads full Main KV
-        into the shared CPU pool."""
+        its HBM. Every D rank reads local HBM legs. Fused overlap also reads
+        full Main KV into its rank-local CPU pool; legacy does so only on TP0."""
         num_blocks = self.kv_cache_config.num_blocks
         indexer_names = list(self.kv_cache_config.kv_cache_groups[_INDEXER_GROUP_IDX].layer_names)
 
@@ -551,24 +551,34 @@ class SFAPDCpuOffloadProducerWorker:
         is at kernel granularity, scale 1)."""
         if self._backend == BACKEND_MEMFABRIC:
             self.current_layer = 0
-            for req_id, req_meta in getattr(metadata, "requests", {}).items():
+            requests = getattr(metadata, "requests", {})
+            for req_id, req_meta in requests.items():
                 if req_meta.remote_port is None:
                     continue
                 remote_tp_size = req_meta.remote_tp_size or self.tp_size
-                tp_ratio = max(1, self.tp_size // remote_tp_size)
+                if remote_tp_size != self.tp_size:
+                    raise RuntimeError(
+                        "SFAPDCpuOffloadConnector requires matching P/D TP sizes; "
+                        f"request={req_id}, P TP={self.tp_size}, D TP={remote_tp_size}"
+                    )
+
+            for req_id, req_meta in requests.items():
+                if req_meta.remote_port is None:
+                    continue
                 old_remote_port = req_meta.remote_port
-                req_meta.remote_port = req_meta.remote_port + self.tp_rank // tp_ratio
+                req_meta.remote_port = req_meta.remote_port + self.tp_rank
                 if envs.VLLM_ASCEND_SFA_DEBUG:
                     logger.info(
                         "MembPull P start_load_kv req %s: remote_host=%s, "
-                        "remote_port=%s->%s, tp_rank=%s, tp_ratio=%s, local_block_ids=%s, "
+                        "remote_port=%s->%s, tp_rank=%s, p_tp_size=%s, d_tp_size=%s, local_block_ids=%s, "
                         "chunk_finish=%s, local_computed_tokens=%s, local_transed_tokens=%s",
                         req_id,
                         req_meta.remote_host,
                         old_remote_port,
                         req_meta.remote_port,
                         self.tp_rank,
-                        tp_ratio,
+                        self.tp_size,
+                        req_meta.remote_tp_size or self.tp_size,
                         req_meta.local_block_ids,
                         req_meta.chunk_finish,
                         req_meta.local_computed_tokens,

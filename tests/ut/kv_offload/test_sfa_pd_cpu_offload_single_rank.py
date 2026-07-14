@@ -1,4 +1,4 @@
-"""Regression tests for the TP-shared SFA PD CPU pool."""
+"""Regression tests for SFA PD CPU pool and rank routing semantics."""
 
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -258,3 +258,56 @@ def test_producer_worker_preserves_transfer_timeout_setup(monkeypatch):
         SFAPDCpuOffloadProducerWorker(config, kv_cache_config, "engine-0")
 
     assert worker_module.os.environ["ASCEND_TRANSFER_TIMEOUT"] == "4321"
+
+
+def _make_producer_worker_for_start_load(*, tp_rank: int, tp_size: int) -> SFAPDCpuOffloadProducerWorker:
+    worker = SFAPDCpuOffloadProducerWorker.__new__(SFAPDCpuOffloadProducerWorker)
+    worker._backend = "memfabric"
+    worker.current_layer = 7
+    worker.tp_rank = tp_rank
+    worker.tp_size = tp_size
+    return worker
+
+
+def _make_producer_req_meta(*, remote_port: int, remote_tp_size: int):
+    return SimpleNamespace(
+        remote_host="127.0.0.1",
+        remote_port=remote_port,
+        remote_tp_size=remote_tp_size,
+        local_block_ids=[[1]],
+        chunk_finish=False,
+        local_computed_tokens=128,
+        local_transed_tokens=0,
+    )
+
+
+def test_producer_start_load_maps_matching_tp_rank_to_same_decode_rank():
+    worker = _make_producer_worker_for_start_load(tp_rank=2, tp_size=4)
+    req_meta = _make_producer_req_meta(remote_port=14579, remote_tp_size=4)
+    metadata = SimpleNamespace(requests={"req-0": req_meta})
+
+    worker.start_load_kv(metadata)
+
+    assert worker.current_layer == 0
+    assert req_meta.remote_port == 14581
+
+
+def test_producer_start_load_rejects_tp_mismatch_without_mutating_ports():
+    worker = _make_producer_worker_for_start_load(tp_rank=1, tp_size=4)
+    matching = _make_producer_req_meta(remote_port=14579, remote_tp_size=4)
+    mismatching = _make_producer_req_meta(remote_port=15579, remote_tp_size=2)
+    metadata = SimpleNamespace(
+        requests={
+            "req-matching": matching,
+            "req-mismatching": mismatching,
+        }
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match=r"request=req-mismatching, P TP=4, D TP=2",
+    ):
+        worker.start_load_kv(metadata)
+
+    assert matching.remote_port == 14579
+    assert mismatching.remote_port == 15579
