@@ -1737,18 +1737,17 @@ class AscendSFAImpl(MLAAttentionImpl):
                 )
         req_ids = attn_metadata.req_ids_tensor[:num_reqs].to(device=last_req_ids.device, dtype=torch.long)
         current_req_ids = req_ids[token_to_req]
-        # Temporary: force full selection miss every step to isolate cross-step
-        # selection-cache hit bugs (wrong KV reuse → repetition / off-topic).
-        # Restore req-id-based masked_fill_ once hit path is fixed.
-        selection_kv_block_status.fill_(-1)
+        changed_rows = last_req_ids != current_req_ids
+        selection_kv_block_status.masked_fill_(changed_rows.view(num_tokens, 1, 1), -1)
         last_req_ids.copy_(current_req_ids)
 
         if envs.VLLM_ASCEND_SFA_DEBUG and not get_forward_context().capturing:
+            changed_count = int(changed_rows.sum().item())
             logger.info(
-                "[fused_overlap_offload][selection][debug] num_tokens=%s num_reqs=%s "
-                "force_full_miss=1",
+                "[fused_overlap_offload][selection][debug] num_tokens=%s num_reqs=%s changed_rows=%s",
                 num_tokens,
                 num_reqs,
+                changed_count,
             )
 
     def _execute_fused_overlap_offload_decode(
