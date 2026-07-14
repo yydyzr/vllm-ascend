@@ -6,17 +6,21 @@ Steps:
   2) If inputs align, run fused op on NPU and compare output to baseline dump
 
 Requires NPU + registered ``npu_fused_sparse_attention_overlap``.
+CPU full KV must be host-visible to the fused kernel; choose one backend:
+  --cpu-kv-backend offload     (memfabric_hybrid.offload.empty, production path)
+  --cpu-kv-backend torch_npu   (torch_npu.empty_with_swapped_memory)
 
 Usage:
   python examples/replay_sfa_fused_dump.py \\
       --fused /tmp/sfa-dump/sfa_fused_inputs_layer0_step1_rank0_pid123.pt \\
       --sfa /tmp/sfa-dump/sfa_sfa_inputs_layer0_step1_rank0_pid456.pt \\
-      --baseline /tmp/sfa-dump/sfa_sfa_output_layer0_step1_rank0_pid456.pt
+      --cpu-kv-backend offload
 """
 
 from __future__ import annotations
 
 import argparse
+import math
 import re
 import sys
 from pathlib import Path
@@ -31,10 +35,116 @@ if str(_SCRIPT_DIR) not in sys.path:
 import compare_sfa_decode_dump as dump_cmp  # noqa: E402
 
 _LAYER_STEP_RE = re.compile(r"layer(?P<layer>\d+)_step(?P<step>\d+)")
+_CPU_CACHE_ALIGNMENT = 2 * 1024 * 1024
 
 
 def _npu_available() -> bool:
     return hasattr(torch, "npu") and torch.npu.is_available()
+
+
+def _require_offload():
+    try:
+        from memfabric_hybrid import offload
+    except ImportError as exc:
+        raise RuntimeError(
+            "memfabric_hybrid is required for --cpu-kv-backend=offload: "
+            f"{exc}"
+        ) from exc
+    return offload
+
+
+def _require_torch_npu_swapped_empty():
+    try:
+        import torch_npu
+    except ImportError as exc:
+        raise RuntimeError(
+            "torch_npu is required for --cpu-kv-backend=torch_npu: "
+            f"{exc}"
+        ) from exc
+    fn = getattr(torch_npu, "empty_with_swapped_memory", None)
+    if fn is None:
+        raise RuntimeError(
+            "torch_npu.empty_with_swapped_memory is unavailable in this torch_npu build"
+        )
+    return fn
+
+
+def _align_memory(tensor: torch.Tensor, alignment: int) -> torch.Tensor:
+    data_ptr = tensor.data_ptr()
+    aligned_addr = (data_ptr + alignment - 1) // alignment * alignment
+    offset = (aligned_addr - data_ptr) // tensor.element_size()
+    return tensor[int(offset) :]
+
+
+def _empty_offload_cpu_tensor(
+    shape: list[int] | torch.Size,
+    dtype: torch.dtype,
+    *,
+    alignment: int = _CPU_CACHE_ALIGNMENT,
+) -> torch.Tensor:
+    """Allocate CPU tensor from memfabric/hybm pool (MTE-visible)."""
+    offload = _require_offload()
+    shape_list = list(shape)
+    num_elements = 1
+    for dim in shape_list:
+        num_elements *= int(dim)
+    extra_elements = math.ceil(alignment / torch.empty((), dtype=dtype).element_size())
+    tensor = offload.empty(
+        [num_elements + extra_elements],
+        dtype=dtype,
+        pin_memory=True,
+    )
+    return _align_memory(tensor, alignment)[:num_elements].view(shape_list)
+
+
+def _empty_torch_npu_swapped_tensor(
+    shape: list[int] | torch.Size,
+    dtype: torch.dtype,
+    *,
+    device: torch.device,
+) -> torch.Tensor:
+    """Allocate host-backed tensor via torch_npu swapped-memory allocator."""
+    empty_fn = _require_torch_npu_swapped_empty()
+    return empty_fn(list(shape), dtype=dtype, device=device)
+
+
+def _copy_to_host_visible_kv(
+    src: torch.Tensor,
+    *,
+    backend: str,
+    device: torch.device,
+) -> torch.Tensor:
+    if not isinstance(src, torch.Tensor):
+        raise TypeError(f"expected torch.Tensor, got {type(src)}")
+    src_cpu = src.detach().contiguous().cpu()
+    if backend == "offload":
+        dst = _empty_offload_cpu_tensor(src_cpu.shape, src_cpu.dtype)
+        dst.copy_(src_cpu)
+        return dst
+    if backend == "torch_npu":
+        dst = _empty_torch_npu_swapped_tensor(src_cpu.shape, src_cpu.dtype, device=device)
+        # empty_with_swapped_memory tensors are device=npu but host-backed.
+        dst.copy_(src_cpu.to(device=dst.device, dtype=dst.dtype))
+        return dst
+    raise ValueError(f"unsupported cpu-kv-backend: {backend!r}")
+
+
+def _init_offload_pool_for_inputs(inputs: dict[str, Any]) -> Any:
+    """Initialize memfabric offload pool large enough for dumped CPU KV caches."""
+    offload = _require_offload()
+    nbytes = 0
+    for key in ("full_kv_cache", "full_k_rope"):
+        value = inputs.get(key)
+        if isinstance(value, torch.Tensor):
+            nbytes += int(value.numel() * value.element_size())
+    # Align + temporary overhead for two tensors.
+    alloc_bytes = max(nbytes * 2 + 4 * _CPU_CACHE_ALIGNMENT, 256 * 1024 * 1024)
+    device_id = int(torch.npu.current_device())
+    ret = offload.initialize(device_id, alloc_bytes)
+    if ret != 0:
+        raise RuntimeError(f"offload.initialize failed, ret={ret}, bytes={alloc_bytes}")
+    print(f"Initialized offload.empty pool: device={device_id} bytes={alloc_bytes}")
+    return offload
 
 
 def _get_fused_op():
@@ -80,8 +190,13 @@ def _to_device(value: Any, device: torch.device) -> Any:
     return value
 
 
-def _prepare_fused_kwargs(inputs: dict[str, Any], device: torch.device) -> dict[str, Any]:
-    """Mirror production: query/selection on NPU, full KV stays on CPU."""
+def _prepare_fused_kwargs(
+    inputs: dict[str, Any],
+    device: torch.device,
+    *,
+    cpu_kv_backend: str,
+) -> dict[str, Any]:
+    """Mirror production: query/selection on NPU, full KV on host-visible memory."""
     npu_keys = {
         "query",
         "selection_k_rope",
@@ -102,7 +217,14 @@ def _prepare_fused_kwargs(inputs: dict[str, Any], device: torch.device) -> dict[
                 tensor = tensor.clone()
             kwargs[name] = tensor
         elif name in cpu_keys:
-            kwargs[name] = value.contiguous() if isinstance(value, torch.Tensor) else value
+            if not isinstance(value, torch.Tensor):
+                raise TypeError(f"{name} must be a tensor, got {type(value)}")
+            # Fused kernel reads full KV via MTE; ordinary torch CPU tensors fail.
+            kwargs[name] = _copy_to_host_visible_kv(
+                value,
+                backend=cpu_kv_backend,
+                device=device,
+            )
         else:
             kwargs[name] = value
     return kwargs
@@ -149,6 +271,7 @@ def run_fused_vs_baseline_output(
     baseline_output_path: Path,
     *,
     atol: float,
+    cpu_kv_backend: str,
 ) -> tuple[bool, str]:
     fused_payload = dump_cmp.load_input_payload(fused_inputs_path)
     baseline_payload = dump_cmp.load_output_payload(baseline_output_path)
@@ -162,7 +285,11 @@ def run_fused_vs_baseline_output(
     step_tag = f"step={step}" if step is not None else "step=?"
 
     device = torch.device("npu")
-    kwargs = _prepare_fused_kwargs(fused_payload["inputs"], device)
+    kwargs = _prepare_fused_kwargs(
+        fused_payload["inputs"],
+        device,
+        cpu_kv_backend=cpu_kv_backend,
+    )
     attn_output = fused_op(**kwargs)
     attn_output = attn_output[..., : golden.shape[-1]].contiguous().cpu()
 
@@ -176,6 +303,7 @@ def run_fused_vs_baseline_output(
     cos = _cosine_sim(attn_output, golden)
     detail = (
         f"{layer_tag} {step_tag} cosine_sim={cos:.8f} "
+        f"cpu_kv_backend={cpu_kv_backend} "
         f"fused={fused_inputs_path.name} baseline={baseline_output_path.name}"
     )
     if cos >= 1.0 - atol:
@@ -209,6 +337,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help=(
             "Baseline SFA output dump (.pt), e.g. sfa_sfa_output_*.pt. "
             "Default: infer from --sfa by replacing _inputs_ with _output_."
+        ),
+    )
+    parser.add_argument(
+        "--cpu-kv-backend",
+        choices=("offload", "torch_npu"),
+        default="offload",
+        help=(
+            "How to allocate host-visible full KV for fused replay: "
+            "'offload' = memfabric_hybrid.offload.empty; "
+            "'torch_npu' = torch_npu.empty_with_swapped_memory. "
+            "Default: offload."
         ),
     )
     parser.add_argument(
@@ -285,14 +424,37 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     print("=" * 72)
-    print("Step 2/2: replay fused op vs baseline output")
+    print(f"Step 2/2: replay fused op vs baseline output (cpu-kv-backend={args.cpu_kv_backend})")
     print("=" * 72)
-    ok, message = run_fused_vs_baseline_output(
-        fused_op,
-        args.fused,
-        baseline_output,
-        atol=args.atol,
-    )
+
+    offload = None
+    ok = False
+    message = "FAIL: fused replay did not run"
+    try:
+        if args.cpu_kv_backend == "offload":
+            offload = _init_offload_pool_for_inputs(fused_payload["inputs"])
+        else:
+            # Validate API early before preparing kwargs.
+            _require_torch_npu_swapped_empty()
+            print("Using torch_npu.empty_with_swapped_memory for full KV")
+        ok, message = run_fused_vs_baseline_output(
+            fused_op,
+            args.fused,
+            baseline_output,
+            atol=args.atol,
+            cpu_kv_backend=args.cpu_kv_backend,
+        )
+    except Exception as exc:
+        message = f"FAIL: fused replay raised {type(exc).__name__}: {exc}"
+        print(message, file=sys.stderr)
+        return 2
+    finally:
+        if offload is not None:
+            try:
+                offload.uninitialize()
+            except Exception as exc:
+                print(f"WARNING: offload.uninitialize failed: {exc}", file=sys.stderr)
+
     print(message)
     return 0 if ok else 1
 
