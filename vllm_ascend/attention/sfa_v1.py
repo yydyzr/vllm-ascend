@@ -735,7 +735,9 @@ class AscendSFAImpl(MLAAttentionImpl):
         self.fused_overlap_last_req_ids: torch.Tensor | None = None
         self._fused_overlap_selection_capacity: tuple[int, int, int, int] | None = None
         self._fused_overlap_decode_logged = False
-        self._sfa_decode_debug_dumped = False
+        self._sfa_decode_dump_step_count = 0
+        self._sfa_decode_dumped_steps: set[int] = set()
+        self._sfa_decode_dump_pending: tuple[int, int, int] | None = None
 
     @staticmethod
     def update_graph_params(
@@ -1516,10 +1518,12 @@ class AscendSFAImpl(MLAAttentionImpl):
             )
         return topk_indices.contiguous()
 
-    def _get_first_decode_dump_location(self, layer_name: str) -> tuple[int, int] | None:
+    def _prepare_decode_dump_step(self, layer_name: str) -> tuple[int, int, int] | None:
+        """Advance decode-step counter on the dump layer; return dump meta if matched."""
+        dump_steps = envs.VLLM_ASCEND_SFA_DUMP_STEP
         if (
             not envs.VLLM_ASCEND_SFA_DUMP_DIR
-            or self._sfa_decode_debug_dumped
+            or self._sfa_decode_dumped_steps >= dump_steps
             or get_forward_context().capturing
         ):
             return None
@@ -1531,10 +1535,15 @@ class AscendSFAImpl(MLAAttentionImpl):
         if layer_id != envs.VLLM_ASCEND_SFA_DUMP_LAYER:
             return None
 
+        step = self._sfa_decode_dump_step_count
+        self._sfa_decode_dump_step_count += 1
+        if step not in dump_steps or step in self._sfa_decode_dumped_steps:
+            return None
+
         rank = self.tp_rank
         if torch.distributed.is_available() and torch.distributed.is_initialized():
             rank = torch.distributed.get_rank()
-        return layer_id, rank
+        return layer_id, rank, step
 
     def _maybe_dump_first_decode_op_inputs(
         self,
@@ -1544,10 +1553,10 @@ class AscendSFAImpl(MLAAttentionImpl):
         op_name: str,
         inputs: dict[str, Any],
     ) -> None:
-        dump_location = self._get_first_decode_dump_location(layer_name)
+        dump_location = self._prepare_decode_dump_step(layer_name)
         if dump_location is None:
             return
-        layer_id, rank = dump_location
+        layer_id, rank, step = dump_location
         output = dump_op_inputs(
             envs.VLLM_ASCEND_SFA_DUMP_DIR,
             mode=mode,
@@ -1557,11 +1566,14 @@ class AscendSFAImpl(MLAAttentionImpl):
             inputs=inputs,
             rank=rank,
             pid=os.getpid(),
+            step=step,
         )
+        self._sfa_decode_dump_pending = dump_location
         logger.warning(
-            "[sfa_decode_dump] saved %s op inputs layer=%s path=%s",
+            "[sfa_decode_dump] saved %s op inputs layer=%s step=%s path=%s",
             mode,
             layer_name,
+            step,
             output,
         )
 
@@ -1573,10 +1585,9 @@ class AscendSFAImpl(MLAAttentionImpl):
         op_name: str,
         output: torch.Tensor,
     ) -> None:
-        dump_location = self._get_first_decode_dump_location(layer_name)
-        if dump_location is None:
+        if self._sfa_decode_dump_pending is None:
             return
-        layer_id, rank = dump_location
+        layer_id, rank, step = self._sfa_decode_dump_pending
         output_path = dump_op_output(
             envs.VLLM_ASCEND_SFA_DUMP_DIR,
             mode=mode,
@@ -1586,12 +1597,15 @@ class AscendSFAImpl(MLAAttentionImpl):
             output=output,
             rank=rank,
             pid=os.getpid(),
+            step=step,
         )
-        self._sfa_decode_debug_dumped = True
+        self._sfa_decode_dump_pending = None
+        self._sfa_decode_dumped_steps.add(step)
         logger.warning(
-            "[sfa_decode_dump] saved %s op output layer=%s path=%s",
+            "[sfa_decode_dump] saved %s op output layer=%s step=%s path=%s",
             mode,
             layer_name,
+            step,
             output_path,
         )
 
@@ -1723,17 +1737,18 @@ class AscendSFAImpl(MLAAttentionImpl):
                 )
         req_ids = attn_metadata.req_ids_tensor[:num_reqs].to(device=last_req_ids.device, dtype=torch.long)
         current_req_ids = req_ids[token_to_req]
-        changed_rows = last_req_ids != current_req_ids
-        selection_kv_block_status.masked_fill_(changed_rows.view(num_tokens, 1, 1), -1)
+        # Temporary: force full selection miss every step to isolate cross-step
+        # selection-cache hit bugs (wrong KV reuse → repetition / off-topic).
+        # Restore req-id-based masked_fill_ once hit path is fixed.
+        selection_kv_block_status.fill_(-1)
         last_req_ids.copy_(current_req_ids)
 
         if envs.VLLM_ASCEND_SFA_DEBUG and not get_forward_context().capturing:
-            changed_count = int(changed_rows.sum().item())
             logger.info(
-                "[fused_overlap_offload][selection][debug] num_tokens=%s num_reqs=%s changed_rows=%s",
+                "[fused_overlap_offload][selection][debug] num_tokens=%s num_reqs=%s "
+                "force_full_miss=1",
                 num_tokens,
                 num_reqs,
-                changed_count,
             )
 
     def _execute_fused_overlap_offload_decode(

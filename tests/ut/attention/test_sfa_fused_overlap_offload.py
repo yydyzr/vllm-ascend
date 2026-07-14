@@ -113,9 +113,8 @@ def test_fused_overlap_selection_invalidation_uses_req_ids_not_row_position():
             num_reqs=2,
         )
 
-    torch.testing.assert_close(status[0], torch.zeros((1, 5), dtype=torch.int32))
-    torch.testing.assert_close(status[1], torch.full((1, 5), -1, dtype=torch.int32))
-    torch.testing.assert_close(status[2], torch.full((1, 5), -1, dtype=torch.int32))
+    # Temporary force-full-miss: every row is invalidated each step.
+    torch.testing.assert_close(status, torch.full((3, 1, 5), -1, dtype=torch.int32))
     torch.testing.assert_close(last_req_ids, torch.tensor([10, 99, 10], dtype=torch.int64))
 
 

@@ -17,11 +17,13 @@ def dump_op_inputs(
     inputs: dict[str, Any],
     rank: int,
     pid: int,
+    step: int = 0,
 ) -> Path:
     payload = {
         "mode": mode,
         "layer_name": layer_name,
         "op_name": op_name,
+        "step": step,
         "inputs": {
             name: (value.detach().cpu() if isinstance(value, torch.Tensor) else value)
             for name, value in inputs.items()
@@ -29,7 +31,9 @@ def dump_op_inputs(
     }
     output_dir = Path(dump_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    output = output_dir / f"sfa_{mode}_inputs_layer{layer_id}_rank{rank}_pid{pid}.pt"
+    output = output_dir / (
+        f"sfa_{mode}_inputs_layer{layer_id}_step{step}_rank{rank}_pid{pid}.pt"
+    )
     temporary = output.with_suffix(".pt.tmp")
     torch.save(payload, temporary)
     os.replace(temporary, output)
@@ -46,16 +50,20 @@ def dump_op_output(
     output: torch.Tensor,
     rank: int,
     pid: int,
+    step: int = 0,
 ) -> Path:
     payload = {
         "mode": mode,
         "layer_name": layer_name,
         "op_name": op_name,
+        "step": step,
         "output": output.detach().cpu(),
     }
     output_dir = Path(dump_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    output_path = output_dir / f"sfa_{mode}_output_layer{layer_id}_rank{rank}_pid{pid}.pt"
+    output_path = output_dir / (
+        f"sfa_{mode}_output_layer{layer_id}_step{step}_rank{rank}_pid{pid}.pt"
+    )
     temporary = output_path.with_suffix(".pt.tmp")
     torch.save(payload, temporary)
     os.replace(temporary, output_path)
