@@ -1,130 +1,94 @@
-/*
- * Copyright (c) Huawei Technologies Co., Ltd. 2025. All rights reserved.
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- * http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
 #ifndef FUSED_SPARSE_ATTENTION_OVERLAP_TORCH_ADPT_H
 #define FUSED_SPARSE_ATTENTION_OVERLAP_TORCH_ADPT_H
 
-#include <algorithm>
-#include <limits>
+#include <string>
+#include <vector>
 
 namespace vllm_ascend {
 
-namespace {
-
-inline int64_t GetInt32Value(const at::Tensor &tensor, int64_t offset)
+inline void CheckPositiveShape(const at::Tensor &tensor, const char *name)
 {
-    return static_cast<int64_t>(tensor.data_ptr<int32_t>()[offset]);
+    for (size_t i = 0; i < tensor.sizes().size(); i++) {
+        TORCH_CHECK(tensor.size(i) > 0, "All values within ", name, "'s shape should be greater than 0, but shape[",
+                    i, "] is ", tensor.size(i));
+    }
 }
 
-inline void CopySelectedCpuSourceToSelectionCache(
-    const at::Tensor &selection_k_rope,
-    const at::Tensor &selection_kv_cache,
-    const at::Tensor &selection_kv_block_table,
-    const at::Tensor &selection_kv_block_status,
-    const at::Tensor &selection_topk_indices,
-    const at::Tensor &full_k_rope,
-    const at::Tensor &full_kv_cache,
-    const at::Tensor &full_kv_block_table,
-    int64_t selection_topk_block_size)
+inline c10::optional<at::Tensor> MaybeQueryRope(const at::Tensor &query_rope)
+{
+    if (!query_rope.defined() || query_rope.numel() == 0) {
+        return c10::nullopt;
+    }
+    return query_rope;
+}
+
+inline at::Tensor ConstructSelectionKvActualSeq(const at::Tensor &selection_kv_block_table,
+                                                const at::Tensor &selection_topk_indices)
+{
+    std::vector<int64_t> actual_seq_shape = {selection_kv_block_table.size(0)};
+    return at::empty(actual_seq_shape, selection_topk_indices.options().dtype(at::kInt));
+}
+
+inline at::Tensor ConstructSelectionKvActualSeqForSideEffect(const at::Tensor &selection_kv_block_table,
+                                                             const at::Tensor &selection_kv_block_status,
+                                                             const at::Tensor &selection_topk_indices)
+{
+    int64_t topk = selection_topk_indices.size(selection_topk_indices.dim() - 1);
+    if (selection_kv_block_table.size(0) == 1 &&
+        selection_kv_block_status.is_contiguous() &&
+        selection_kv_block_status.numel() == topk + 1) {
+        return selection_kv_block_status.view({1, topk + 1}).select(1, topk);
+    }
+    return ConstructSelectionKvActualSeq(selection_kv_block_table, selection_topk_indices);
+}
+
+inline int64_t GetSelectionTopkHeadNum(const at::Tensor &selection_topk_indices)
 {
     TORCH_CHECK(selection_topk_indices.dim() == 3 || selection_topk_indices.dim() == 4,
-                "selection_topk_indices must be TND or BSND, but got dim ",
+                "selection_topk_indices dim should be 3 or 4, but got ",
                 selection_topk_indices.dim());
-    TORCH_CHECK(selection_kv_block_status.dim() == selection_topk_indices.dim(),
-                "selection_kv_block_status dim must match selection_topk_indices dim");
-    TORCH_CHECK(full_kv_block_table.dim() == 2,
-                "full_kv_block_table must be 2-D");
-
-    const int64_t topk = selection_topk_indices.size(selection_topk_indices.dim() - 1);
-    const int64_t kv_heads = selection_topk_indices.size(selection_topk_indices.dim() - 2);
-    const int64_t row_count = selection_topk_indices.numel() / topk;
-    const int64_t query_token_count = row_count / kv_heads;
-    const int64_t batch_count = full_kv_block_table.size(0);
-    const int64_t full_max_block_num = full_kv_block_table.size(1);
-    const int64_t selection_max_block_num = selection_kv_block_table.size(1);
-    const int64_t selection_block_size = selection_kv_cache.size(1);
-    const int64_t full_block_size = full_kv_cache.size(1);
-
-    auto topk_cpu = selection_topk_indices.to(at::kCPU).contiguous();
-    auto selection_block_table_cpu = selection_kv_block_table.to(at::kCPU).contiguous();
-    auto full_block_table_cpu = full_kv_block_table.to(at::kCPU).contiguous();
-    auto status_cpu = at::full(
-        selection_kv_block_status.sizes(),
-        -1,
-        selection_kv_block_status.options().device(at::kCPU));
-    int32_t *status_data = status_cpu.data_ptr<int32_t>();
-
-    using namespace at::indexing;
-    for (int64_t row = 0; row < row_count; ++row) {
-        const int64_t token_index = row / kv_heads;
-        const int64_t batch_index = std::min(token_index, batch_count - 1);
-        int64_t actual_selected_tokens = 0;
-        for (int64_t topk_index = 0; topk_index < topk; ++topk_index) {
-            const int64_t topk_id = GetInt32Value(topk_cpu, row * topk + topk_index);
-            if (topk_id < 0) {
-                continue;
-            }
-            status_data[row * (topk + 1) + topk_index] = static_cast<int32_t>(topk_id);
-            for (int64_t token_offset = 0; token_offset < selection_topk_block_size; ++token_offset) {
-                const int64_t source_token = topk_id * selection_topk_block_size + token_offset;
-                const int64_t source_table_index = source_token / full_block_size;
-                const int64_t source_block_offset = source_token % full_block_size;
-                if (source_table_index >= full_max_block_num) {
-                    continue;
-                }
-                const int64_t source_block = GetInt32Value(
-                    full_block_table_cpu,
-                    batch_index * full_max_block_num + source_table_index);
-                if (source_block < 0) {
-                    continue;
-                }
-
-                const int64_t selected_token = topk_index * selection_topk_block_size + token_offset;
-                const int64_t destination_table_index = selected_token / selection_block_size;
-                const int64_t destination_block_offset = selected_token % selection_block_size;
-                if (destination_table_index >= selection_max_block_num) {
-                    continue;
-                }
-                const int64_t destination_block = GetInt32Value(
-                    selection_block_table_cpu,
-                    row * selection_max_block_num + destination_table_index);
-                if (destination_block < 0) {
-                    continue;
-                }
-
-                selection_kv_cache.index({destination_block, destination_block_offset}).copy_(
-                    full_kv_cache.index({source_block, source_block_offset}),
-                    true);
-                if (selection_k_rope.numel() > 0 && full_k_rope.numel() > 0) {
-                    selection_k_rope.index({destination_block, destination_block_offset}).copy_(
-                        full_k_rope.index({source_block, source_block_offset}),
-                        true);
-                }
-                ++actual_selected_tokens;
-            }
-        }
-        status_data[row * (topk + 1) + topk] = static_cast<int32_t>(
-            actual_selected_tokens / selection_topk_block_size);
-    }
-    selection_kv_block_status.copy_(status_cpu, true);
+    return selection_topk_indices.size(selection_topk_indices.dim() - 2);
 }
 
-}  // namespace
+inline at::Tensor FlattenTopkIndicesForSfa(const at::Tensor &selection_topk_indices,
+                                           int64_t bsz_seq,
+                                           int64_t sparse_head_num)
+{
+    int64_t topk = selection_topk_indices.size(selection_topk_indices.dim() - 1);
+    if (selection_topk_indices.dim() == 4) {
+        if (selection_topk_indices.is_contiguous()) {
+            return selection_topk_indices.view({bsz_seq, sparse_head_num, topk});
+        }
+        return selection_topk_indices.contiguous().view({bsz_seq, sparse_head_num, topk});
+    }
+    if (selection_topk_indices.is_contiguous()) {
+        return selection_topk_indices;
+    }
+    return selection_topk_indices.contiguous();
+}
 
-at::Tensor npu_fused_sparse_attention_overlap(
-    const at::Tensor &query,
+inline at::Tensor BuildActualSeqQueryForSfa(const at::Tensor &full_q_actual_seq,
+                                            int64_t bsz_seq,
+                                            const at::Tensor &like_tensor)
+{
+    if (full_q_actual_seq.defined() &&
+        full_q_actual_seq.numel() == bsz_seq &&
+        full_q_actual_seq.is_contiguous()) {
+        return full_q_actual_seq;
+    }
+    return at::ones({bsz_seq}, like_tensor.options());
+}
+
+inline at::Tensor BuildFullCacheSparseIndicesForSfa(const at::Tensor &selection_topk_indices,
+                                                    int64_t bsz_seq,
+                                                    int64_t sparse_head_num)
+{
+    return FlattenTopkIndicesForSfa(selection_topk_indices, bsz_seq, sparse_head_num);
+}
+
+inline at::Tensor RunFusedSparseAttentionOverlapSideEffectSplit(
+    const at::Tensor &query_nope,
+    const at::Tensor &query_rope,
     const at::Tensor &selection_k_rope,
     const at::Tensor &selection_kv_cache,
     const at::Tensor &selection_kv_block_table,
@@ -138,49 +102,68 @@ at::Tensor npu_fused_sparse_attention_overlap(
     double scale_value,
     int64_t sparse_block_size,
     int64_t selection_topk_block_size,
-    c10::string_view layout_query,
-    c10::string_view layout_kv,
+    const std::string &layout_query_str,
+    const std::string &layout_kv_str,
     int64_t sparse_mode)
 {
-    std::string layout_query_str = std::string(layout_query);
-    std::string layout_kv_str = std::string(layout_kv);
+    TORCH_CHECK(selection_topk_block_size == 1,
+                "fused sparse attention overlap standalone side-effect path requires selection_topk_block_size=1, "
+                "but got ", selection_topk_block_size);
+    CheckPositiveShape(query_nope, "query_nope");
+    int64_t bsz_seq = query_nope.size(0);
+    int64_t sparse_head_num = GetSelectionTopkHeadNum(selection_topk_indices);
+    int64_t kv_cache_dim = full_kv_cache.size(full_kv_cache.dim() - 1);
+    TORCH_CHECK(query_nope.size(query_nope.dim() - 1) == kv_cache_dim,
+                "query_nope last dim should equal full_kv_cache last dim, but got ",
+                query_nope.size(query_nope.dim() - 1), " and ", kv_cache_dim);
 
-    for (size_t i = 0; i < query.sizes().size(); i++) {
-        TORCH_CHECK(query.size(i) > 0, "All values within query's shape should be greater "
-                                       "than 0, but shape[", i, "] is ", query.size(i));
+    at::Tensor selection_kv_actual_seq = ConstructSelectionKvActualSeqForSideEffect(
+        selection_kv_block_table, selection_kv_block_status, selection_topk_indices);
+    at::Tensor sparse_indices = BuildFullCacheSparseIndicesForSfa(
+        selection_topk_indices, bsz_seq, sparse_head_num);
+    at::Tensor key = full_kv_cache.unsqueeze(2);
+    at::Tensor value = key;
+    at::Tensor actual_seq_query = BuildActualSeqQueryForSfa(full_q_actual_seq, bsz_seq, selection_topk_indices);
+    at::Tensor actual_seq_kv = full_kv_actual_seq.contiguous();
+    at::Tensor sfa_output = at::empty(query_nope.sizes(), query_nope.options().dtype(query_nope.dtype()));
+
+    c10::optional<at::Tensor> block_table_opt = full_kv_block_table;
+    c10::optional<at::Tensor> actual_seq_query_opt = actual_seq_query;
+    c10::optional<at::Tensor> actual_seq_kv_opt = actual_seq_kv;
+    c10::optional<at::Tensor> query_rope_opt = MaybeQueryRope(query_rope);
+    c10::optional<at::Tensor> key_rope_opt = c10::nullopt;
+    if (query_rope_opt.has_value()) {
+        key_rope_opt = full_k_rope.unsqueeze(2);
     }
-
-    // Construct output tensors
-    at::Tensor attention_output = at::empty(query.sizes(), query.options().dtype(query.dtype()));
-
-    const int SIZE = 8;
-    c10::SmallVector<int64_t, SIZE> actual_seq_shape = {selection_kv_block_table.size(0)};
-    at::Tensor selection_kv_actual_seq = at::empty(actual_seq_shape, selection_kv_block_table.options());
-
-    at::Tensor hit_mask = at::empty(selection_topk_indices.sizes(),
-                                    selection_topk_indices.options().dtype(torch::kInt32));
-    at::Tensor miss_indices = at::empty(selection_topk_indices.sizes(),
-                                        selection_topk_indices.options());
 
     char *layout_query_ptr = const_cast<char *>(layout_query_str.c_str());
     char *layout_kv_ptr = const_cast<char *>(layout_kv_str.c_str());
+    EXEC_NPU_CMD(aclnnFusedSparseAttentionOverlap,
+                 query_nope,
+                 key,
+                 value,
+                 sparse_indices,
+                 block_table_opt,
+                 actual_seq_query_opt,
+                 actual_seq_kv_opt,
+                 query_rope_opt,
+                 key_rope_opt,
+                 selection_k_rope,
+                 selection_kv_cache,
+                 selection_kv_block_table,
+                 selection_kv_block_status,
+                 scale_value,
+                 sparse_block_size,
+                 layout_query_ptr,
+                 layout_kv_ptr,
+                 sparse_mode,
+                 sfa_output,
+                 selection_kv_actual_seq);
 
-    EXEC_NPU_CMD(
-        aclnnFusedSparseAttentionOverlap,
-        query,
-        selection_k_rope, selection_kv_cache, selection_kv_block_table,
-        selection_kv_block_status, selection_topk_indices,
-        full_k_rope, full_kv_cache, full_kv_block_table,
-        full_kv_actual_seq, full_q_actual_seq,
-        scale_value, sparse_block_size, selection_topk_block_size,
-        layout_query_ptr, layout_kv_ptr, sparse_mode,
-        hit_mask, miss_indices,
-        attention_output, selection_kv_actual_seq);
-
-    return attention_output;
+    return sfa_output;
 }
 
-at::Tensor npu_fused_sparse_attention_overlap_cpu_source(
+inline at::Tensor RunFusedSparseAttentionOverlapSideEffect(
     const at::Tensor &query,
     const at::Tensor &selection_k_rope,
     const at::Tensor &selection_kv_cache,
@@ -195,17 +178,26 @@ at::Tensor npu_fused_sparse_attention_overlap_cpu_source(
     double scale_value,
     int64_t sparse_block_size,
     int64_t selection_topk_block_size,
-    c10::string_view layout_query,
-    c10::string_view layout_kv,
+    const std::string &layout_query_str,
+    const std::string &layout_kv_str,
     int64_t sparse_mode)
 {
-    TORCH_CHECK(query.dim() == 3,
-                "cpu-source fused path currently expects TND query, but got dim ",
-                query.dim());
-    TORCH_CHECK(selection_kv_cache.dim() == 3,
-                "selection_kv_cache must be [block, block_size, dim]");
-
-    CopySelectedCpuSourceToSelectionCache(
+    CheckPositiveShape(query, "query");
+    int64_t last_dim = query.dim() - 1;
+    int64_t query_dim = query.size(last_dim);
+    int64_t kv_cache_dim = full_kv_cache.size(full_kv_cache.dim() - 1);
+    int64_t k_rope_dim = full_k_rope.defined() && full_k_rope.numel() > 0
+                             ? full_k_rope.size(full_k_rope.dim() - 1)
+                             : 0;
+    TORCH_CHECK(query_dim >= kv_cache_dim,
+                "query last dim should be >= full_kv_cache last dim, but got ", query_dim, " and ", kv_cache_dim);
+    at::Tensor query_nope = query.slice(last_dim, 0, kv_cache_dim);
+    at::Tensor query_rope = (k_rope_dim > 0 && query_dim >= kv_cache_dim + k_rope_dim)
+                                ? query.slice(last_dim, kv_cache_dim, kv_cache_dim + k_rope_dim)
+                                : at::Tensor();
+    at::Tensor sfa_output = RunFusedSparseAttentionOverlapSideEffectSplit(
+        query_nope,
+        query_rope,
         selection_k_rope,
         selection_kv_cache,
         selection_kv_block_table,
@@ -214,60 +206,96 @@ at::Tensor npu_fused_sparse_attention_overlap_cpu_source(
         full_k_rope,
         full_kv_cache,
         full_kv_block_table,
-        selection_topk_block_size);
-
-    using namespace at::indexing;
-    const int64_t kv_cache_dim = selection_kv_cache.size(2);
-    const int64_t k_rope_dim = selection_k_rope.numel() > 0 ? selection_k_rope.size(2) : 0;
-    TORCH_CHECK(query.size(2) >= kv_cache_dim + k_rope_dim,
-                "query last dim should be at least kv_cache_dim + k_rope_dim, but got ",
-                query.size(2), " vs ", kv_cache_dim + k_rope_dim);
-
-    const int64_t topk = selection_topk_indices.size(selection_topk_indices.dim() - 1);
-    const int64_t kv_heads = selection_topk_indices.size(selection_topk_indices.dim() - 2);
-    const int64_t selected_token_count = topk * selection_topk_block_size;
-    const int64_t query_token_count = query.size(0);
-
-    auto query_nope = query.index({Slice(), Slice(), Slice(0, kv_cache_dim)}).contiguous();
-    c10::optional<at::Tensor> query_rope = c10::nullopt;
-    c10::optional<at::Tensor> key_rope = c10::nullopt;
-    if (k_rope_dim > 0) {
-        query_rope = query.index({Slice(), Slice(), Slice(kv_cache_dim, kv_cache_dim + k_rope_dim)}).contiguous();
-        key_rope = selection_k_rope.unsqueeze(2);
-    }
-
-    auto sparse_indices = at::arange(selected_token_count, selection_topk_indices.options())
-                              .view({1, 1, selected_token_count})
-                              .expand({query_token_count, kv_heads, selected_token_count})
-                              .contiguous();
-    auto actual_seq_lengths_query = at::ones({query_token_count}, selection_topk_indices.options());
-    auto actual_seq_lengths_kv = at::full(
-        {query_token_count},
-        selected_token_count,
-        selection_topk_indices.options());
-
-    auto result = npu_sparse_flash_attention(
-        query_nope,
-        selection_kv_cache.unsqueeze(2),
-        selection_kv_cache.unsqueeze(2),
-        sparse_indices,
+        full_kv_actual_seq,
+        full_q_actual_seq,
         scale_value,
-        c10::optional<at::Tensor>(selection_kv_block_table),
-        c10::optional<at::Tensor>(actual_seq_lengths_query),
-        c10::optional<at::Tensor>(actual_seq_lengths_kv),
-        query_rope,
-        key_rope,
         sparse_block_size,
-        layout_query,
-        layout_kv,
-        sparse_mode,
-        std::numeric_limits<int64_t>::max(),
-        std::numeric_limits<int64_t>::max(),
-        2,
-        false,
-        false);
-    return std::get<0>(result);
+        selection_topk_block_size,
+        layout_query_str,
+        layout_kv_str,
+        sparse_mode);
+
+    at::Tensor attention_output = at::zeros(query.sizes(), query.options().dtype(query.dtype()));
+    attention_output.slice(last_dim, 0, kv_cache_dim).copy_(sfa_output);
+    return attention_output;
 }
 
-}  // namespace vllm_ascend
-#endif  // FUSED_SPARSE_ATTENTION_OVERLAP_TORCH_ADPT_H
+inline at::Tensor npu_fused_sparse_attention_overlap(
+    const at::Tensor &query,
+    const at::Tensor &selection_k_rope,
+    const at::Tensor &selection_kv_cache,
+    const at::Tensor &selection_kv_block_table,
+    const at::Tensor &selection_kv_block_status,
+    const at::Tensor &selection_topk_indices,
+    const at::Tensor &full_k_rope,
+    const at::Tensor &full_kv_cache,
+    const at::Tensor &full_kv_block_table,
+    const at::Tensor &full_kv_actual_seq,
+    const at::Tensor &full_q_actual_seq,
+    double scale_value,
+    int64_t sparse_block_size,
+    int64_t selection_topk_block_size,
+    c10::string_view layout_query,
+    c10::string_view layout_kv,
+    int64_t sparse_mode)
+{
+    return RunFusedSparseAttentionOverlapSideEffect(
+        query,
+        selection_k_rope,
+        selection_kv_cache,
+        selection_kv_block_table,
+        selection_kv_block_status,
+        selection_topk_indices,
+        full_k_rope,
+        full_kv_cache,
+        full_kv_block_table,
+        full_kv_actual_seq,
+        full_q_actual_seq,
+        scale_value,
+        sparse_block_size,
+        selection_topk_block_size,
+        std::string(layout_query),
+        std::string(layout_kv),
+        sparse_mode);
+}
+
+inline at::Tensor npu_fused_sparse_attention_overlap_cpu_source(
+    const at::Tensor &query,
+    const at::Tensor &selection_k_rope,
+    const at::Tensor &selection_kv_cache,
+    const at::Tensor &selection_kv_block_table,
+    const at::Tensor &selection_kv_block_status,
+    const at::Tensor &selection_topk_indices,
+    const at::Tensor &full_k_rope,
+    const at::Tensor &full_kv_cache,
+    const at::Tensor &full_kv_block_table,
+    const at::Tensor &full_kv_actual_seq,
+    const at::Tensor &full_q_actual_seq,
+    double scale_value,
+    int64_t sparse_block_size,
+    int64_t selection_topk_block_size,
+    c10::string_view layout_query,
+    c10::string_view layout_kv,
+    int64_t sparse_mode)
+{
+    return npu_fused_sparse_attention_overlap(query,
+                                              selection_k_rope,
+                                              selection_kv_cache,
+                                              selection_kv_block_table,
+                                              selection_kv_block_status,
+                                              selection_topk_indices,
+                                              full_k_rope,
+                                              full_kv_cache,
+                                              full_kv_block_table,
+                                              full_kv_actual_seq,
+                                              full_q_actual_seq,
+                                              scale_value,
+                                              sparse_block_size,
+                                              selection_topk_block_size,
+                                              layout_query,
+                                              layout_kv,
+                                              sparse_mode);
+}
+
+} // namespace vllm_ascend
+#endif

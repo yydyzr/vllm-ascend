@@ -1,45 +1,45 @@
-/**
- * Copyright (c) Huawei Technologies Co., Ltd. 2025. All rights reserved.
- * Licensed under the Apache License, Version 2.0.
- */
-
 #include "kernel_operator.h"
-#include "fused_sparse_attention_overlap_kernel.h"
-#include "fused_sparse_attention_overlap_cube.h"
-#include "fused_sparse_attention_overlap_vector.h"
-#include "fused_sparse_attention_overlap_main.h"
+#include "fused_sparse_attention_overlap_template_tiling_key.h"
+#include "fused_sparse_attention_overlap_kernel_mla.h"
 
 using namespace AscendC;
-using namespace FusedSparseAttentionOverlapNs;
 
-extern "C" __global__ __aicore__ void fused_sparse_attention_overlap(
-    GM_ADDR query,
-    GM_ADDR selection_k_rope, GM_ADDR selection_kv_cache,
-    GM_ADDR selection_kv_block_table, GM_ADDR selection_kv_block_status,
-    GM_ADDR selection_topk_indices,
-    GM_ADDR full_k_rope, GM_ADDR full_kv_cache,
-    GM_ADDR full_kv_block_table, GM_ADDR full_kv_actual_seq,
-    GM_ADDR full_q_actual_seq,
-    GM_ADDR hit_mask_out, GM_ADDR miss_indices_out,
-    GM_ADDR attention_output, GM_ADDR selection_kv_actual_seq,
-    GM_ADDR workspace, GM_ADDR tiling)
+#define FSA_OVERLAP_SELECTION_UPDATE_OP_IMPL(templateClass, tilingdataClass, ...)                 \
+    do {                                                                                          \
+        templateClass<FusedSparseAttentionOverlapType<__VA_ARGS__>> op;                                                   \
+        GET_TILING_DATA_WITH_STRUCT(tilingdataClass, tiling_data_in, tiling);                      \
+        const tilingdataClass *__restrict tiling_data = &tiling_data_in;                           \
+        op.Init(query, key, value, sparseIndices, actualSeqLengthsQuery, actualSeqLengthsKV,       \
+            blocktable, queryRope, keyRope, attentionOut, user, tiling_data, tiling, &tPipe);       \
+        op.InitSelectionUpdateGlobalTensor(selectionKRope, selectionKvCache,                       \
+            selectionKvBlockTable, selectionKvBlockStatus, selectionKvActualSeq, true);            \
+        op.Process();                                                                              \
+    } while (0)
+
+template<int FLASH_DECODE, int LAYOUT_T, int KV_LAYOUT_T, int TEMPLATE_MODE>
+__global__ __aicore__ void fused_sparse_attention_overlap(
+    __gm__ uint8_t *query, __gm__ uint8_t *key, __gm__ uint8_t *value,
+    __gm__ uint8_t *sparseIndices, __gm__ uint8_t *blocktable,
+    __gm__ uint8_t *actualSeqLengthsQuery, __gm__ uint8_t *actualSeqLengthsKV,
+    __gm__ uint8_t *queryRope, __gm__ uint8_t *keyRope,
+    __gm__ uint8_t *selectionKRope, __gm__ uint8_t *selectionKvCache,
+    __gm__ uint8_t *selectionKvBlockTable, __gm__ uint8_t *selectionKvBlockStatus,
+    __gm__ uint8_t *attentionOut, __gm__ uint8_t *selectionKvActualSeq,
+    __gm__ uint8_t *workspace, __gm__ uint8_t *tiling)
 {
     KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_2);
 
-    TPipe pipe;
-    GET_TILING_DATA(tilingData, tiling);
-    GM_ADDR userWorkspace = GetUserWorkspace(workspace);
+    TPipe tPipe;
+    __gm__ uint8_t *user = GetUserWorkspace(workspace);
 
-    FusedAttentionMainOp<DTYPE_QUERY> op;
-    op.Init(&pipe, &tilingData,
-            query, selection_k_rope, selection_kv_cache,
-            selection_kv_block_table, selection_kv_block_status,
-            selection_topk_indices,
-            full_k_rope, full_kv_cache,
-            full_kv_block_table, full_kv_actual_seq, full_q_actual_seq,
-            hit_mask_out, miss_indices_out,
-            attention_output, selection_kv_actual_seq,
-            userWorkspace);
-    op.Process();
+    if constexpr (ORIG_DTYPE_QUERY == DT_FLOAT16 && ORIG_DTYPE_KEY == DT_FLOAT16 &&
+                  ORIG_DTYPE_ATTENTION_OUT == DT_FLOAT16) {
+        FSA_OVERLAP_SELECTION_UPDATE_OP_IMPL(FusedSparseAttentionOverlapMla, FusedSparseAttentionOverlapTilingDataMla,
+            half, half, half, FLASH_DECODE, static_cast<FusedSparseAttentionOverlapLayout>(LAYOUT_T),
+            static_cast<FusedSparseAttentionOverlapLayout>(KV_LAYOUT_T), TEMPLATE_MODE);
+    } else {
+        FSA_OVERLAP_SELECTION_UPDATE_OP_IMPL(FusedSparseAttentionOverlapMla, FusedSparseAttentionOverlapTilingDataMla,
+            bfloat16_t, bfloat16_t, bfloat16_t, FLASH_DECODE, static_cast<FusedSparseAttentionOverlapLayout>(LAYOUT_T),
+            static_cast<FusedSparseAttentionOverlapLayout>(KV_LAYOUT_T), TEMPLATE_MODE);
+    }
 }
-
