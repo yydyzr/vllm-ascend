@@ -839,6 +839,23 @@ class SFAKVOffloadWorker:
             self.d2h_size_buffer_cpu[num_k_copies:copy_idx].fill_(self.token_size_bytes_v)
         self.d2h_num_tokens_buffer_cpu[0] = copy_idx
 
+        stream_capturing = _is_current_stream_capturing()
+        mode = "capture" if stream_capturing else "eager_or_host_func"
+        self._log_fused_d2h(
+            f"{mode}|host_func|{layer_id}",
+            "[fused_overlap_offload][d2h][host_func] mode=%s layer_id=%s "
+            "num_actual_tokens=%s num_reqs=%s copy_count=%s "
+            "fused_step_requests=%s stream_capturing=%s tp_rank=%s",
+            mode,
+            layer_id,
+            num_actual_tokens,
+            num_reqs,
+            copy_idx,
+            len(self.fused_step_requests),
+            stream_capturing,
+            self.tp_rank,
+        )
+
     def save_cpu(self, layer_id: int | None = None) -> None:
         if layer_id is None:
             layer_id = self.current_layer_save
@@ -872,6 +889,16 @@ class SFAKVOffloadWorker:
             self.cpu_block_table_req_hashes,
         )
 
+    def _log_fused_d2h(self, key: str, message: str, *args) -> None:
+        """Rate-limited D2H diagnostics. Always log capture path; otherwise first 4 hits / DEBUG."""
+        if not hasattr(self, "_fused_d2h_log_counts"):
+            self._fused_d2h_log_counts: dict[str, int] = {}
+        count = self._fused_d2h_log_counts.get(key, 0)
+        capturing = "capturing=True" in key or key.startswith("capture|")
+        if capturing or envs.VLLM_ASCEND_SFA_DEBUG or count < 4:
+            logger.info(message, *args)
+            self._fused_d2h_log_counts[key] = count + 1
+
     def save_current_kv_tokens(
         self,
         layer_name: str,
@@ -883,28 +910,75 @@ class SFAKVOffloadWorker:
         capturing: bool = False,
     ) -> None:
         """Immediately copy current-step main MLA KV tokens from NPU to CPU."""
+        stream_capturing = bool(capturing) or _is_current_stream_capturing()
+        mode = "capture" if stream_capturing else "eager"
+        fused_req_count = len(self.fused_step_requests)
+
         if not self.use_fused_overlap_offload or num_actual_tokens <= 0 or num_reqs <= 0:
+            self._log_fused_d2h(
+                f"{mode}|skip_invalid|{layer_name}",
+                "[fused_overlap_offload][d2h][%s] SKIP layer=%s "
+                "use_fused=%s num_actual_tokens=%s num_reqs=%s "
+                "capturing=%s stream_capturing=%s",
+                mode,
+                layer_name,
+                self.use_fused_overlap_offload,
+                num_actual_tokens,
+                num_reqs,
+                capturing,
+                stream_capturing,
+            )
             return
         if not self.fused_step_requests:
+            self._log_fused_d2h(
+                f"{mode}|skip_empty_reqs|{layer_name}",
+                "[fused_overlap_offload][d2h][%s] SKIP empty fused_step_requests "
+                "layer=%s num_actual_tokens=%s num_reqs=%s "
+                "capturing=%s stream_capturing=%s tp_rank=%s",
+                mode,
+                layer_name,
+                num_actual_tokens,
+                num_reqs,
+                capturing,
+                stream_capturing,
+                self.tp_rank,
+            )
             return
 
         layer_id = self._get_offload_layer_id(layer_name)
+        self._log_fused_d2h(
+            f"{mode}|enter|{layer_id}",
+            "[fused_overlap_offload][d2h][%s] ENTER layer=%s layer_id=%s "
+            "num_actual_tokens=%s num_reqs=%s fused_step_requests=%s "
+            "capturing=%s stream_capturing=%s tp_rank=%s host_func=%s",
+            mode,
+            layer_name,
+            layer_id,
+            num_actual_tokens,
+            num_reqs,
+            fused_req_count,
+            capturing,
+            stream_capturing,
+            self.tp_rank,
+            stream_capturing,
+        )
+
         self.d2h_slot_mapping_cpu[:num_actual_tokens].copy_(
-            slot_mapping[:num_actual_tokens], non_blocking=capturing
+            slot_mapping[:num_actual_tokens], non_blocking=stream_capturing
         )
         self.d2h_token_to_req_cpu[:num_actual_tokens].copy_(
-            token_to_req[:num_actual_tokens], non_blocking=capturing
+            token_to_req[:num_actual_tokens], non_blocking=stream_capturing
         )
         self.d2h_cum_query_lens_cpu[:num_reqs].copy_(
-            cum_query_lens[:num_reqs], non_blocking=capturing
+            cum_query_lens[:num_reqs], non_blocking=stream_capturing
         )
         self.cpu_block_table_host_buffer[:num_reqs].copy_(
-            self.cpu_block_table.gpu[:num_reqs], non_blocking=capturing
+            self.cpu_block_table.gpu[:num_reqs], non_blocking=stream_capturing
         )
 
         args = (num_actual_tokens, num_reqs, layer_id)
         current_compute_stream = torch_npu.npu.current_stream()
-        if capturing:
+        if stream_capturing:
             subscribed_compute_streams = get_subscribed_compute_streams()
             if current_compute_stream not in subscribed_compute_streams:
                 torch_npu.npu._subscribe_report(current_compute_stream)
@@ -917,34 +991,37 @@ class SFAKVOffloadWorker:
         else:
             self._compute_step_offload_addrs_cpu(args)
 
-        if not capturing:
+        if not stream_capturing:
             copy_count = int(self.d2h_num_tokens_buffer_cpu[0].item())
-            if not getattr(self, "_fused_overlap_d2h_logged", False):
-                logger.info(
-                    "[fused_overlap_offload][d2h] first submit layer_id=%s "
-                    "num_actual_tokens=%s num_reqs=%s copy_count=%s "
-                    "slot_shape=%s token_to_req_shape=%s cum_query_lens_shape=%s",
-                    layer_id,
-                    num_actual_tokens,
-                    num_reqs,
-                    copy_count,
-                    tuple(slot_mapping[:num_actual_tokens].shape),
-                    tuple(token_to_req[:num_actual_tokens].shape),
-                    tuple(cum_query_lens[:num_reqs].shape),
-                )
-                self._fused_overlap_d2h_logged = True
-            if envs.VLLM_ASCEND_SFA_DEBUG:
-                logger.info(
-                    "[fused_overlap_offload][d2h][debug] layer_id=%s "
-                    "num_actual_tokens=%s num_reqs=%s copy_count=%s",
-                    layer_id,
-                    num_actual_tokens,
-                    num_reqs,
-                    copy_count,
-                )
+            self._log_fused_d2h(
+                f"eager|submit|{layer_id}",
+                "[fused_overlap_offload][d2h][eager] SUBMIT layer_id=%s "
+                "num_actual_tokens=%s num_reqs=%s copy_count=%s "
+                "slot_shape=%s token_to_req_shape=%s cum_query_lens_shape=%s "
+                "tp_rank=%s",
+                layer_id,
+                num_actual_tokens,
+                num_reqs,
+                copy_count,
+                tuple(slot_mapping[:num_actual_tokens].shape),
+                tuple(token_to_req[:num_actual_tokens].shape),
+                tuple(cum_query_lens[:num_reqs].shape),
+                self.tp_rank,
+            )
+        else:
+            self._log_fused_d2h(
+                f"capture|submit|{layer_id}",
+                "[fused_overlap_offload][d2h][capture] SUBMIT "
+                "(host_func scheduled, copy_count deferred) layer_id=%s "
+                "num_actual_tokens=%s num_reqs=%s tp_rank=%s",
+                layer_id,
+                num_actual_tokens,
+                num_reqs,
+                self.tp_rank,
+            )
 
         self.d2h_batch_copy_args_buffer_npu.copy_(
-            self.d2h_batch_copy_args_buffer_cpu, non_blocking=capturing
+            self.d2h_batch_copy_args_buffer_cpu, non_blocking=stream_capturing
         )
         # D2H: gvas/addr buffers use H2D naming (CPU/NPU); swap sparse_copy args for NPU->CPU.
         offload.sparse_copy(
@@ -955,7 +1032,7 @@ class SFAKVOffloadWorker:
             self.k_caches_npu[layer_id].device,
         )
         self.d2h_save_event.record(current_compute_stream)
-        if not capturing:
+        if not stream_capturing:
             self.d2h_save_event.synchronize()
 
     def wait_for_save(self):
