@@ -54,7 +54,34 @@ def test_non_owner_still_registers_memfabric_pull():
     consumer.use_layerwise = True
     consumer.kv_cache_config = MagicMock()
     consumer._register_memfabric_pull = MagicMock()
-    sfa_worker = SimpleNamespace(register_kv_caches=MagicMock())
+    sfa_worker = SimpleNamespace(
+        register_kv_caches=MagicMock(),
+        get_owned_cpu_kv_pools=lambda: (None, None),
+    )
+    kv_caches = {"model.layers.0.self_attn.attn": tuple(MagicMock() for _ in range(5))}
+
+    with patch.object(worker_module, "SFAKVOffloadWorker", return_value=sfa_worker):
+        consumer.register_kv_caches(kv_caches)
+
+    consumer._register_memfabric_pull.assert_called_once_with(kv_caches, None, None)
+
+
+def test_non_owner_fused_views_are_not_registered_as_pd_destinations():
+    consumer = SFAPDCpuOffloadConsumerWorker.__new__(SFAPDCpuOffloadConsumerWorker)
+    consumer.vllm_config = SimpleNamespace(
+        kv_transfer_config=SimpleNamespace(
+            kv_connector_extra_config={"transfer_backend": "memfabric"},
+        ),
+    )
+    consumer.use_layerwise = True
+    consumer.kv_cache_config = MagicMock()
+    consumer._register_memfabric_pull = MagicMock()
+    sfa_worker = SimpleNamespace(
+        register_kv_caches=MagicMock(),
+        k_caches_cpu=[MagicMock(name="non_owner_k_view")],
+        v_caches_cpu=[MagicMock(name="non_owner_v_view")],
+        get_owned_cpu_kv_pools=lambda: (None, None),
+    )
     kv_caches = {"model.layers.0.self_attn.attn": tuple(MagicMock() for _ in range(5))}
 
     with patch.object(worker_module, "SFAKVOffloadWorker", return_value=sfa_worker):

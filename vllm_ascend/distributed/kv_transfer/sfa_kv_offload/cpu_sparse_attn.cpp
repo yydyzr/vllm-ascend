@@ -651,6 +651,13 @@ compute_lru_resident_addrs(
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
 {
     namespace py = pybind11;
+    m.def(
+        "restore_bfloat16_tensor",
+        [](uintptr_t ptr_val, const std::vector<int64_t>& shape) {
+            TORCH_CHECK(ptr_val != 0, "restore_bfloat16_tensor requires a non-zero pointer");
+            return restore_tensor(ptr_val, shape, torch::kBFloat16);
+        },
+        "Create a non-owning CPU bfloat16 tensor view for a shared GVA");
     m.def("get_kv_topk", &get_kv_topk, "High performance topk combine");
     m.def("lru_resident_compact", &lru_resident_compact,
           "CPU LRU resident compact miss prepare with OpenMP row-level parallelism");
