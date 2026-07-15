@@ -359,24 +359,9 @@ def _prepare_fused_kwargs(
     return kwargs
 
 
-def _print_input_align_report(
-    fused_path: Path,
-    sfa_path: Path,
-    fused_payload: dict[str, Any],
-    sfa_payload: dict[str, Any],
+def _count_check_results(
     results: list[dump_cmp.CheckResult],
-    *,
-    title: str = "Step 1/2: fused vs baseline input alignment",
-) -> int:
-    print("=" * 72)
-    print(title)
-    print("=" * 72)
-    print(f"fused inputs: {fused_path}")
-    print(f"  layer={fused_payload.get('layer_name')} op={fused_payload.get('op_name')}")
-    print(f"sfa inputs:   {sfa_path}")
-    print(f"  layer={sfa_payload.get('layer_name')} op={sfa_payload.get('op_name')}")
-    print("-" * 72)
-
+) -> dict[str, int]:
     counts = {
         dump_cmp.PASS: 0,
         dump_cmp.FAIL: 0,
@@ -385,20 +370,57 @@ def _print_input_align_report(
     }
     for item in results:
         counts[item.status] = counts.get(item.status, 0) + 1
-        print(f"[{item.status:4}] {item.name}: {item.detail}")
+    return counts
 
-    print("-" * 72)
-    print(
-        "input summary: "
+
+def _short_check_detail(item: dump_cmp.CheckResult) -> str:
+    detail = item.detail
+    if item.status == dump_cmp.WARN and len(detail) > 48:
+        return detail[:45] + "..."
+    if item.status == dump_cmp.SKIP and len(detail) > 48:
+        return detail[:45] + "..."
+    return detail
+
+
+def _format_counts(counts: dict[str, int]) -> str:
+    return (
         f"pass={counts[dump_cmp.PASS]} fail={counts[dump_cmp.FAIL]} "
         f"warn={counts[dump_cmp.WARN]} skip={counts[dump_cmp.SKIP]}"
     )
+
+
+def _print_section(title: str) -> None:
+    print("=" * 64)
+    print(title)
+    print("=" * 64)
+
+
+def _print_req_separator(req_idx: int, token_start: int, token_end: int) -> None:
+    print("-" * 64)
+    print(f"req={req_idx}  tokens=[{token_start}, {token_end})")
+    print("-" * 64)
+
+
+def _print_check_results(results: list[dump_cmp.CheckResult]) -> dict[str, int]:
+    counts = _count_check_results(results)
+    for item in results:
+        print(f"  [{item.status}] {item.name}: {_short_check_detail(item)}")
+    return counts
+
+
+def _print_input_align_report(
+    results: list[dump_cmp.CheckResult],
+    *,
+    title: str = "Step 1/2: input alignment",
+) -> int:
+    _print_section(title)
+    counts = _print_check_results(results)
+    status = "FAIL" if counts[dump_cmp.FAIL] else "PASS"
+    print(f"input summary: [{status}] {_format_counts(counts)}")
     return 1 if counts[dump_cmp.FAIL] else 0
 
 
 def _compare_inputs_per_request(
-    fused_path: Path,
-    sfa_path: Path,
     fused_payload: dict[str, Any],
     sfa_payload: dict[str, Any],
     *,
@@ -412,17 +434,19 @@ def _compare_inputs_per_request(
     )
     num_reqs = len(token_ranges)
     selected = request_ids if request_ids is not None else list(range(num_reqs))
-    print("=" * 72)
-    print(f"Step 1/2: per-request input alignment (num_reqs={num_reqs})")
-    print("=" * 72)
+    _print_section(f"Step 1/2: input alignment (per-request, num_reqs={num_reqs})")
 
+    req_rows: list[tuple[int, str, dict[str, int]]] = []
     failed_reqs: list[int] = []
     for req_idx in selected:
         if req_idx < 0 or req_idx >= num_reqs:
-            print(f"[FAIL] req={req_idx}: out of range [0, {num_reqs})")
+            _print_req_separator(req_idx, -1, -1)
+            print(f"  [FAIL] out of range [0, {num_reqs})")
             failed_reqs.append(req_idx)
+            req_rows.append((req_idx, "FAIL", _count_check_results([])))
             continue
         token_start, token_end = token_ranges[req_idx]
+        _print_req_separator(req_idx, token_start, token_end)
         fused_req = {
             **fused_payload,
             "inputs": _slice_fused_inputs_for_request(
@@ -447,26 +471,23 @@ def _compare_inputs_per_request(
             atol=atol,
             rtol=rtol,
         )
-        rc = _print_input_align_report(
-            fused_path,
-            sfa_path,
-            fused_req,
-            sfa_req,
-            results,
-            title=(
-                f"req={req_idx} tokens=[{token_start}, {token_end}) "
-                f"num_tokens={token_end - token_start}"
-            ),
-        )
-        if rc != 0:
+        counts = _print_check_results(results)
+        status = "FAIL" if counts[dump_cmp.FAIL] else "PASS"
+        print(f"  input: [{status}] {_format_counts(counts)}")
+        req_rows.append((req_idx, status, counts))
+        if status == "FAIL":
             failed_reqs.append(req_idx)
 
-    print("=" * 72)
-    if failed_reqs:
-        print(f"per-request input summary: FAIL reqs={failed_reqs}")
-        return 1
-    print(f"per-request input summary: all {len(selected)} selected request(s) PASS")
-    return 0
+    print("-" * 64)
+    print("INPUT SUMMARY")
+    for req_idx, status, counts in req_rows:
+        print(f"  req={req_idx}: [{status}] {_format_counts(counts)}")
+    overall = "FAIL" if failed_reqs else "PASS"
+    print(
+        f"  overall: [{overall}] "
+        f"checked={len(selected)} fail_reqs={failed_reqs or []}"
+    )
+    return 1 if failed_reqs else 0
 
 
 def run_fused_vs_baseline_output(
@@ -508,14 +529,11 @@ def run_fused_vs_baseline_output(
 
     if not per_request:
         cos = _cosine_sim(attn_output, golden)
-        detail = (
-            f"{layer_tag} {step_tag} cosine_sim={cos:.8f} "
-            f"cpu_kv_backend={cpu_kv_backend} "
-            f"fused={fused_inputs_path.name} baseline={baseline_output_path.name}"
-        )
-        if cos >= 1.0 - atol:
-            return True, f"PASS {detail}"
-        return False, f"FAIL {detail}"
+        status = "PASS" if cos >= 1.0 - atol else "FAIL"
+        _print_section(f"Step 2/2: output compare ({layer_tag} {step_tag})")
+        print(f"  [{status}] cosine_sim={cos:.8f}")
+        print(f"output summary: [{status}] cosine_sim={cos:.8f}")
+        return status == "PASS", f"[{status}] {layer_tag} {step_tag} cosine_sim={cos:.8f}"
 
     # Per-request output compare on the full-batch fused replay result.
     token_ranges = _token_ranges_from_cum_query(
@@ -523,40 +541,51 @@ def run_fused_vs_baseline_output(
     )
     num_reqs = len(token_ranges)
     selected = request_ids if request_ids is not None else list(range(num_reqs))
-    lines = [
-        f"{layer_tag} {step_tag} per-request output "
-        f"cpu_kv_backend={cpu_kv_backend}"
-    ]
+    _print_section(
+        f"Step 2/2: output compare (per-request, {layer_tag} {step_tag})"
+    )
+
+    req_rows: list[tuple[int, str, float | None]] = []
     failed: list[int] = []
     for req_idx in selected:
         if req_idx < 0 or req_idx >= num_reqs:
-            lines.append(f"[FAIL] req={req_idx}: out of range [0, {num_reqs})")
+            _print_req_separator(req_idx, -1, -1)
+            print(f"  [FAIL] out of range [0, {num_reqs})")
             failed.append(req_idx)
+            req_rows.append((req_idx, "FAIL", None))
             continue
         token_start, token_end = token_ranges[req_idx]
+        _print_req_separator(req_idx, token_start, token_end)
         left = attn_output[token_start:token_end]
         right = golden[token_start:token_end]
         if tuple(left.shape) != tuple(right.shape):
-            lines.append(
-                f"[FAIL] req={req_idx} tokens=[{token_start},{token_end}): "
-                f"shape fused={tuple(left.shape)} baseline={tuple(right.shape)}"
+            print(
+                f"  [FAIL] shape fused={tuple(left.shape)} "
+                f"baseline={tuple(right.shape)}"
             )
             failed.append(req_idx)
+            req_rows.append((req_idx, "FAIL", None))
             continue
         cos = _cosine_sim(left, right)
         status = "PASS" if cos >= 1.0 - atol else "FAIL"
-        lines.append(
-            f"[{status}] req={req_idx} tokens=[{token_start},{token_end}) "
-            f"cosine_sim={cos:.8f}"
-        )
+        print(f"  [{status}] cosine_sim={cos:.8f}")
+        req_rows.append((req_idx, status, cos))
         if status == "FAIL":
             failed.append(req_idx)
 
-    if failed:
-        lines.append(f"FAIL reqs={failed}")
-        return False, "\n".join(lines)
-    lines.append(f"PASS all {len(selected)} selected request(s)")
-    return True, "\n".join(lines)
+    print("-" * 64)
+    print("OUTPUT SUMMARY")
+    for req_idx, status, cos in req_rows:
+        if cos is None:
+            print(f"  req={req_idx}: [{status}]")
+        else:
+            print(f"  req={req_idx}: [{status}] cosine_sim={cos:.8f}")
+    overall = "FAIL" if failed else "PASS"
+    print(
+        f"  overall: [{overall}] "
+        f"checked={len(selected)} fail_reqs={failed or []}"
+    )
+    return overall == "PASS", f"[{overall}] output fail_reqs={failed or []}"
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -658,11 +687,10 @@ def main(argv: list[str] | None = None) -> int:
     fused_payload = dump_cmp.load_input_payload(args.fused)
     sfa_payload = dump_cmp.load_input_payload(args.sfa)
 
+    input_status = "SKIP"
     if not args.skip_input_check:
         if args.per_request:
             input_rc = _compare_inputs_per_request(
-                args.fused,
-                args.sfa,
                 fused_payload,
                 sfa_payload,
                 atol=args.atol,
@@ -676,17 +704,13 @@ def main(argv: list[str] | None = None) -> int:
                 atol=args.atol,
                 rtol=args.rtol,
             )
-            input_rc = _print_input_align_report(
-                args.fused,
-                args.sfa,
-                fused_payload,
-                sfa_payload,
-                input_results,
-            )
+            input_rc = _print_input_align_report(input_results)
+        input_status = "FAIL" if input_rc != 0 else "PASS"
         if input_rc != 0:
-            print("ABORT: inputs are not aligned; skip fused op replay")
+            _print_section("FINAL SUMMARY")
+            print(f"  input:  [{input_status}]")
+            print("  output: [SKIP] (aborted: inputs not aligned)")
             return 1
-        print("Inputs aligned; continue to fused op replay")
     else:
         print("Skip input alignment (--skip-input-check)")
 
@@ -703,25 +727,14 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 2
 
-    print("=" * 72)
-    mode = "per-request" if args.per_request else "full-batch"
-    print(
-        f"Step 2/2: replay fused op vs baseline output "
-        f"(cpu-kv-backend={args.cpu_kv_backend}, mode={mode})"
-    )
-    print("=" * 72)
-
     offload = None
     ok = False
-    message = "FAIL: fused replay did not run"
     try:
         if args.cpu_kv_backend == "offload":
             offload = _init_offload_pool_for_inputs(fused_payload["inputs"])
         else:
-            # Validate API early before preparing kwargs.
             _require_torch_npu_swapped_empty()
-            print("Using torch_npu.empty_with_swapped_memory for full KV")
-        ok, message = run_fused_vs_baseline_output(
+        ok, _message = run_fused_vs_baseline_output(
             fused_op,
             args.fused,
             baseline_output,
@@ -731,8 +744,7 @@ def main(argv: list[str] | None = None) -> int:
             request_ids=request_ids,
         )
     except Exception as exc:
-        message = f"FAIL: fused replay raised {type(exc).__name__}: {exc}"
-        print(message, file=sys.stderr)
+        print(f"FAIL: fused replay raised {type(exc).__name__}: {exc}", file=sys.stderr)
         return 2
     finally:
         if offload is not None:
@@ -741,7 +753,10 @@ def main(argv: list[str] | None = None) -> int:
             except Exception as exc:
                 print(f"WARNING: offload.uninitialize failed: {exc}", file=sys.stderr)
 
-    print(message)
+    output_status = "PASS" if ok else "FAIL"
+    _print_section("FINAL SUMMARY")
+    print(f"  input:  [{input_status}]")
+    print(f"  output: [{output_status}]")
     return 0 if ok else 1
 
 

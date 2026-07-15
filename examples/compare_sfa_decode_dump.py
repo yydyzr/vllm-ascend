@@ -247,9 +247,7 @@ def compare_payloads(
         CheckResult(
             "block_table",
             WARN,
-            "skipped direct compare: fused uses CPU full_kv_block_table, "
-            f"sfa uses NPU block_table ({_tensor_info(fused['full_kv_block_table'])} vs "
-            f"{_tensor_info(sfa['block_table'])})",
+            "skip (layout differs)",
         )
     )
 
@@ -315,9 +313,7 @@ def compare_payloads(
         CheckResult(
             "selection_buffer",
             WARN,
-            "skipped: fused has selection_kv_cache/selection_k_rope buffers, "
-            f"sfa uses full paged key directly ({_tensor_info(fused.get('selection_kv_cache'))} vs "
-            f"{_tensor_info(sfa.get('key'))})",
+            "skip (fused-only)",
         )
     )
     return results
