@@ -50,6 +50,10 @@ class SFAPDCpuOffloadConnector(KVConnectorBase_V1, SupportsHMA):
       CPU pool) + memfabric pull read + indexer/main split registration.
     """
 
+    @classmethod
+    def requires_piecewise_for_cudagraph(cls, extra_config: dict[str, Any]) -> bool:
+        return extra_config.get("use_layerwise", True)
+
     def __init__(
         self,
         vllm_config: VllmConfig,

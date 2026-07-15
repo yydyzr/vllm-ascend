@@ -9,7 +9,6 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     SupportsHMA,
 )
 from vllm.forward_context import ForwardContext
-from vllm.logger import logger
 from vllm.v1.attention.backend import AttentionMetadata
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks
 from vllm.v1.core.sched.output import SchedulerOutput
@@ -19,7 +18,12 @@ from vllm.v1.request import Request
 from vllm_ascend.distributed.kv_transfer.sfa_kv_offload.sfa_kv_offload_scheduler import SFAKVOffloadlScheduler
 from vllm_ascend.distributed.kv_transfer.sfa_kv_offload.sfa_kv_offload_worker import SFAKVOffloadWorker
 
+
 class SFAKVOffloadConnector(KVConnectorBase_V1, SupportsHMA):
+    @classmethod
+    def requires_piecewise_for_cudagraph(cls, extra_config: dict[str, Any]) -> bool:
+        return extra_config.get("use_layerwise", False)
+
     def __init__(self, vllm_config: VllmConfig, role: KVConnectorRole, kv_cache_config: KVCacheConfig | None = None):
         super().__init__(vllm_config=vllm_config, role=role, kv_cache_config=kv_cache_config)
         self.kv_role = vllm_config.kv_transfer_config.kv_role

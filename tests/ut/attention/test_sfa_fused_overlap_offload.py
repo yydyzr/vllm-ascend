@@ -6,6 +6,9 @@ import torch
 
 from vllm_ascend.attention import utils as attention_utils
 from vllm_ascend.attention.sfa_v1 import AscendSFAImpl
+from vllm_ascend.distributed.kv_transfer.sfa_kv_offload.sfa_kv_offload_connector import (
+    SFAKVOffloadConnector,
+)
 from vllm_ascend.distributed.kv_transfer.sfa_pd_cpu_offload.connector import (
     SFAPDCpuOffloadConnector,
 )
@@ -28,6 +31,25 @@ def _make_impl() -> AscendSFAImpl:
     impl._fused_overlap_selection_capacity = None
     impl._fused_overlap_decode_logged = True
     return impl
+
+
+@pytest.mark.parametrize(
+    ("connector_cls", "extra_config", "expected"),
+    [
+        (SFAKVOffloadConnector, {}, False),
+        (SFAKVOffloadConnector, {"use_layerwise": False}, False),
+        (SFAKVOffloadConnector, {"use_layerwise": True}, True),
+        (SFAPDCpuOffloadConnector, {}, True),
+        (SFAPDCpuOffloadConnector, {"use_layerwise": False}, False),
+        (SFAPDCpuOffloadConnector, {"use_layerwise": True}, True),
+    ],
+)
+def test_sfa_connectors_require_piecewise_for_layerwise_operations(
+    connector_cls,
+    extra_config,
+    expected,
+):
+    assert connector_cls.requires_piecewise_for_cudagraph(extra_config) is expected
 
 
 def test_fused_overlap_decode_uses_cpu_full_kv_and_reused_selection_buffers():
