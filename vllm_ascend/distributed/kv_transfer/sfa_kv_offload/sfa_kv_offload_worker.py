@@ -840,23 +840,10 @@ class SFAKVOffloadWorker:
         # Always publish copy_count (including 0) so graph-capture empty steps
         # still produce a deterministic sparse_copy no-op on replay.
         self.d2h_num_tokens_buffer_cpu[0] = copy_idx
-
-        stream_capturing = _is_current_stream_capturing()
-        mode = "capture" if stream_capturing else "eager_or_host_func"
-        self._log_fused_d2h(
-            f"{mode}|host_func|{layer_id}",
-            "[fused_overlap_offload][d2h][host_func] mode=%s layer_id=%s "
-            "num_actual_tokens=%s num_reqs=%s copy_count=%s "
-            "fused_step_requests=%s stream_capturing=%s tp_rank=%s",
-            mode,
-            layer_id,
-            num_actual_tokens,
-            num_reqs,
-            copy_idx,
-            len(self.fused_step_requests),
-            stream_capturing,
-            self.tp_rank,
-        )
+        # NOTE: This runs under ``_launch_host_func`` during ACLGraph replay.
+        # Do NOT call NPU APIs (e.g. is_current_stream_capturing) or blocking
+        # logger here — that deadlocks the compute stream waiting on the host
+        # callback. Keep this path pure CPU, same as legacy prepare_lru host_func.
 
     def save_cpu(self, layer_id: int | None = None) -> None:
         if layer_id is None:
