@@ -92,28 +92,6 @@ def test_fused_overlap_decode_uses_cpu_full_kv_and_reused_selection_buffers():
     )
 
 
-def test_fused_overlap_shared_owner_rejects_graph_capture():
-    impl = _make_impl()
-
-    with (
-        patch(
-            "vllm_ascend.attention.sfa_v1.get_forward_context",
-            return_value=SimpleNamespace(capturing=True),
-        ),
-        pytest.raises(RuntimeError, match="requires --enforce-eager"),
-    ):
-        impl._execute_fused_overlap_offload_decode(
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            "model.layers.0.self_attn",
-        )
-
-
 def test_fused_overlap_selection_invalidation_uses_req_ids_not_row_position():
     impl = _make_impl()
     status = torch.zeros((3, 1, 5), dtype=torch.int32)

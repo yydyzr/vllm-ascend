@@ -137,61 +137,6 @@ class SFAKVOffloadWorker:
         tensor = offload.empty([num_elements + extra_elements], dtype=dtype, pin_memory=True)
         return cls._align_memory(tensor, alignment)[:num_elements].view(shape)
 
-    @classmethod
-    def _validate_owner_gva(cls, ptr: int, *, name: str) -> None:
-        if ptr == 0:
-            raise RuntimeError(f"SFA fused_overlap shared owner GVA is zero: {name}")
-        if ptr % cls._CPU_CACHE_ALIGNMENT != 0:
-            raise RuntimeError(
-                "SFA fused_overlap shared owner GVA is not 2MB aligned: "
-                f"{name}=0x{ptr:x}"
-            )
-
-    @staticmethod
-    def _restore_bfloat16_tensor(ptr: int, shape: list[int]) -> torch.Tensor:
-        tensor = cpu_sparse_attn.restore_bfloat16_tensor(ptr, shape)
-        if tensor.data_ptr() != ptr:
-            raise RuntimeError(
-                "SFA fused_overlap non-owner tensor view points to the wrong GVA: "
-                f"expected=0x{ptr:x}, actual=0x{tensor.data_ptr():x}"
-            )
-        if tuple(tensor.shape) != tuple(shape) or tensor.dtype != torch.bfloat16:
-            raise RuntimeError(
-                "SFA fused_overlap non-owner tensor view metadata mismatch: "
-                f"shape={tuple(tensor.shape)}, dtype={tensor.dtype}, expected_shape={tuple(shape)}"
-            )
-        if not tensor.is_contiguous():
-            raise RuntimeError("SFA fused_overlap non-owner tensor view must be contiguous")
-        return tensor
-
-    def _initialize_memfabric(self) -> None:
-        config = offload.OffloadConfig()
-        config.device_id = torch_npu.npu.current_device()
-        config.size = self.allocate_dram_size
-        config.world_size = self.tp_size
-        config.rank_id = self.tp_rank
-        init_error = None
-        try:
-            init_ret = offload.initialize(config)
-            if init_ret != 0:
-                init_error = f"ret={init_ret}"
-        except Exception as exc:
-            init_error = f"{type(exc).__name__}: {exc}"
-
-        init_failed = torch.tensor(
-            [int(init_error is not None)],
-            dtype=torch.int32,
-            device='npu',
-        )
-        any_init_failed = self.tp_group.all_reduce(init_failed)
-        if int(any_init_failed.item()) != 0:
-            local_detail = init_error or "another TP rank failed"
-            raise RuntimeError(
-                "SFA KV offload MemFabric initialization failed: "
-                f"tp_rank={self.tp_rank}, world_size={self.tp_size}, {local_detail}"
-            )
-        self.tp_group.barrier()
-
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -294,49 +239,56 @@ class SFAKVOffloadWorker:
         if self.use_fused_overlap_offload:
             self.fused_step_requests: list[ReqMeta] = []
             self._fused_req_meta_by_id: dict[str, ReqMeta] = {}
-            self.fused_step_has_offload = False
-            self.fused_step_state_npu = torch.zeros([1], dtype=torch.int32, device='npu')
-            self.d2h_status_npu = torch.zeros([1], dtype=torch.int32, device='npu')
-            if self.tp_rank == 0:
-                self.d2h_save_event = torch_npu.npu.Event()
-                self.fused_offload_token_start_cpu = torch.full(
-                    [self.max_num_reqs],
-                    -1,
-                    dtype=torch.int32,
-                    device='cpu',
-                    pin_memory=True,
-                )
-                self.fused_offload_num_tokens_cpu = torch.zeros(
-                    [self.max_num_reqs],
-                    dtype=torch.int32,
-                    device='cpu',
-                    pin_memory=True,
-                )
-                self.d2h_slot_mapping_cpu = torch.empty(
-                    [self.max_num_tokens],
-                    dtype=torch.int32,
-                    device='cpu',
-                    pin_memory=True,
-                )
-                self.d2h_token_to_req_cpu = torch.empty(
-                    [self.max_num_tokens],
-                    dtype=torch.int32,
-                    device='cpu',
-                    pin_memory=True,
-                )
-                self.d2h_cum_query_lens_cpu = torch.empty(
-                    [self.max_num_reqs],
-                    dtype=torch.int32,
-                    device='cpu',
-                    pin_memory=True,
-                )
+            self.d2h_save_event = torch_npu.npu.Event()
+            self.fused_offload_token_start_cpu = torch.full(
+                [self.max_num_reqs],
+                -1,
+                dtype=torch.int32,
+                device='cpu',
+                pin_memory=True,
+            )
+            self.fused_offload_num_tokens_cpu = torch.zeros(
+                [self.max_num_reqs],
+                dtype=torch.int32,
+                device='cpu',
+                pin_memory=True,
+            )
+            self.d2h_slot_mapping_cpu = torch.empty(
+                [self.max_num_tokens],
+                dtype=torch.int32,
+                device='cpu',
+                pin_memory=True,
+            )
+            self.d2h_token_to_req_cpu = torch.empty(
+                [self.max_num_tokens],
+                dtype=torch.int32,
+                device='cpu',
+                pin_memory=True,
+            )
+            self.d2h_cum_query_lens_cpu = torch.empty(
+                [self.max_num_reqs],
+                dtype=torch.int32,
+                device='cpu',
+                pin_memory=True,
+            )
         dram_size_gb = 64 if self.use_fused_overlap_offload else 128
         self.allocate_dram_size = dram_size_gb * 1024 * 1024 * 1024 # TODO get from config
         logger.info(
             f"SFAKVOffloadWoker start init CPU KV pool with {self.allocate_dram_size / 1024 / 1024 / 1024} GB dram, "
             "it might be time consuming, please wait."
         )
-        self._initialize_memfabric()
+        config = offload.OffloadConfig()
+        config.device_id = torch_npu.npu.current_device()
+        config.size = self.allocate_dram_size
+        if self.use_fused_overlap_offload:
+            # Each TP rank writes and reads its own locally backed host pool.
+            config.world_size = 1
+            config.rank_id = 0
+        else:
+            config.world_size = self.tp_size
+            config.rank_id = self.tp_rank
+        offload.initialize(config)
+        self.tp_group.barrier()
 
     def _infer_group_block_sizes(
         self,
@@ -485,20 +437,14 @@ class SFAKVOffloadWorker:
             else:
                 raise ValueError("SFA KV Offload only support layerwise now.")
 
-            npu_block_num = self.num_blocks
-            # Fused keeps the existing 1x capacity; legacy keeps 4x.
-            cpu_block_num_multiple = 1 if self.use_fused_overlap_offload else 4
-            cpu_block_num = npu_block_num * cpu_block_num_multiple
-            cpu_k_shape = [cpu_block_num, self.block_size, 1, 512]
-            cpu_v_shape = [cpu_block_num, self.block_size, 1, 64]
-            if self.tp_rank == 0:
-                cpu_cache_size = (
-                    cpu_block_num
-                    * self.block_size
-                    * (512 + 64)
-                    * torch.bfloat16.itemsize
-                    * self.num_layers
-                )
+            if self.tp_rank == 0 or self.use_fused_overlap_offload:
+                npu_block_num = self.num_blocks
+                # we need 4 * npu_blocks of cpu_blocks to fully store all offload blocks (dskv32, 512/128)
+                # but you may want to set this to 1 in debug case in case of allocating to much dram
+                # TODO remove this and directly compute from model config before merge
+                cpu_block_num_multiple = 1 if self.use_fused_overlap_offload else 4
+                cpu_block_num = npu_block_num * cpu_block_num_multiple
+                cpu_cache_size = cpu_block_num * self.block_size * (512 + 64) * torch.bfloat16.itemsize * self.num_layers
                 logger.info(f'KV offload allocate {cpu_block_num} cpu blocks, size = {cpu_cache_size / 1024 / 1024 / 1024} GB')
                 if cpu_cache_size > self.allocate_dram_size:
                     raise ValueError(
@@ -507,13 +453,28 @@ class SFAKVOffloadWorker:
                         "try to decrease gpu_memory_utilization or allocate more cpu memory during init."
                     )
                 self.k_caches_cpu: list[torch.Tensor] = [
-                    self._empty_aligned_cpu_tensor(cpu_k_shape, dtype=torch.bfloat16)
+                    self._empty_aligned_cpu_tensor([cpu_block_num, self.block_size, 1, 512], dtype=torch.bfloat16)
                     for _ in range(self.num_layers)
                 ]
                 self.v_caches_cpu: list[torch.Tensor] = [
-                    self._empty_aligned_cpu_tensor(cpu_v_shape, dtype=torch.bfloat16)
+                    self._empty_aligned_cpu_tensor([cpu_block_num, self.block_size, 1, 64], dtype=torch.bfloat16)
                     for _ in range(self.num_layers)
                 ]
+                if self.use_fused_overlap_offload:
+                    logger.info(
+                        "[fused_overlap_offload][init] layer_count=%s cpu_block_num=%s "
+                        "k_cpu_shape=%s rope_cpu_shape=%s k_cpu_device=%s rope_cpu_device=%s "
+                        "k_cpu_ptr=%s rope_cpu_ptr=%s cpu_block_table_shape=%s",
+                        self.num_layers,
+                        cpu_block_num,
+                        tuple(self.k_caches_cpu[0].shape),
+                        tuple(self.v_caches_cpu[0].shape),
+                        self.k_caches_cpu[0].device,
+                        self.v_caches_cpu[0].device,
+                        self.k_caches_cpu[0].data_ptr(),
+                        self.v_caches_cpu[0].data_ptr(),
+                        tuple(self.cpu_block_table.gpu.shape),
+                    )
 
             # topk cache reuse related
             self.lru_workspace_threads = 8
@@ -624,51 +585,25 @@ class SFAKVOffloadWorker:
             # sparse h2d (sparse_copy related)
             self.addr_k_bases: list[int] = [t.data_ptr() for t in self.topk_buffers_k]
             self.addr_v_bases: list[int] = [t.data_ptr() for t in self.topk_buffers_v]
-            self.gvas_k_bases = []
-            self.gvas_v_bases = []
-            gvas_k_tensor = torch.zeros([self.num_layers], dtype=torch.int64, device='npu')
-            gvas_v_tensor = torch.zeros([self.num_layers], dtype=torch.int64, device='npu')
-            if self.tp_rank == 0:
-                for layer_id in range(self.num_layers):
-                    gvas_k_tensor[layer_id] = self.k_caches_cpu[layer_id].data_ptr()
-                    gvas_v_tensor[layer_id] = self.v_caches_cpu[layer_id].data_ptr()
-            self.tp_group.broadcast(gvas_k_tensor, src=0)
-            self.tp_group.broadcast(gvas_v_tensor, src=0)
-            for layer_id in range(self.num_layers):
-                k_ptr = int(gvas_k_tensor[layer_id].item())
-                v_ptr = int(gvas_v_tensor[layer_id].item())
-                self._validate_owner_gva(k_ptr, name=f"layer={layer_id} main_k")
-                self._validate_owner_gva(v_ptr, name=f"layer={layer_id} rope")
-                self.gvas_k_bases.append(k_ptr)
-                self.gvas_v_bases.append(v_ptr)
-
-            if self.use_fused_overlap_offload and self.tp_rank != 0:
-                self.k_caches_cpu = [
-                    self._restore_bfloat16_tensor(ptr, cpu_k_shape)
-                    for ptr in self.gvas_k_bases
-                ]
-                self.v_caches_cpu = [
-                    self._restore_bfloat16_tensor(ptr, cpu_v_shape)
-                    for ptr in self.gvas_v_bases
-                ]
-
             if self.use_fused_overlap_offload:
+                self.gvas_k_bases = [t.data_ptr() for t in self.k_caches_cpu]
+                self.gvas_v_bases = [t.data_ptr() for t in self.v_caches_cpu]
                 self.npu_k_bases = [t.data_ptr() for t in self.k_caches_npu]
                 self.npu_v_bases = [t.data_ptr() for t in self.v_caches_npu]
-                logger.info(
-                    "[fused_overlap_offload][init] tp_rank=%s owner=%s layer_count=%s "
-                    "cpu_block_num=%s k_cpu_shape=%s rope_cpu_shape=%s "
-                    "k_cpu_ptr=%s rope_cpu_ptr=%s cpu_block_table_shape=%s",
-                    self.tp_rank,
-                    self.tp_rank == 0,
-                    self.num_layers,
-                    cpu_block_num,
-                    tuple(self.k_caches_cpu[0].shape),
-                    tuple(self.v_caches_cpu[0].shape),
-                    self.k_caches_cpu[0].data_ptr(),
-                    self.v_caches_cpu[0].data_ptr(),
-                    tuple(self.cpu_block_table.gpu.shape),
-                )
+            else:
+                self.gvas_k_bases = []
+                self.gvas_v_bases = []
+                gvas_k_tensor = torch.zeros([self.num_layers], dtype=torch.int64, device='npu')
+                gvas_v_tensor = torch.zeros([self.num_layers], dtype=torch.int64, device='npu')
+                if self.tp_rank == 0:
+                    for layer_id in range(self.num_layers):
+                        gvas_k_tensor[layer_id] = self.k_caches_cpu[layer_id].data_ptr()
+                        gvas_v_tensor[layer_id] = self.v_caches_cpu[layer_id].data_ptr()
+                self.tp_group.broadcast(gvas_k_tensor, src=0)
+                self.tp_group.broadcast(gvas_v_tensor, src=0)
+                for layer_id in range(self.num_layers):
+                    self.gvas_k_bases.append(gvas_k_tensor[layer_id].item())
+                    self.gvas_v_bases.append(gvas_v_tensor[layer_id].item())
 
             gvas_buffer_offset = 0
             gvas_buffer_size_bytes = self.max_num_topk_rows * self.sfa_sparse_topk * 2 * 8 # 2: k+v, 8: int64
@@ -702,7 +637,7 @@ class SFAKVOffloadWorker:
             assert self.size_buffer_npu.shape == torch.Size([self.max_num_topk_rows * self.sfa_sparse_topk * 2])
             assert self.num_tokens_buffer_npu.shape == torch.Size([1])
 
-            if self.use_fused_overlap_offload and self.tp_rank == 0:
+            if self.use_fused_overlap_offload:
                 # fused_overlap d2h: gvas/addr buffers follow H2D naming (CPU/NPU bases).
                 # sparse_copy copies gvas->addr, so pass addr(NPU src) first for D2H.
                 d2h_max_copies = self.max_num_tokens * 2
@@ -772,11 +707,6 @@ class SFAKVOffloadWorker:
             if self.tp_rank > 0 or request.num_new_offload_blocks <= 0:
                 continue # no new blocks to save
             self.process_layer_data(request)
-        if self.use_fused_overlap_offload:
-            if self.tp_rank == 0:
-                self.fused_step_state_npu.fill_(int(bool(self.fused_step_requests)))
-            self.tp_group.broadcast(self.fused_step_state_npu, src=0)
-            self.fused_step_has_offload = bool(self.fused_step_state_npu.item())
         num_save_layers = sum(1 for layer_save_task in self.layer_save_tasks if layer_save_task)
         self.num_save_tasks = sum(len(layer_save_task) for layer_save_task in self.layer_save_tasks)
         if self.tp_rank == 0:
@@ -801,7 +731,7 @@ class SFAKVOffloadWorker:
                 )
         self.cpu_block_table.copy_to_gpu(num_reqs)
 
-        if self.use_fused_overlap_offload and self.tp_rank == 0:
+        if self.use_fused_overlap_offload:
             self.fused_offload_token_start_cpu.fill_(-1)
             self.fused_offload_num_tokens_cpu.zero_()
             for req_idx, req_id in enumerate(self.req_ids[:num_reqs]):
@@ -942,44 +872,6 @@ class SFAKVOffloadWorker:
             self.cpu_block_table_req_hashes,
         )
 
-    def get_owned_cpu_kv_pools(
-        self,
-    ) -> tuple[list[torch.Tensor] | None, list[torch.Tensor] | None]:
-        if self.tp_rank != 0:
-            return None, None
-        return self.k_caches_cpu, self.v_caches_cpu
-
-    def _debug_verify_current_kv_replicated(
-        self,
-        layer_name: str,
-        slot_mapping: torch.Tensor,
-        num_actual_tokens: int,
-    ) -> None:
-        layer_id = self._get_offload_layer_id(layer_name)
-        slots = slot_mapping[:num_actual_tokens].to(dtype=torch.long)
-        slots = slots[slots >= 0]
-        if slots.numel() == 0:
-            return
-
-        k_cache = self.k_caches_npu[layer_id].view(-1, self.k_caches_npu[layer_id].shape[-1])
-        v_cache = self.v_caches_npu[layer_id].view(-1, self.v_caches_npu[layer_id].shape[-1])
-        current_k = torch.index_select(k_cache, 0, slots).float()
-        current_v = torch.index_select(v_cache, 0, slots).float()
-        checksum = torch.stack(
-            (
-                current_k.sum(),
-                current_k.abs().sum(),
-                current_v.sum(),
-                current_v.abs().sum(),
-            )
-        ).view(1, 4)
-        gathered = self.tp_group.all_gather(checksum, dim=0).view(self.tp_size, 4)
-        if not torch.equal(gathered, gathered[0:1].expand_as(gathered)):
-            raise RuntimeError(
-                "SFA fused_overlap current-token Main KV differs across TP ranks: "
-                f"layer={layer_name}, checksums={gathered.cpu().tolist()}"
-            )
-
     def save_current_kv_tokens(
         self,
         layer_name: str,
@@ -990,60 +882,11 @@ class SFAKVOffloadWorker:
         num_reqs: int,
         capturing: bool = False,
     ) -> None:
-        """Copy current-step Main KV through the TP0 shared CPU owner."""
+        """Immediately copy current-step main MLA KV tokens from NPU to CPU."""
         if not self.use_fused_overlap_offload or num_actual_tokens <= 0 or num_reqs <= 0:
             return
-        if capturing or _is_current_stream_capturing():
-            raise RuntimeError(
-                "SFA fused_overlap shared CPU Main KV currently requires --enforce-eager; "
-                "graph/capture mode is not supported"
-            )
-        if not self.fused_step_has_offload:
+        if not self.fused_step_requests:
             return
-
-        if envs.VLLM_ASCEND_SFA_DEBUG:
-            self._debug_verify_current_kv_replicated(
-                layer_name,
-                slot_mapping,
-                num_actual_tokens,
-            )
-
-        d2h_error = None
-        if self.tp_rank == 0:
-            self.d2h_status_npu.zero_()
-            try:
-                self._save_current_kv_tokens_on_owner(
-                    layer_name,
-                    slot_mapping,
-                    token_to_req,
-                    cum_query_lens,
-                    num_actual_tokens,
-                    num_reqs,
-                )
-            except Exception as exc:
-                d2h_error = exc
-                self.d2h_status_npu.fill_(1)
-
-        self.tp_group.broadcast(self.d2h_status_npu, src=0)
-        if int(self.d2h_status_npu.item()) != 0:
-            detail = f"{type(d2h_error).__name__}: {d2h_error}" if d2h_error is not None else "TP0 D2H failed"
-            raise RuntimeError(
-                "SFA fused_overlap TP0 current-token D2H failed: "
-                f"layer={layer_name}, tp_rank={self.tp_rank}, {detail}"
-            ) from d2h_error
-        self.tp_group.barrier()
-
-    def _save_current_kv_tokens_on_owner(
-        self,
-        layer_name: str,
-        slot_mapping: torch.Tensor,
-        token_to_req: torch.Tensor,
-        cum_query_lens: torch.Tensor,
-        num_actual_tokens: int,
-        num_reqs: int,
-    ) -> None:
-        assert self.tp_rank == 0
-        capturing = False
 
         layer_id = self._get_offload_layer_id(layer_name)
         self.d2h_slot_mapping_cpu[:num_actual_tokens].copy_(
@@ -1074,32 +917,31 @@ class SFAKVOffloadWorker:
         else:
             self._compute_step_offload_addrs_cpu(args)
 
-        copy_count = int(self.d2h_num_tokens_buffer_cpu[0].item())
-        if not getattr(self, "_fused_overlap_d2h_logged", False):
-            logger.info(
-                "[fused_overlap_offload][d2h] first submit layer_id=%s "
-                "num_actual_tokens=%s num_reqs=%s copy_count=%s "
-                "slot_shape=%s token_to_req_shape=%s cum_query_lens_shape=%s",
-                layer_id,
-                num_actual_tokens,
-                num_reqs,
-                copy_count,
-                tuple(slot_mapping[:num_actual_tokens].shape),
-                tuple(token_to_req[:num_actual_tokens].shape),
-                tuple(cum_query_lens[:num_reqs].shape),
-            )
-            self._fused_overlap_d2h_logged = True
-        if envs.VLLM_ASCEND_SFA_DEBUG:
-            logger.info(
-                "[fused_overlap_offload][d2h][debug] layer_id=%s "
-                "num_actual_tokens=%s num_reqs=%s copy_count=%s",
-                layer_id,
-                num_actual_tokens,
-                num_reqs,
-                copy_count,
-            )
-        if copy_count == 0:
-            return
+        if not capturing:
+            copy_count = int(self.d2h_num_tokens_buffer_cpu[0].item())
+            if not getattr(self, "_fused_overlap_d2h_logged", False):
+                logger.info(
+                    "[fused_overlap_offload][d2h] first submit layer_id=%s "
+                    "num_actual_tokens=%s num_reqs=%s copy_count=%s "
+                    "slot_shape=%s token_to_req_shape=%s cum_query_lens_shape=%s",
+                    layer_id,
+                    num_actual_tokens,
+                    num_reqs,
+                    copy_count,
+                    tuple(slot_mapping[:num_actual_tokens].shape),
+                    tuple(token_to_req[:num_actual_tokens].shape),
+                    tuple(cum_query_lens[:num_reqs].shape),
+                )
+                self._fused_overlap_d2h_logged = True
+            if envs.VLLM_ASCEND_SFA_DEBUG:
+                logger.info(
+                    "[fused_overlap_offload][d2h][debug] layer_id=%s "
+                    "num_actual_tokens=%s num_reqs=%s copy_count=%s",
+                    layer_id,
+                    num_actual_tokens,
+                    num_reqs,
+                    copy_count,
+                )
 
         self.d2h_batch_copy_args_buffer_npu.copy_(
             self.d2h_batch_copy_args_buffer_cpu, non_blocking=capturing
@@ -1113,7 +955,8 @@ class SFAKVOffloadWorker:
             self.k_caches_npu[layer_id].device,
         )
         self.d2h_save_event.record(current_compute_stream)
-        self.d2h_save_event.synchronize()
+        if not capturing:
+            self.d2h_save_event.synchronize()
 
     def wait_for_save(self):
         assert self.use_layerwise

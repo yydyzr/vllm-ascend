@@ -1943,11 +1943,6 @@ class AscendSFAImpl(MLAAttentionImpl):
         actual_seq_lengths_key_decode: torch.Tensor,
         layer_name: str,
     ) -> torch.Tensor:
-        if get_forward_context().capturing:
-            raise RuntimeError(
-                "SFA fused_overlap shared CPU Main KV currently requires --enforce-eager; "
-                "graph/capture mode is not supported"
-            )
         num_tokens = ql_nope_decode.shape[0]
         num_reqs = attn_metadata.num_decodes
         if num_tokens <= 0 or num_reqs <= 0:

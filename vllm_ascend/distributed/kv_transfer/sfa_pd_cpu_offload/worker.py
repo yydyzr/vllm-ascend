@@ -170,13 +170,14 @@ class SFAPDCpuOffloadConsumerWorker:
         """
         # --- D side: compose the SFA worker for LRU load + CPU pool ---
         self.sfa_worker = SFAKVOffloadWorker(self.vllm_config, self.use_layerwise, self.kv_cache_config)
-        # SFA worker allocates the shared CPU Main KV owner on TP0 and creates
-        # non-owning owner-GVA views for fused attention on the other ranks.
+        # SFA worker allocates k_caches_cpu/v_caches_cpu + LRU buffers here.
         self.sfa_worker.register_kv_caches(kv_caches)
 
-        # Only owning tensors are writable PD destinations. Non-owner views
-        # must never make D1+ pull full Main KV into TP0's shared GVA.
-        k_caches_cpu, v_caches_cpu = self.sfa_worker.get_owned_cpu_kv_pools()
+        # Fused overlap gives every TP rank a local Main KV CPU pool. Legacy
+        # keeps the TP-shared pool on TP0. Every rank still runs PD receive
+        # because Indexer and partial Main KV land in rank-local HBM.
+        k_caches_cpu = getattr(self.sfa_worker, "k_caches_cpu", None)
+        v_caches_cpu = getattr(self.sfa_worker, "v_caches_cpu", None)
 
         # Part A: D's main MLA HBM k/v tensors (group1 paged cache) — the partial
         # last block lands here instead of the CPU pool. Keyed by main layer name
@@ -369,12 +370,9 @@ class SFAPDCpuOffloadConsumerWorker:
         k_caches_cpu: list[torch.Tensor] | None,
         v_caches_cpu: list[torch.Tensor] | None,
     ) -> None:
-        """Register D pull destinations without registering D memory.
-
-        Every D rank reads its local HBM legs. Only TP0 exposes the shared CPU
-        Main KV owner as a writable destination; D1+ still retains non-owning
-        views for fused attention, but those views are not passed here.
-        """
+        """memfabric pull mode: D does NOT register anything. Only P registers
+        its HBM. Every D rank reads local HBM legs. Fused overlap also reads
+        full Main KV into its rank-local CPU pool; legacy does so only on TP0."""
         num_blocks = self.kv_cache_config.num_blocks
         indexer_names = list(self.kv_cache_config.kv_cache_groups[_INDEXER_GROUP_IDX].layer_names)
 
