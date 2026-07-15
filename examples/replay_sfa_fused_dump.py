@@ -15,6 +15,13 @@ Usage:
       --fused /tmp/sfa-dump/sfa_fused_inputs_layer0_step1_rank0_pid123.pt \\
       --sfa /tmp/sfa-dump/sfa_sfa_inputs_layer0_step1_rank0_pid456.pt \\
       --cpu-kv-backend offload
+
+  # compare each request in the batch separately
+  python examples/replay_sfa_fused_dump.py \\
+      --fused .../sfa_fused_inputs_....pt \\
+      --sfa .../sfa_sfa_inputs_....pt \\
+      --per-request \\
+      --request 0,2
 """
 
 from __future__ import annotations
@@ -27,6 +34,7 @@ from pathlib import Path
 from typing import Any
 
 import torch
+import vllm_ascend.vllm_ascend_C
 
 _SCRIPT_DIR = Path(__file__).resolve().parent
 if str(_SCRIPT_DIR) not in sys.path:
@@ -170,6 +178,127 @@ def _infer_layer_step(path: Path) -> tuple[int | None, int | None]:
     return int(match.group("layer")), int(match.group("step"))
 
 
+def _parse_int_list(raw: str | None) -> list[int] | None:
+    if raw is None or not str(raw).strip():
+        return None
+    return [int(part.strip()) for part in str(raw).split(",") if part.strip()]
+
+
+def _as_1d_long(value: Any, name: str) -> torch.Tensor:
+    if not isinstance(value, torch.Tensor):
+        raise TypeError(f"{name} must be a tensor, got {type(value)}")
+    return value.detach().cpu().reshape(-1).to(torch.long)
+
+
+def _token_ranges_from_cum_query(cum_query: torch.Tensor) -> list[tuple[int, int]]:
+    """Convert TND cumulative query lengths to per-request [start, end) token ranges."""
+    cum = _as_1d_long(cum_query, "cum_query").tolist()
+    if not cum:
+        return []
+    ranges: list[tuple[int, int]] = []
+    prev = 0
+    for end in cum:
+        end_i = int(end)
+        if end_i < prev:
+            raise ValueError(f"invalid cumulative query lengths: {cum}")
+        ranges.append((prev, end_i))
+        prev = end_i
+    return ranges
+
+
+def _num_reqs_and_token_ranges(
+    fused_inputs: dict[str, Any],
+    sfa_inputs: dict[str, Any],
+) -> list[tuple[int, int]]:
+    fused_q = _as_1d_long(fused_inputs["full_q_actual_seq"], "fused.full_q_actual_seq")
+    sfa_q = _as_1d_long(sfa_inputs["actual_seq_lengths_query"], "sfa.actual_seq_lengths_query")
+    if fused_q.numel() != sfa_q.numel():
+        raise ValueError(
+            f"num_reqs mismatch: fused={fused_q.numel()} sfa={sfa_q.numel()}"
+        )
+    if not torch.equal(fused_q, sfa_q):
+        raise ValueError(
+            f"cumulative query lengths differ: fused={fused_q.tolist()} sfa={sfa_q.tolist()}"
+        )
+    return _token_ranges_from_cum_query(fused_q)
+
+
+def _repeat_block_table_for_tokens(
+    block_table: torch.Tensor,
+    *,
+    req_idx: int,
+    num_tokens: int,
+) -> torch.Tensor:
+    """Expand one request's block-table row to match token rows for gather/compare."""
+    row = block_table[req_idx : req_idx + 1]
+    if num_tokens <= 1:
+        return row
+    return row.expand(num_tokens, *row.shape[1:]).contiguous()
+
+
+def _slice_fused_inputs_for_request(
+    inputs: dict[str, Any],
+    *,
+    req_idx: int,
+    token_start: int,
+    token_end: int,
+) -> dict[str, Any]:
+    sliced = dict(inputs)
+    num_tokens = token_end - token_start
+    query_tokens = int(inputs["query"].shape[0])
+    sliced["query"] = inputs["query"][token_start:token_end]
+    sliced["selection_topk_indices"] = inputs["selection_topk_indices"][token_start:token_end]
+    for name in (
+        "selection_k_rope",
+        "selection_kv_cache",
+        "selection_kv_block_status",
+    ):
+        value = inputs.get(name)
+        if isinstance(value, torch.Tensor) and value.dim() >= 1 and value.shape[0] == query_tokens:
+            sliced[name] = value[token_start:token_end]
+    # selection_kv_block_table is often [token*head, blocks]; slice by head-grouped rows.
+    block_table = inputs.get("selection_kv_block_table")
+    if isinstance(block_table, torch.Tensor) and block_table.dim() >= 1:
+        if block_table.shape[0] == query_tokens:
+            sliced["selection_kv_block_table"] = block_table[token_start:token_end]
+        elif query_tokens > 0 and block_table.shape[0] % query_tokens == 0:
+            heads = block_table.shape[0] // query_tokens
+            sliced["selection_kv_block_table"] = block_table[
+                token_start * heads : token_end * heads
+            ]
+    sliced["full_q_actual_seq"] = torch.tensor([num_tokens], dtype=torch.int32)
+    sliced["full_kv_actual_seq"] = inputs["full_kv_actual_seq"][req_idx : req_idx + 1]
+    # Repeat so gather_selected_paged_cache(token_to_req=arange) works for MTP.
+    sliced["full_kv_block_table"] = _repeat_block_table_for_tokens(
+        inputs["full_kv_block_table"],
+        req_idx=req_idx,
+        num_tokens=num_tokens,
+    )
+    return sliced
+
+
+def _slice_sfa_inputs_for_request(
+    inputs: dict[str, Any],
+    *,
+    req_idx: int,
+    token_start: int,
+    token_end: int,
+) -> dict[str, Any]:
+    sliced = dict(inputs)
+    num_tokens = token_end - token_start
+    sliced["query"] = inputs["query"][token_start:token_end]
+    sliced["query_rope"] = inputs["query_rope"][token_start:token_end]
+    sliced["sparse_indices"] = inputs["sparse_indices"][token_start:token_end]
+    sliced["actual_seq_lengths_query"] = torch.tensor([num_tokens], dtype=torch.int32)
+    sliced["actual_seq_lengths_kv"] = inputs["actual_seq_lengths_kv"][req_idx : req_idx + 1]
+    sliced["block_table"] = _repeat_block_table_for_tokens(
+        inputs["block_table"],
+        req_idx=req_idx,
+        num_tokens=num_tokens,
+    )
+    return sliced
+
+
 def _cosine_sim(left: torch.Tensor, right: torch.Tensor) -> float:
     left = left.detach().float().reshape(-1)
     right = right.detach().float().reshape(-1)
@@ -236,9 +365,11 @@ def _print_input_align_report(
     fused_payload: dict[str, Any],
     sfa_payload: dict[str, Any],
     results: list[dump_cmp.CheckResult],
+    *,
+    title: str = "Step 1/2: fused vs baseline input alignment",
 ) -> int:
     print("=" * 72)
-    print("Step 1/2: fused vs baseline input alignment")
+    print(title)
     print("=" * 72)
     print(f"fused inputs: {fused_path}")
     print(f"  layer={fused_payload.get('layer_name')} op={fused_payload.get('op_name')}")
@@ -265,6 +396,79 @@ def _print_input_align_report(
     return 1 if counts[dump_cmp.FAIL] else 0
 
 
+def _compare_inputs_per_request(
+    fused_path: Path,
+    sfa_path: Path,
+    fused_payload: dict[str, Any],
+    sfa_payload: dict[str, Any],
+    *,
+    atol: float,
+    rtol: float,
+    request_ids: list[int] | None,
+) -> int:
+    token_ranges = _num_reqs_and_token_ranges(
+        fused_payload["inputs"],
+        sfa_payload["inputs"],
+    )
+    num_reqs = len(token_ranges)
+    selected = request_ids if request_ids is not None else list(range(num_reqs))
+    print("=" * 72)
+    print(f"Step 1/2: per-request input alignment (num_reqs={num_reqs})")
+    print("=" * 72)
+
+    failed_reqs: list[int] = []
+    for req_idx in selected:
+        if req_idx < 0 or req_idx >= num_reqs:
+            print(f"[FAIL] req={req_idx}: out of range [0, {num_reqs})")
+            failed_reqs.append(req_idx)
+            continue
+        token_start, token_end = token_ranges[req_idx]
+        fused_req = {
+            **fused_payload,
+            "inputs": _slice_fused_inputs_for_request(
+                fused_payload["inputs"],
+                req_idx=req_idx,
+                token_start=token_start,
+                token_end=token_end,
+            ),
+        }
+        sfa_req = {
+            **sfa_payload,
+            "inputs": _slice_sfa_inputs_for_request(
+                sfa_payload["inputs"],
+                req_idx=req_idx,
+                token_start=token_start,
+                token_end=token_end,
+            ),
+        }
+        results = dump_cmp.compare_payloads(
+            fused_req,
+            sfa_req,
+            atol=atol,
+            rtol=rtol,
+        )
+        rc = _print_input_align_report(
+            fused_path,
+            sfa_path,
+            fused_req,
+            sfa_req,
+            results,
+            title=(
+                f"req={req_idx} tokens=[{token_start}, {token_end}) "
+                f"num_tokens={token_end - token_start}"
+            ),
+        )
+        if rc != 0:
+            failed_reqs.append(req_idx)
+
+    print("=" * 72)
+    if failed_reqs:
+        print(f"per-request input summary: FAIL reqs={failed_reqs}")
+        return 1
+    print(f"per-request input summary: all {len(selected)} selected request(s) PASS")
+    return 0
+
+
 def run_fused_vs_baseline_output(
     fused_op,
     fused_inputs_path: Path,
@@ -272,6 +476,8 @@ def run_fused_vs_baseline_output(
     *,
     atol: float,
     cpu_kv_backend: str,
+    per_request: bool,
+    request_ids: list[int] | None,
 ) -> tuple[bool, str]:
     fused_payload = dump_cmp.load_input_payload(fused_inputs_path)
     baseline_payload = dump_cmp.load_output_payload(baseline_output_path)
@@ -300,15 +506,57 @@ def run_fused_vs_baseline_output(
             f"baseline={tuple(golden.shape)}",
         )
 
-    cos = _cosine_sim(attn_output, golden)
-    detail = (
-        f"{layer_tag} {step_tag} cosine_sim={cos:.8f} "
-        f"cpu_kv_backend={cpu_kv_backend} "
-        f"fused={fused_inputs_path.name} baseline={baseline_output_path.name}"
+    if not per_request:
+        cos = _cosine_sim(attn_output, golden)
+        detail = (
+            f"{layer_tag} {step_tag} cosine_sim={cos:.8f} "
+            f"cpu_kv_backend={cpu_kv_backend} "
+            f"fused={fused_inputs_path.name} baseline={baseline_output_path.name}"
+        )
+        if cos >= 1.0 - atol:
+            return True, f"PASS {detail}"
+        return False, f"FAIL {detail}"
+
+    # Per-request output compare on the full-batch fused replay result.
+    token_ranges = _token_ranges_from_cum_query(
+        fused_payload["inputs"]["full_q_actual_seq"]
     )
-    if cos >= 1.0 - atol:
-        return True, f"PASS {detail}"
-    return False, f"FAIL {detail}"
+    num_reqs = len(token_ranges)
+    selected = request_ids if request_ids is not None else list(range(num_reqs))
+    lines = [
+        f"{layer_tag} {step_tag} per-request output "
+        f"cpu_kv_backend={cpu_kv_backend}"
+    ]
+    failed: list[int] = []
+    for req_idx in selected:
+        if req_idx < 0 or req_idx >= num_reqs:
+            lines.append(f"[FAIL] req={req_idx}: out of range [0, {num_reqs})")
+            failed.append(req_idx)
+            continue
+        token_start, token_end = token_ranges[req_idx]
+        left = attn_output[token_start:token_end]
+        right = golden[token_start:token_end]
+        if tuple(left.shape) != tuple(right.shape):
+            lines.append(
+                f"[FAIL] req={req_idx} tokens=[{token_start},{token_end}): "
+                f"shape fused={tuple(left.shape)} baseline={tuple(right.shape)}"
+            )
+            failed.append(req_idx)
+            continue
+        cos = _cosine_sim(left, right)
+        status = "PASS" if cos >= 1.0 - atol else "FAIL"
+        lines.append(
+            f"[{status}] req={req_idx} tokens=[{token_start},{token_end}) "
+            f"cosine_sim={cos:.8f}"
+        )
+        if status == "FAIL":
+            failed.append(req_idx)
+
+    if failed:
+        lines.append(f"FAIL reqs={failed}")
+        return False, "\n".join(lines)
+    lines.append(f"PASS all {len(selected)} selected request(s)")
+    return True, "\n".join(lines)
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -351,6 +599,22 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--per-request",
+        action="store_true",
+        help=(
+            "Compare inputs/outputs per request inside the batch "
+            "(uses cumulative query lengths to split token rows)."
+        ),
+    )
+    parser.add_argument(
+        "--request",
+        default=None,
+        help=(
+            "With --per-request, only check these request indices "
+            "(comma-separated, e.g. 0 or 0,2). Default: all requests."
+        ),
+    )
+    parser.add_argument(
         "--atol",
         type=float,
         default=1e-3,
@@ -386,23 +650,39 @@ def main(argv: list[str] | None = None) -> int:
         print("       pass --baseline explicitly if the filename differs", file=sys.stderr)
         return 2
 
+    request_ids = _parse_int_list(args.request)
+    if request_ids is not None and not args.per_request:
+        print("ERROR: --request requires --per-request", file=sys.stderr)
+        return 2
+
     fused_payload = dump_cmp.load_input_payload(args.fused)
     sfa_payload = dump_cmp.load_input_payload(args.sfa)
 
     if not args.skip_input_check:
-        input_results = dump_cmp.compare_payloads(
-            fused_payload,
-            sfa_payload,
-            atol=args.atol,
-            rtol=args.rtol,
-        )
-        input_rc = _print_input_align_report(
-            args.fused,
-            args.sfa,
-            fused_payload,
-            sfa_payload,
-            input_results,
-        )
+        if args.per_request:
+            input_rc = _compare_inputs_per_request(
+                args.fused,
+                args.sfa,
+                fused_payload,
+                sfa_payload,
+                atol=args.atol,
+                rtol=args.rtol,
+                request_ids=request_ids,
+            )
+        else:
+            input_results = dump_cmp.compare_payloads(
+                fused_payload,
+                sfa_payload,
+                atol=args.atol,
+                rtol=args.rtol,
+            )
+            input_rc = _print_input_align_report(
+                args.fused,
+                args.sfa,
+                fused_payload,
+                sfa_payload,
+                input_results,
+            )
         if input_rc != 0:
             print("ABORT: inputs are not aligned; skip fused op replay")
             return 1
@@ -424,7 +704,11 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     print("=" * 72)
-    print(f"Step 2/2: replay fused op vs baseline output (cpu-kv-backend={args.cpu_kv_backend})")
+    mode = "per-request" if args.per_request else "full-batch"
+    print(
+        f"Step 2/2: replay fused op vs baseline output "
+        f"(cpu-kv-backend={args.cpu_kv_backend}, mode={mode})"
+    )
     print("=" * 72)
 
     offload = None
@@ -443,6 +727,8 @@ def main(argv: list[str] | None = None) -> int:
             baseline_output,
             atol=args.atol,
             cpu_kv_backend=args.cpu_kv_backend,
+            per_request=args.per_request,
+            request_ids=request_ids,
         )
     except Exception as exc:
         message = f"FAIL: fused replay raised {type(exc).__name__}: {exc}"
