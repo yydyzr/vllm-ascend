@@ -648,6 +648,147 @@ compute_lru_resident_addrs(
     return num_tokens_to_load_sum;
 }
 
+int32_t
+compute_step_offload_addrs(
+    const at::Tensor& slots,
+    const at::Tensor& token_to_req,
+    const at::Tensor& cum_query_lens,
+    const at::Tensor& cpu_block_table,
+    const at::Tensor& offload_token_start,
+    const at::Tensor& offload_num_tokens,
+    at::Tensor& gvas_buffer,
+    at::Tensor& addr_buffer,
+    at::Tensor& size_buffer,
+    at::Tensor& num_tokens_buffer,
+    const int32_t num_actual_tokens,
+    const int32_t num_reqs,
+    const int32_t block_size,
+    const int32_t token_size_bytes_k,
+    const int32_t token_size_bytes_v,
+    const int64_t npu_k_base,
+    const int64_t npu_v_base,
+    const int64_t cpu_k_base,
+    const int64_t cpu_v_base
+) {
+    // Host-func friendly: pure CPU, no Python/GIL. Used by fused_overlap D2H.
+    if (num_actual_tokens <= 0 || num_reqs <= 0) {
+        static_cast<int32_t*>(num_tokens_buffer.data_ptr())[0] = 0;
+        return 0;
+    }
+
+    TORCH_CHECK(slots.scalar_type() == at::kInt, "slots must be int32");
+    TORCH_CHECK(token_to_req.scalar_type() == at::kInt, "token_to_req must be int32");
+    TORCH_CHECK(cum_query_lens.scalar_type() == at::kInt, "cum_query_lens must be int32");
+    TORCH_CHECK(cpu_block_table.scalar_type() == at::kInt, "cpu_block_table must be int32");
+    TORCH_CHECK(offload_token_start.scalar_type() == at::kInt, "offload_token_start must be int32");
+    TORCH_CHECK(offload_num_tokens.scalar_type() == at::kInt, "offload_num_tokens must be int32");
+    TORCH_CHECK(gvas_buffer.scalar_type() == at::kLong, "gvas_buffer must be int64");
+    TORCH_CHECK(addr_buffer.scalar_type() == at::kLong, "addr_buffer must be int64");
+    TORCH_CHECK(size_buffer.scalar_type() == at::kInt, "size_buffer must be int32");
+    TORCH_CHECK(num_tokens_buffer.scalar_type() == at::kInt, "num_tokens_buffer must be int32");
+    TORCH_CHECK(slots.size(0) >= num_actual_tokens, "slots too small");
+    TORCH_CHECK(token_to_req.size(0) >= num_actual_tokens, "token_to_req too small");
+    TORCH_CHECK(cum_query_lens.size(0) >= num_reqs, "cum_query_lens too small");
+    TORCH_CHECK(cpu_block_table.size(0) >= num_reqs, "cpu_block_table too small");
+    TORCH_CHECK(offload_token_start.size(0) >= num_reqs, "offload_token_start too small");
+    TORCH_CHECK(offload_num_tokens.size(0) >= num_reqs, "offload_num_tokens too small");
+    TORCH_CHECK(gvas_buffer.size(0) >= num_actual_tokens * 2, "gvas_buffer too small");
+    TORCH_CHECK(addr_buffer.size(0) >= num_actual_tokens * 2, "addr_buffer too small");
+    TORCH_CHECK(size_buffer.size(0) >= num_actual_tokens * 2, "size_buffer too small");
+    TORCH_CHECK(num_tokens_buffer.size(0) >= 1, "num_tokens_buffer too small");
+    TORCH_CHECK(block_size > 0, "block_size must be positive");
+
+    const int32_t max_num_blocks = cpu_block_table.size(1);
+    const int32_t block_size_bytes_k = block_size * token_size_bytes_k;
+    const int32_t block_size_bytes_v = block_size * token_size_bytes_v;
+
+    const int32_t* slots_ptr = static_cast<int32_t*>(slots.data_ptr());
+    const int32_t* token_to_req_ptr = static_cast<int32_t*>(token_to_req.data_ptr());
+    const int32_t* cum_query_lens_ptr = static_cast<int32_t*>(cum_query_lens.data_ptr());
+    const int32_t* cpu_block_table_ptr = static_cast<int32_t*>(cpu_block_table.data_ptr());
+    const int32_t* offload_token_start_ptr = static_cast<int32_t*>(offload_token_start.data_ptr());
+    const int32_t* offload_num_tokens_ptr = static_cast<int32_t*>(offload_num_tokens.data_ptr());
+    int64_t* gvas_buffer_ptr = static_cast<int64_t*>(gvas_buffer.data_ptr());
+    int64_t* addr_buffer_ptr = static_cast<int64_t*>(addr_buffer.data_ptr());
+    int32_t* size_buffer_ptr = static_cast<int32_t*>(size_buffer.data_ptr());
+    int32_t* num_tokens_buffer_ptr = static_cast<int32_t*>(num_tokens_buffer.data_ptr());
+
+    const int32_t v_staging_offset = num_actual_tokens;
+    int32_t k_idx = 0;
+    for (int32_t batch_idx = 0; batch_idx < num_actual_tokens; ++batch_idx) {
+        const int32_t req_idx = token_to_req_ptr[batch_idx];
+        if (req_idx < 0 || req_idx >= num_reqs) {
+            continue;
+        }
+        const int32_t offload_n = offload_num_tokens_ptr[req_idx];
+        if (offload_n <= 0) {
+            continue;
+        }
+        const int32_t query_start = (req_idx == 0) ? 0 : cum_query_lens_ptr[req_idx - 1];
+        const int32_t local_offset = batch_idx - query_start;
+        if (local_offset < 0 || local_offset >= offload_n) {
+            continue;
+        }
+        const int32_t slot = slots_ptr[batch_idx];
+        if (slot < 0) {
+            continue;
+        }
+        const int32_t global_pos = offload_token_start_ptr[req_idx] + local_offset;
+        const int32_t npu_block_id = slot / block_size;
+        const int32_t npu_offset_in_block = slot % block_size;
+        const int32_t cpu_block_idx = global_pos / block_size;
+        const int32_t cpu_offset_in_block = global_pos % block_size;
+        if (cpu_block_idx < 0 || cpu_block_idx >= max_num_blocks) {
+            continue;
+        }
+        const int32_t cpu_block_id =
+            cpu_block_table_ptr[req_idx * max_num_blocks + cpu_block_idx];
+        if (cpu_block_id <= 0) {
+            continue;
+        }
+
+        const int64_t gva_k =
+            cpu_k_base
+            + static_cast<int64_t>(cpu_block_id) * block_size_bytes_k
+            + static_cast<int64_t>(cpu_offset_in_block) * token_size_bytes_k;
+        const int64_t addr_k =
+            npu_k_base
+            + static_cast<int64_t>(npu_block_id) * block_size_bytes_k
+            + static_cast<int64_t>(npu_offset_in_block) * token_size_bytes_k;
+        const int64_t gva_v =
+            cpu_v_base
+            + static_cast<int64_t>(cpu_block_id) * block_size_bytes_v
+            + static_cast<int64_t>(cpu_offset_in_block) * token_size_bytes_v;
+        const int64_t addr_v =
+            npu_v_base
+            + static_cast<int64_t>(npu_block_id) * block_size_bytes_v
+            + static_cast<int64_t>(npu_offset_in_block) * token_size_bytes_v;
+
+        gvas_buffer_ptr[k_idx] = gva_k;
+        addr_buffer_ptr[k_idx] = addr_k;
+        gvas_buffer_ptr[v_staging_offset + k_idx] = gva_v;
+        addr_buffer_ptr[v_staging_offset + k_idx] = addr_v;
+        ++k_idx;
+    }
+
+    const int32_t num_k_copies = k_idx;
+    const int32_t copy_idx = num_k_copies * 2;
+    if (num_k_copies > 0) {
+        if (num_k_copies < num_actual_tokens) {
+            for (int32_t i = 0; i < num_k_copies; ++i) {
+                gvas_buffer_ptr[num_k_copies + i] =
+                    gvas_buffer_ptr[v_staging_offset + i];
+                addr_buffer_ptr[num_k_copies + i] =
+                    addr_buffer_ptr[v_staging_offset + i];
+            }
+        }
+        std::fill_n(size_buffer_ptr, num_k_copies, token_size_bytes_k);
+        std::fill_n(size_buffer_ptr + num_k_copies, num_k_copies, token_size_bytes_v);
+    }
+    num_tokens_buffer_ptr[0] = copy_idx;
+    return copy_idx;
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
 {
     namespace py = pybind11;
@@ -656,4 +797,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
           "CPU LRU resident compact miss prepare with OpenMP row-level parallelism");
     m.def("compute_lru_resident_addrs", &compute_lru_resident_addrs,
           "Compute sparse H2D metadata for compact LRU resident miss loads");
+    m.def(
+        "compute_step_offload_addrs",
+        &compute_step_offload_addrs,
+        py::call_guard<py::gil_scoped_release>(),
+        "Compute sparse D2H metadata for fused_overlap current-token offload");
 }

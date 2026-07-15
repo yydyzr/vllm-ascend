@@ -743,107 +743,87 @@ class SFAKVOffloadWorker:
 
     def _compute_step_offload_addrs_cpu(
         self,
-        args: tuple[int, int, int],
+        args: tuple,
     ) -> None:
-        num_actual_tokens, num_reqs, layer_id = args
-        if num_actual_tokens <= 0:
-            self.d2h_num_tokens_buffer_cpu.zero_()
+        """Host callback / eager: pure CPU addr prep for fused D2H (C++ body).
+
+        Mirrors legacy ``prepare_lru_resident_and_load_cpu``: thin Python shell,
+        heavy work in ``cpu_sparse_attn.compute_step_offload_addrs`` with GIL
+        released. No NPU ops here.
+        """
+        (
+            num_actual_tokens,
+            num_reqs,
+            slots,
+            token_to_req,
+            cum_query_lens,
+            cpu_block_table,
+            offload_token_start,
+            offload_num_tokens,
+            gvas_buffer,
+            addr_buffer,
+            size_buffer,
+            num_tokens_buffer,
+            block_size,
+            token_size_bytes_k,
+            token_size_bytes_v,
+            npu_k_base,
+            npu_v_base,
+            cpu_k_base,
+            cpu_v_base,
+        ) = args
+        if num_actual_tokens <= 0 or num_reqs <= 0:
+            num_tokens_buffer.zero_()
             return
+        cpu_sparse_attn.compute_step_offload_addrs(
+            slots,
+            token_to_req,
+            cum_query_lens,
+            cpu_block_table,
+            offload_token_start,
+            offload_num_tokens,
+            gvas_buffer,
+            addr_buffer,
+            size_buffer,
+            num_tokens_buffer,
+            int(num_actual_tokens),
+            int(num_reqs),
+            int(block_size),
+            int(token_size_bytes_k),
+            int(token_size_bytes_v),
+            int(npu_k_base),
+            int(npu_v_base),
+            int(cpu_k_base),
+            int(cpu_v_base),
+        )
 
-        block_size_bytes_k = self.block_size * self.token_size_bytes_k
-        block_size_bytes_v = self.block_size * self.token_size_bytes_v
-        npu_k_base = self.npu_k_bases[layer_id]
-        npu_v_base = self.npu_v_bases[layer_id]
-        cpu_k_base = self.gvas_k_bases[layer_id]
-        cpu_v_base = self.gvas_v_bases[layer_id]
-
-        slots = self.d2h_slot_mapping_cpu[:num_actual_tokens]
-        token_to_req = self.d2h_token_to_req_cpu[:num_actual_tokens]
-        cum_query_lens = self.d2h_cum_query_lens_cpu[:num_reqs]
-        cpu_block_table = self.cpu_block_table_host_buffer[:num_reqs]
-        offload_token_start = self.fused_offload_token_start_cpu[:num_reqs]
-        offload_num_tokens = self.fused_offload_num_tokens_cpu[:num_reqs]
-
-        def _get_step_offload_addrs(batch_idx: int) -> tuple[int, int, int, int] | None:
-            req_idx = int(token_to_req[batch_idx].item())
-            if req_idx < 0 or req_idx >= num_reqs:
-                return None
-            if int(offload_num_tokens[req_idx].item()) <= 0:
-                return None
-
-            query_start = 0 if req_idx == 0 else int(cum_query_lens[req_idx - 1].item())
-            local_offset = batch_idx - query_start
-            if local_offset < 0 or local_offset >= int(offload_num_tokens[req_idx].item()):
-                return None
-
-            slot = int(slots[batch_idx].item())
-            if slot < 0:
-                return None
-
-            global_pos = int(offload_token_start[req_idx].item()) + local_offset
-            npu_block_id = slot // self.block_size
-            npu_offset_in_block = slot % self.block_size
-            cpu_block_idx = global_pos // self.block_size
-            cpu_offset_in_block = global_pos % self.block_size
-            cpu_block_id = int(cpu_block_table[req_idx, cpu_block_idx].item())
-            if cpu_block_id <= 0:
-                return None
-
-            gva_k = (
-                cpu_k_base
-                + cpu_block_id * block_size_bytes_k
-                + cpu_offset_in_block * self.token_size_bytes_k
-            )
-            addr_k = (
-                npu_k_base
-                + npu_block_id * block_size_bytes_k
-                + npu_offset_in_block * self.token_size_bytes_k
-            )
-            gva_v = (
-                cpu_v_base
-                + cpu_block_id * block_size_bytes_v
-                + cpu_offset_in_block * self.token_size_bytes_v
-            )
-            addr_v = (
-                npu_v_base
-                + npu_block_id * block_size_bytes_v
-                + npu_offset_in_block * self.token_size_bytes_v
-            )
-            return gva_k, addr_k, gva_v, addr_v
-
-        v_staging_offset = num_actual_tokens
-        k_idx = 0
-        for batch_idx in range(num_actual_tokens):
-            addrs = _get_step_offload_addrs(batch_idx)
-            if addrs is None:
-                continue
-            gva_k, addr_k, gva_v, addr_v = addrs
-            self.d2h_gvas_buffer_cpu[k_idx] = gva_k
-            self.d2h_addr_buffer_cpu[k_idx] = addr_k
-            staging_idx = v_staging_offset + k_idx
-            self.d2h_gvas_buffer_cpu[staging_idx] = gva_v
-            self.d2h_addr_buffer_cpu[staging_idx] = addr_v
-            k_idx += 1
-
-        num_k_copies = k_idx
-        copy_idx = num_k_copies * 2
-        if num_k_copies > 0:
-            if num_k_copies < num_actual_tokens:
-                self.d2h_gvas_buffer_cpu[num_k_copies:copy_idx] = (
-                    self.d2h_gvas_buffer_cpu[v_staging_offset:v_staging_offset + num_k_copies]
-                )
-                self.d2h_addr_buffer_cpu[num_k_copies:copy_idx] = (
-                    self.d2h_addr_buffer_cpu[v_staging_offset:v_staging_offset + num_k_copies]
-                )
-            self.d2h_size_buffer_cpu[:num_k_copies].fill_(self.token_size_bytes_k)
-            self.d2h_size_buffer_cpu[num_k_copies:copy_idx].fill_(self.token_size_bytes_v)
-        # Always publish copy_count (including 0) so graph-capture empty steps
-        # still produce a deterministic sparse_copy no-op on replay.
-        self.d2h_num_tokens_buffer_cpu[0] = copy_idx
-        # NOTE: This runs under ``_launch_host_func`` during ACLGraph replay.
-        # Do NOT call NPU APIs (e.g. is_current_stream_capturing) or blocking
-        # logger here — that deadlocks the compute stream waiting on the host
-        # callback. Keep this path pure CPU, same as legacy prepare_lru host_func.
+    def _pack_fused_d2h_addr_args(
+        self,
+        num_actual_tokens: int,
+        num_reqs: int,
+        layer_id: int,
+    ) -> tuple:
+        return (
+            num_actual_tokens,
+            num_reqs,
+            self.d2h_slot_mapping_cpu,
+            self.d2h_token_to_req_cpu,
+            self.d2h_cum_query_lens_cpu,
+            self.cpu_block_table_host_buffer,
+            self.fused_offload_token_start_cpu,
+            self.fused_offload_num_tokens_cpu,
+            self.d2h_gvas_buffer_cpu,
+            self.d2h_addr_buffer_cpu,
+            self.d2h_size_buffer_cpu,
+            self.d2h_num_tokens_buffer_cpu,
+            self.block_size,
+            self.token_size_bytes_k,
+            self.token_size_bytes_v,
+            self.npu_k_bases[layer_id],
+            self.npu_v_bases[layer_id],
+            self.gvas_k_bases[layer_id],
+            self.gvas_v_bases[layer_id],
+        )
 
     def save_cpu(self, layer_id: int | None = None) -> None:
         if layer_id is None:
@@ -900,11 +880,12 @@ class SFAKVOffloadWorker:
     ) -> None:
         """Copy current-step main MLA KV tokens from NPU to CPU.
 
-        Mirrors legacy H2D ``prepare_lru_resident_and_load`` for ACLGraph:
-        always record host_func + sparse_copy into the capture stream. When there
-        is nothing to offload (dummy capture / empty meta), host_func sets
-        ``copy_count=0`` and sparse_copy is a no-op — do NOT early-return on
-        ``fused_step_requests``, or the D2H path will be missing from the graph.
+        Aligned with legacy H2D ``prepare_lru_resident_and_load``:
+          1) copy meta NPU→CPU on compute stream
+          2) host_func / eager: CPU addr prep only (C++, no NPU in callback)
+          3) args buffer CPU→NPU + ``sparse_copy`` on compute stream
+        Always enter this path under ACLGraph (no early-return on empty
+        ``fused_step_requests``); empty meta yields copy_count=0.
         """
         if not self.use_fused_overlap_offload or num_actual_tokens <= 0 or num_reqs <= 0:
             return
@@ -916,7 +897,7 @@ class SFAKVOffloadWorker:
             f"{mode}|submit|{layer_id}",
             "[fused_overlap_offload][d2h][%s] SUBMIT layer=%s layer_id=%s "
             "num_actual_tokens=%s num_reqs=%s fused_step_requests=%s "
-            "capturing=%s tp_rank=%s host_func=%s",
+            "capturing=%s tp_rank=%s",
             mode,
             layer_name,
             layer_id,
@@ -925,7 +906,6 @@ class SFAKVOffloadWorker:
             len(self.fused_step_requests),
             capturing,
             self.tp_rank,
-            capturing,
         )
 
         self.d2h_slot_mapping_cpu[:num_actual_tokens].copy_(
@@ -941,7 +921,7 @@ class SFAKVOffloadWorker:
             self.cpu_block_table.gpu[:num_reqs], non_blocking=capturing
         )
 
-        args = (num_actual_tokens, num_reqs, layer_id)
+        addr_args = self._pack_fused_d2h_addr_args(num_actual_tokens, num_reqs, layer_id)
         current_compute_stream = torch_npu.npu.current_stream()
         if capturing:
             subscribed_compute_streams = get_subscribed_compute_streams()
@@ -951,10 +931,10 @@ class SFAKVOffloadWorker:
             torch_npu.npu._launch_host_func(
                 current_compute_stream,
                 self._compute_step_offload_addrs_cpu,
-                args,
+                addr_args,
             )
         else:
-            self._compute_step_offload_addrs_cpu(args)
+            self._compute_step_offload_addrs_cpu(addr_args)
             copy_count = int(self.d2h_num_tokens_buffer_cpu[0].item())
             self._log_fused_d2h(
                 f"eager|copy_count|{layer_id}",
@@ -969,10 +949,10 @@ class SFAKVOffloadWorker:
                 self.tp_rank,
             )
 
+        # Same as legacy H2D: sparse_copy stays on compute stream, outside callback.
         self.d2h_batch_copy_args_buffer_npu.copy_(
             self.d2h_batch_copy_args_buffer_cpu, non_blocking=capturing
         )
-        # D2H: gvas/addr buffers use H2D naming (CPU/NPU); swap sparse_copy args for NPU->CPU.
         offload.sparse_copy(
             self.d2h_addr_buffer_npu,
             self.d2h_gvas_buffer_npu,
@@ -980,8 +960,8 @@ class SFAKVOffloadWorker:
             self.d2h_num_tokens_buffer_npu,
             self.k_caches_npu[layer_id].device,
         )
-        self.d2h_save_event.record(current_compute_stream)
         if not capturing:
+            self.d2h_save_event.record(current_compute_stream)
             self.d2h_save_event.synchronize()
 
     def wait_for_save(self):
