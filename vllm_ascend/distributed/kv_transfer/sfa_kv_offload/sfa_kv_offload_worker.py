@@ -239,10 +239,6 @@ class SFAKVOffloadWorker:
         if self.use_fused_overlap_offload:
             self.fused_step_requests: list[ReqMeta] = []
             self._fused_req_meta_by_id: dict[str, ReqMeta] = {}
-            # Dedicated DMA stream for current-token D2H; compute waits via event
-            # (graph-friendly alternative to host_func barrier / synchronize).
-            self.d2h_copy_stream = torch_npu.npu.Stream()
-            self.d2h_addr_ready_event = torch_npu.npu.Event()
             self.d2h_save_event = torch_npu.npu.Event()
             self.fused_offload_token_start_cpu = torch.full(
                 [self.max_num_reqs],
@@ -872,6 +868,17 @@ class SFAKVOffloadWorker:
             logger.info(message, *args)
             self._fused_d2h_log_counts[key] = count + 1
 
+    def _fused_d2h_completion_barrier_cpu(self, args: tuple) -> None:
+        """ACLGraph stream barrier after D2H sparse_copy (no NPU ops).
+
+        Eager uses ``d2h_save_event.synchronize()`` (host-visible). Graph cannot
+        synchronize; this host_func is the best graph-safe stand-in, but it has
+        not been shown to fully match eager precision yet.
+        """
+        (num_tokens_buffer,) = args
+        if isinstance(num_tokens_buffer, torch.Tensor) and num_tokens_buffer.numel() > 0:
+            _ = int(num_tokens_buffer.reshape(-1)[0].item())
+
     def save_current_kv_tokens(
         self,
         layer_name: str,
@@ -884,12 +891,13 @@ class SFAKVOffloadWorker:
     ) -> None:
         """Copy current-step main MLA KV tokens from NPU to CPU.
 
-        Flow (prefetch-style, graph-friendly):
-          1) meta NPU→CPU on compute stream
-          2) host_func / eager: CPU addr prep only (C++, no NPU in callback)
-          3) ``d2h_copy_stream`` waits for addr-ready, then args H2D + ``sparse_copy``
-          4) compute ``wait_event(d2h_save_event)`` before fused reads CPU KV
-        Always enter this path under ACLGraph (no early-return on empty
+        Eager (known-good):
+          meta D2H → CPU addr prep → args H2D + sparse_copy on compute →
+          ``event.synchronize()``
+        ACLGraph (still under investigation):
+          meta D2H → host_func(addr) → args H2D + sparse_copy on compute →
+          host_func(barrier); no host synchronize / no cross-stream copy.
+        Always enter under ACLGraph (no early-return on empty
         ``fused_step_requests``); empty meta yields copy_count=0.
         """
         if not self.use_fused_overlap_offload or num_actual_tokens <= 0 or num_reqs <= 0:
@@ -954,23 +962,28 @@ class SFAKVOffloadWorker:
                 self.tp_rank,
             )
 
-        # Addr prep (and prior meta D2H) must finish before copy stream reads CPU args.
-        self.d2h_addr_ready_event.record(current_compute_stream)
-        self.d2h_copy_stream.wait_event(self.d2h_addr_ready_event)
-        with torch_npu.npu.stream(self.d2h_copy_stream):
-            self.d2h_batch_copy_args_buffer_npu.copy_(
-                self.d2h_batch_copy_args_buffer_cpu, non_blocking=True
+        # sparse_copy on compute stream (same as legacy H2D); outside host callback.
+        self.d2h_batch_copy_args_buffer_npu.copy_(
+            self.d2h_batch_copy_args_buffer_cpu, non_blocking=capturing
+        )
+        offload.sparse_copy(
+            self.d2h_addr_buffer_npu,
+            self.d2h_gvas_buffer_npu,
+            self.d2h_size_buffer_npu,
+            self.d2h_num_tokens_buffer_npu,
+            self.k_caches_npu[layer_id].device,
+        )
+        if capturing:
+            # Graph cannot synchronize(); host_func is a stand-in (precision TBD).
+            torch_npu.npu._launch_host_func(
+                current_compute_stream,
+                self._fused_d2h_completion_barrier_cpu,
+                (self.d2h_num_tokens_buffer_cpu,),
             )
-            offload.sparse_copy(
-                self.d2h_addr_buffer_npu,
-                self.d2h_gvas_buffer_npu,
-                self.d2h_size_buffer_npu,
-                self.d2h_num_tokens_buffer_npu,
-                self.k_caches_npu[layer_id].device,
-            )
-        self.d2h_save_event.record(self.d2h_copy_stream)
-        # Device-side wait only (no host synchronize / host_func barrier).
-        current_compute_stream.wait_event(self.d2h_save_event)
+        else:
+            # Known-good eager path: block host until D2H is host-visible.
+            self.d2h_save_event.record(current_compute_stream)
+            self.d2h_save_event.synchronize()
 
     def wait_for_save(self):
         assert self.use_layerwise

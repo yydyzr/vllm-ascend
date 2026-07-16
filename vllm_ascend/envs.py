@@ -123,13 +123,23 @@ env_variables: dict[str, Callable[[], Any]] = {
     # (debugging). Does NOT gate the expensive MFV checksums (see
     # VLLM_ASCEND_MF_VERIFY) nor one-time startup / operational error logs.
     "VLLM_ASCEND_SFA_DEBUG": lambda: bool(int(os.getenv("VLLM_ASCEND_SFA_DEBUG", "0"))),
-    # Dump the first eager decode operator inputs for the selected layer.
-    # Run once with fused_overlap offload (writes sfa_fused_inputs_*.pt) and once
-    # without kv_offload (writes sfa_sfa_inputs_*.pt), then compare offline.
+    # Dump fused/SFA operator inputs/outputs for the selected layer+step(s).
+    # Eager: Python dump (sfa_fused_*/sfa_sfa_*).
+    # ACLGraph: host_func recorded at capture; replay writes sfa_fused_graph_*.
     # Empty (default) disables all tensor copies and file I/O on the attention path.
     "VLLM_ASCEND_SFA_DUMP_DIR": lambda: os.getenv("VLLM_ASCEND_SFA_DUMP_DIR", ""),
     # Zero-based layer index selected by VLLM_ASCEND_SFA_DUMP_DIR.
     "VLLM_ASCEND_SFA_DUMP_LAYER": lambda: int(os.getenv("VLLM_ASCEND_SFA_DUMP_LAYER", "0")),
+    # Zero-based decode step indices to dump (shared by eager and ACLGraph).
+    # Comma-separated, e.g. "0", "1", or "0,1,3". Each decode forward on the
+    # selected layer advances the counter once (eager in Python; graph in the
+    # host_func callback). Matching steps' op inputs/outputs are saved.
+    "VLLM_ASCEND_SFA_DUMP_STEP": lambda: frozenset(
+        int(part.strip())
+        for part in os.getenv("VLLM_ASCEND_SFA_DUMP_STEP", "0").split(",")
+        if part.strip()
+    )
+    or frozenset({0}),
     # SFA PD memfabric-pull per-layer KV checksum verification
     # (.float().sum().item() device->host syncs -- expensive). Off by default.
     # 0 = off (default), 1 = on (correctness debugging). Independent of

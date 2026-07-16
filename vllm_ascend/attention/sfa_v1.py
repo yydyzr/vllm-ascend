@@ -29,7 +29,12 @@ from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 from vllm_ascend.attention.attention_mask import AttentionMaskBuilder
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
 from vllm_ascend.attention.context_parallel.common_cp import AscendPCPMetadata
-from vllm_ascend.attention.fused_overlap_debug import dump_op_inputs, dump_op_output
+from vllm_ascend.attention.fused_overlap_debug import (
+    dump_op_inputs,
+    dump_op_output,
+    launch_graph_fused_inputs_dump,
+    launch_graph_fused_output_dump,
+)
 from vllm_ascend.attention.mla_v1 import MAX_O_PROJ_PREFETCH_SIZE, MLAPO_MAX_SUPPORTED_TOKENS
 from vllm_ascend.attention.utils import (
     SFA_QSFA_TILE_SIZE,
@@ -799,7 +804,9 @@ class AscendSFAImpl(MLAAttentionImpl):
         self.fused_overlap_last_req_ids: torch.Tensor | None = None
         self._fused_overlap_selection_capacity: tuple[int, int, int, int] | None = None
         self._fused_overlap_decode_logged = False
-        self._sfa_decode_debug_dumped = False
+        self._sfa_decode_dump_step_count = 0
+        self._sfa_decode_dumped_steps: set[int] = set()
+        self._sfa_decode_dump_pending: tuple[int, int, int] | None = None
 
     @staticmethod
     def update_graph_params(
@@ -1712,12 +1719,8 @@ class AscendSFAImpl(MLAAttentionImpl):
             )
         return topk_indices.contiguous()
 
-    def _get_first_decode_dump_location(self, layer_name: str) -> tuple[int, int] | None:
-        if (
-            not envs.VLLM_ASCEND_SFA_DUMP_DIR
-            or self._sfa_decode_debug_dumped
-            or get_forward_context().capturing
-        ):
+    def _resolve_decode_dump_layer_rank(self, layer_name: str) -> tuple[int, int] | None:
+        if not envs.VLLM_ASCEND_SFA_DUMP_DIR:
             return None
 
         layer_match = re.search(r"(?:^|\.)layers\.(\d+)(?:\.|$)", layer_name)
@@ -1732,6 +1735,27 @@ class AscendSFAImpl(MLAAttentionImpl):
             rank = torch.distributed.get_rank()
         return layer_id, rank
 
+    def _prepare_decode_dump_step(self, layer_name: str) -> tuple[int, int, int] | None:
+        """Eager: advance decode-step counter; return meta only for DUMP_STEP hits."""
+        dump_steps = envs.VLLM_ASCEND_SFA_DUMP_STEP
+        if (
+            not envs.VLLM_ASCEND_SFA_DUMP_DIR
+            or self._sfa_decode_dumped_steps >= dump_steps
+            or get_forward_context().capturing
+        ):
+            return None
+
+        layer_rank = self._resolve_decode_dump_layer_rank(layer_name)
+        if layer_rank is None:
+            return None
+        layer_id, rank = layer_rank
+
+        step = self._sfa_decode_dump_step_count
+        self._sfa_decode_dump_step_count += 1
+        if step not in dump_steps or step in self._sfa_decode_dumped_steps:
+            return None
+        return layer_id, rank, step
+
     def _maybe_dump_first_decode_op_inputs(
         self,
         *,
@@ -1740,10 +1764,10 @@ class AscendSFAImpl(MLAAttentionImpl):
         op_name: str,
         inputs: dict[str, Any],
     ) -> None:
-        dump_location = self._get_first_decode_dump_location(layer_name)
+        dump_location = self._prepare_decode_dump_step(layer_name)
         if dump_location is None:
             return
-        layer_id, rank = dump_location
+        layer_id, rank, step = dump_location
         output = dump_op_inputs(
             envs.VLLM_ASCEND_SFA_DUMP_DIR,
             mode=mode,
@@ -1753,11 +1777,14 @@ class AscendSFAImpl(MLAAttentionImpl):
             inputs=inputs,
             rank=rank,
             pid=os.getpid(),
+            step=step,
         )
+        self._sfa_decode_dump_pending = dump_location
         logger.warning(
-            "[sfa_decode_dump] saved %s op inputs layer=%s path=%s",
+            "[sfa_decode_dump] saved %s op inputs layer=%s step=%s path=%s",
             mode,
             layer_name,
+            step,
             output,
         )
 
@@ -1769,10 +1796,9 @@ class AscendSFAImpl(MLAAttentionImpl):
         op_name: str,
         output: torch.Tensor,
     ) -> None:
-        dump_location = self._get_first_decode_dump_location(layer_name)
-        if dump_location is None:
+        if self._sfa_decode_dump_pending is None:
             return
-        layer_id, rank = dump_location
+        layer_id, rank, step = self._sfa_decode_dump_pending
         output_path = dump_op_output(
             envs.VLLM_ASCEND_SFA_DUMP_DIR,
             mode=mode,
@@ -1782,13 +1808,93 @@ class AscendSFAImpl(MLAAttentionImpl):
             output=output,
             rank=rank,
             pid=os.getpid(),
+            step=step,
         )
-        self._sfa_decode_debug_dumped = True
+        self._sfa_decode_dump_pending = None
+        self._sfa_decode_dumped_steps.add(step)
         logger.warning(
-            "[sfa_decode_dump] saved %s op output layer=%s path=%s",
+            "[sfa_decode_dump] saved %s op output layer=%s step=%s path=%s",
             mode,
             layer_name,
+            step,
             output_path,
+        )
+
+    def _maybe_dump_fused_overlap_op_inputs(
+        self,
+        *,
+        layer_name: str,
+        op_name: str,
+        inputs: dict[str, Any],
+    ) -> None:
+        """Eager: Python dump for DUMP_STEP. ACLGraph capture: record host_func."""
+        dump_location = self._resolve_decode_dump_layer_rank(layer_name)
+        if dump_location is None:
+            return
+        layer_id, rank = dump_location
+        capturing = bool(get_forward_context().capturing)
+        if capturing:
+            launch_graph_fused_inputs_dump(
+                dump_dir=envs.VLLM_ASCEND_SFA_DUMP_DIR,
+                mode="fused_graph",
+                layer_name=layer_name,
+                layer_id=layer_id,
+                op_name=op_name,
+                inputs=inputs,
+                rank=rank,
+                pid=os.getpid(),
+                dump_steps=envs.VLLM_ASCEND_SFA_DUMP_STEP,
+            )
+            logger.warning(
+                "[sfa_decode_dump] scheduled ACLGraph host_func inputs dump "
+                "layer=%s mode=fused_graph steps=%s",
+                layer_name,
+                sorted(envs.VLLM_ASCEND_SFA_DUMP_STEP),
+            )
+            return
+        self._maybe_dump_first_decode_op_inputs(
+            layer_name=layer_name,
+            mode="fused",
+            op_name=op_name,
+            inputs=inputs,
+        )
+
+    def _maybe_dump_fused_overlap_op_output(
+        self,
+        *,
+        layer_name: str,
+        op_name: str,
+        output: torch.Tensor,
+    ) -> None:
+        dump_location = self._resolve_decode_dump_layer_rank(layer_name)
+        if dump_location is None:
+            return
+        layer_id, rank = dump_location
+        capturing = bool(get_forward_context().capturing)
+        if capturing:
+            launch_graph_fused_output_dump(
+                dump_dir=envs.VLLM_ASCEND_SFA_DUMP_DIR,
+                mode="fused_graph",
+                layer_name=layer_name,
+                layer_id=layer_id,
+                op_name=op_name,
+                output=output,
+                rank=rank,
+                pid=os.getpid(),
+                dump_steps=envs.VLLM_ASCEND_SFA_DUMP_STEP,
+            )
+            logger.warning(
+                "[sfa_decode_dump] scheduled ACLGraph host_func output dump "
+                "layer=%s mode=fused_graph steps=%s",
+                layer_name,
+                sorted(envs.VLLM_ASCEND_SFA_DUMP_STEP),
+            )
+            return
+        self._maybe_dump_first_decode_op_output(
+            layer_name=layer_name,
+            mode="fused",
+            op_name=op_name,
+            output=output,
         )
 
     def _flatten_selection_buffer(
@@ -2075,21 +2181,20 @@ class AscendSFAImpl(MLAAttentionImpl):
             "layout_kv": "PA_BSND",
             "sparse_mode": 3,
         }
-        self._maybe_dump_first_decode_op_inputs(
+        self._maybe_dump_fused_overlap_op_inputs(
             layer_name=layer_name,
-            mode="fused",
             op_name="npu_fused_sparse_attention_overlap",
             inputs=fused_inputs,
         )
         attn_output = fused_op(**fused_inputs)
         attn_output = attn_output[..., : ql_nope_decode.shape[-1]].contiguous()
-        self._maybe_dump_first_decode_op_output(
+        self._maybe_dump_fused_overlap_op_output(
             layer_name=layer_name,
-            mode="fused",
             op_name="npu_fused_sparse_attention_overlap",
             output=attn_output,
         )
         return attn_output
+
 
     def _execute_sparse_flash_attention_process(
         self, ql_nope, q_pe, kv_cache, topk_indices, attn_metadata, actual_seq_lengths_query, actual_seq_lengths_key, layer_name="",

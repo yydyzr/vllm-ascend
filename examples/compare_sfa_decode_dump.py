@@ -1,13 +1,23 @@
 #!/usr/bin/env python3
-"""Compare fused_overlap vs no-offload SFA decode operator dumps.
+"""Compare SFA decode operator dumps.
 
 Usage:
-  # explicit paths
-  python examples/compare_sfa_decode_dump.py \\
-      --fused /tmp/sfa-dump/sfa_fused_inputs_layer0_rank0_pid123.pt \\
-      --sfa   /tmp/sfa-dump/sfa_sfa_inputs_layer0_rank0_pid456.pt
+  # dump selected decode steps (eager + graph share this env):
+  #   export VLLM_ASCEND_SFA_DUMP_DIR=/tmp/sfa-dump
+  #   export VLLM_ASCEND_SFA_DUMP_LAYER=0
+  #   export VLLM_ASCEND_SFA_DUMP_STEP=0,1,3
 
-  # auto-pick the newest fused/sfa dump in a directory
+  # fused_overlap vs no-offload SFA
+  python examples/compare_sfa_decode_dump.py \\
+      --fused /tmp/sfa-dump/sfa_fused_inputs_layer0_step1_rank0_pid123.pt \\
+      --sfa   /tmp/sfa-dump/sfa_sfa_inputs_layer0_step1_rank0_pid456.pt
+
+  # eager fused vs ACLGraph fused (same op schema / same step)
+  python examples/compare_sfa_decode_dump.py \\
+      --eager /tmp/sfa-dump/sfa_fused_inputs_layer0_step1_rank0_pid123.pt \\
+      --graph /tmp/sfa-dump/sfa_fused_graph_inputs_layer0_step1_rank0_pid123.pt
+
+  # auto-pick newest fused/sfa dumps in a directory
   python examples/compare_sfa_decode_dump.py --dump-dir /tmp/sfa-dump
 """
 
@@ -121,6 +131,44 @@ def compare_scalars(name: str, left: Any, right: Any) -> CheckResult:
     if left == right:
         return CheckResult(name, PASS, f"value={left!r}")
     return CheckResult(name, FAIL, f"left={left!r} right={right!r}")
+
+
+def compare_same_schema_payloads(
+    left_payload: dict[str, Any],
+    right_payload: dict[str, Any],
+    *,
+    atol: float,
+    rtol: float,
+    left_label: str = "eager",
+    right_label: str = "graph",
+) -> list[CheckResult]:
+    """Compare two fused-style dumps that share the same input keys."""
+    left = left_payload["inputs"]
+    right = right_payload["inputs"]
+    results: list[CheckResult] = [
+        CheckResult(
+            "payload.mode",
+            WARN,
+            f"{left_label}.mode={left_payload.get('mode')!r} "
+            f"{right_label}.mode={right_payload.get('mode')!r} "
+            f"{left_label}.step={left_payload.get('step')!r} "
+            f"{right_label}.step={right_payload.get('step')!r}",
+        )
+    ]
+    keys = sorted(set(left) | set(right))
+    for key in keys:
+        if key not in left:
+            results.append(CheckResult(key, FAIL, f"missing in {left_label}"))
+            continue
+        if key not in right:
+            results.append(CheckResult(key, FAIL, f"missing in {right_label}"))
+            continue
+        lv, rv = left[key], right[key]
+        if isinstance(lv, torch.Tensor) and isinstance(rv, torch.Tensor):
+            results.append(compare_tensors(key, lv, rv, atol=atol, rtol=rtol))
+        else:
+            results.append(compare_scalars(key, lv, rv))
+    return results
 
 
 def build_sfa_query(sfa_inputs: dict[str, Any]) -> torch.Tensor:
@@ -385,6 +433,12 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--fused", type=Path, help="path to sfa_fused_inputs_*.pt")
     parser.add_argument("--sfa", type=Path, help="path to sfa_sfa_inputs_*.pt")
+    parser.add_argument("--eager", type=Path, help="path to eager sfa_fused_inputs_*.pt")
+    parser.add_argument(
+        "--graph",
+        type=Path,
+        help="path to ACLGraph sfa_fused_graph_inputs_layer*_step*_rank*_pid*.pt",
+    )
     parser.add_argument("--fused-output", type=Path, help="path to sfa_fused_output_*.pt")
     parser.add_argument("--sfa-output", type=Path, help="path to sfa_sfa_output_*.pt")
     parser.add_argument(
@@ -409,6 +463,46 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
+    if args.eager is not None and args.graph is not None:
+        eager_payload = load_input_payload(args.eager)
+        graph_payload = load_input_payload(args.graph)
+        results = compare_same_schema_payloads(
+            eager_payload,
+            graph_payload,
+            atol=args.atol,
+            rtol=args.rtol,
+            left_label="eager",
+            right_label="graph",
+        )
+        eager_out = infer_output_path(args.eager)
+        graph_out = infer_output_path(args.graph)
+        if eager_out.is_file() and graph_out.is_file():
+            results.extend(
+                compare_output_payloads(
+                    load_output_payload(eager_out),
+                    load_output_payload(graph_out),
+                    atol=args.atol,
+                    rtol=args.rtol,
+                )
+            )
+        else:
+            results.append(
+                CheckResult(
+                    "attention_output",
+                    WARN,
+                    f"output dump missing: {[str(p) for p in (eager_out, graph_out) if not p.is_file()]}",
+                )
+            )
+        return print_report(
+            args.eager,
+            args.graph,
+            eager_out if eager_out.is_file() else None,
+            graph_out if graph_out.is_file() else None,
+            eager_payload,
+            graph_payload,
+            results,
+        )
+
     if args.dump_dir is not None:
         fused_path = find_latest_input_dump(args.dump_dir, "fused")
         sfa_path = find_latest_input_dump(args.dump_dir, "sfa")
@@ -416,7 +510,10 @@ def main() -> int:
         fused_path = args.fused
         sfa_path = args.sfa
     else:
-        print("error: provide --fused/--sfa or --dump-dir", file=sys.stderr)
+        print(
+            "error: provide --eager/--graph, --fused/--sfa, or --dump-dir",
+            file=sys.stderr,
+        )
         return 2
 
     fused_output_path = args.fused_output or infer_output_path(fused_path)
