@@ -38,7 +38,11 @@ import torch.nn as nn
 from vllm._aiter_ops import rocm_aiter_ops
 from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.config import CompilationMode, CUDAGraphMode, VllmConfig, get_layers_from_vllm_config
-from vllm.distributed import get_tensor_model_parallel_world_size, tensor_model_parallel_all_gather
+from vllm.distributed import (
+    get_tensor_model_parallel_rank,
+    get_tensor_model_parallel_world_size,
+    tensor_model_parallel_all_gather,
+)
 from vllm.distributed.ec_transfer import get_ec_transfer, has_ec_transfer
 from vllm.distributed.kv_transfer import get_kv_transfer_group, has_kv_transfer_group
 from vllm.distributed.parallel_state import get_dcp_group, get_dp_group, get_pcp_group, get_pp_group, get_tp_group
@@ -105,6 +109,7 @@ from vllm.v1.worker.utils import AttentionGroup, select_common_block_size
 
 # yapf: enable
 from vllm_ascend import envs
+from vllm_ascend.worker.sfa_decode_token_log import maybe_log_decode_step_tokens
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.attention.attention_v1 import AscendAttentionBackend, AscendAttentionState
 from vllm_ascend.attention.context_parallel.dsa_cp import AscendDSACPMetadataBuilder
@@ -351,6 +356,7 @@ class NPUModelRunner(GPUModelRunner):
 
         self.sampler = AscendSampler()
         self.attn_state: AscendAttentionState | None = None
+        self._sfa_decode_token_log_step = 0
 
         # Ascend-specific configurations
         self.ascend_config = get_ascend_config()
@@ -2757,6 +2763,22 @@ class NPUModelRunner(GPUModelRunner):
             cudagraph_stats=cudagraph_stats,
             routed_experts=None,
         )
+
+        if isinstance(valid_sampled_token_ids, list) and valid_sampled_token_ids:
+            maybe_log_decode_step_tokens(
+                step=self._sfa_decode_token_log_step,
+                req_ids=req_ids_output_copy,
+                sampled_token_ids=valid_sampled_token_ids,
+                spec_token_ids=output_spec_token_ids,
+                total_num_scheduled_tokens=scheduler_output.total_num_scheduled_tokens,
+                cudagraph_mode=self.compilation_config.cudagraph_mode,
+                enforce_eager=bool(self.model_config.enforce_eager),
+                cudagraph_stats=cudagraph_stats,
+                batch_desc=batch_desc,
+                tp_rank=get_tensor_model_parallel_rank(),
+            )
+            self._sfa_decode_token_log_step += 1
+
         if self.ascend_config.profiling_chunk_config.need_timing and hasattr(self, '_execution_start_time'):
             self._sync_device()
             model_runner_output.execution_time_ms = (time.perf_counter() - self._execution_start_time) * 1000.0

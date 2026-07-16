@@ -1722,6 +1722,9 @@ class AscendSFAImpl(MLAAttentionImpl):
     def _resolve_decode_dump_layer_rank(self, layer_name: str) -> tuple[int, int] | None:
         if not envs.VLLM_ASCEND_SFA_DUMP_DIR:
             return None
+        # Only TP rank 0 writes dumps to avoid 16-way duplicate I/O under TP.
+        if self.tp_rank != 0:
+            return None
 
         layer_match = re.search(r"(?:^|\.)layers\.(\d+)(?:\.|$)", layer_name)
         if layer_match is None:
@@ -1730,10 +1733,7 @@ class AscendSFAImpl(MLAAttentionImpl):
         if layer_id != envs.VLLM_ASCEND_SFA_DUMP_LAYER:
             return None
 
-        rank = self.tp_rank
-        if torch.distributed.is_available() and torch.distributed.is_initialized():
-            rank = torch.distributed.get_rank()
-        return layer_id, rank
+        return layer_id, self.tp_rank
 
     def _prepare_decode_dump_step(self, layer_name: str) -> tuple[int, int, int] | None:
         """Eager: advance decode-step counter; return meta only for DUMP_STEP hits."""
