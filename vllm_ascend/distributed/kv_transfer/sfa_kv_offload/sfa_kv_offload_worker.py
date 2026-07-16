@@ -993,11 +993,23 @@ class SFAKVOffloadWorker:
         """Copy current-step Main KV through the TP0 shared CPU owner."""
         if not self.use_fused_overlap_offload or num_actual_tokens <= 0 or num_reqs <= 0:
             return
-        if capturing or _is_current_stream_capturing():
-            raise RuntimeError(
-                "SFA fused_overlap shared CPU Main KV currently requires --enforce-eager; "
-                "graph/capture mode is not supported"
-            )
+        capturing = capturing or _is_current_stream_capturing()
+        if capturing:
+            if self.tp_rank == 0:
+                self._save_current_kv_tokens_on_owner(
+                    layer_name,
+                    slot_mapping,
+                    token_to_req,
+                    cum_query_lens,
+                    num_actual_tokens,
+                    num_reqs,
+                    capturing=True,
+                )
+            # This collective is the graph-internal happens-before edge from
+            # TP0's D2H to every rank's fused owner-GVA read.
+            self.tp_group.broadcast(self.d2h_status_npu, src=0)
+            return
+
         if not self.fused_step_has_offload:
             return
 
@@ -1019,6 +1031,7 @@ class SFAKVOffloadWorker:
                     cum_query_lens,
                     num_actual_tokens,
                     num_reqs,
+                    capturing=False,
                 )
             except Exception as exc:
                 d2h_error = exc
@@ -1041,9 +1054,9 @@ class SFAKVOffloadWorker:
         cum_query_lens: torch.Tensor,
         num_actual_tokens: int,
         num_reqs: int,
+        capturing: bool = False,
     ) -> None:
         assert self.tp_rank == 0
-        capturing = False
 
         layer_id = self._get_offload_layer_id(layer_name)
         self.d2h_slot_mapping_cpu[:num_actual_tokens].copy_(
@@ -1074,32 +1087,33 @@ class SFAKVOffloadWorker:
         else:
             self._compute_step_offload_addrs_cpu(args)
 
-        copy_count = int(self.d2h_num_tokens_buffer_cpu[0].item())
-        if not getattr(self, "_fused_overlap_d2h_logged", False):
-            logger.info(
-                "[fused_overlap_offload][d2h] first submit layer_id=%s "
-                "num_actual_tokens=%s num_reqs=%s copy_count=%s "
-                "slot_shape=%s token_to_req_shape=%s cum_query_lens_shape=%s",
-                layer_id,
-                num_actual_tokens,
-                num_reqs,
-                copy_count,
-                tuple(slot_mapping[:num_actual_tokens].shape),
-                tuple(token_to_req[:num_actual_tokens].shape),
-                tuple(cum_query_lens[:num_reqs].shape),
-            )
-            self._fused_overlap_d2h_logged = True
-        if envs.VLLM_ASCEND_SFA_DEBUG:
-            logger.info(
-                "[fused_overlap_offload][d2h][debug] layer_id=%s "
-                "num_actual_tokens=%s num_reqs=%s copy_count=%s",
-                layer_id,
-                num_actual_tokens,
-                num_reqs,
-                copy_count,
-            )
-        if copy_count == 0:
-            return
+        if not capturing:
+            copy_count = int(self.d2h_num_tokens_buffer_cpu[0].item())
+            if not getattr(self, "_fused_overlap_d2h_logged", False):
+                logger.info(
+                    "[fused_overlap_offload][d2h] first submit layer_id=%s "
+                    "num_actual_tokens=%s num_reqs=%s copy_count=%s "
+                    "slot_shape=%s token_to_req_shape=%s cum_query_lens_shape=%s",
+                    layer_id,
+                    num_actual_tokens,
+                    num_reqs,
+                    copy_count,
+                    tuple(slot_mapping[:num_actual_tokens].shape),
+                    tuple(token_to_req[:num_actual_tokens].shape),
+                    tuple(cum_query_lens[:num_reqs].shape),
+                )
+                self._fused_overlap_d2h_logged = True
+            if envs.VLLM_ASCEND_SFA_DEBUG:
+                logger.info(
+                    "[fused_overlap_offload][d2h][debug] layer_id=%s "
+                    "num_actual_tokens=%s num_reqs=%s copy_count=%s",
+                    layer_id,
+                    num_actual_tokens,
+                    num_reqs,
+                    copy_count,
+                )
+            if copy_count == 0:
+                return
 
         self.d2h_batch_copy_args_buffer_npu.copy_(
             self.d2h_batch_copy_args_buffer_cpu, non_blocking=capturing
@@ -1112,8 +1126,9 @@ class SFAKVOffloadWorker:
             self.d2h_num_tokens_buffer_npu,
             self.k_caches_npu[layer_id].device,
         )
-        self.d2h_save_event.record(current_compute_stream)
-        self.d2h_save_event.synchronize()
+        if not capturing:
+            self.d2h_save_event.record(current_compute_stream)
+            self.d2h_save_event.synchronize()
 
     def wait_for_save(self):
         assert self.use_layerwise

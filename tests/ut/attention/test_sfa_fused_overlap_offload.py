@@ -34,25 +34,25 @@ def _make_impl() -> AscendSFAImpl:
 
 
 @pytest.mark.parametrize(
-    ("connector_cls", "extra_config", "expected"),
+    ("connector_cls", "extra_config"),
     [
-        (SFAKVOffloadConnector, {}, False),
-        (SFAKVOffloadConnector, {"use_layerwise": False}, False),
-        (SFAKVOffloadConnector, {"use_layerwise": True}, True),
-        (SFAPDCpuOffloadConnector, {}, True),
-        (SFAPDCpuOffloadConnector, {"use_layerwise": False}, False),
-        (SFAPDCpuOffloadConnector, {"use_layerwise": True}, True),
+        (SFAKVOffloadConnector, {}),
+        (SFAKVOffloadConnector, {"use_layerwise": False}),
+        (SFAKVOffloadConnector, {"use_layerwise": True}),
+        (SFAPDCpuOffloadConnector, {}),
+        (SFAPDCpuOffloadConnector, {"use_layerwise": False}),
+        (SFAPDCpuOffloadConnector, {"use_layerwise": True}),
     ],
 )
-def test_sfa_connectors_require_piecewise_for_layerwise_operations(
+def test_sfa_connectors_allow_full_cudagraph(
     connector_cls,
     extra_config,
-    expected,
 ):
-    assert connector_cls.requires_piecewise_for_cudagraph(extra_config) is expected
+    assert connector_cls.requires_piecewise_for_cudagraph(extra_config) is False
 
 
-def test_fused_overlap_decode_uses_cpu_full_kv_and_reused_selection_buffers():
+@pytest.mark.parametrize("capturing", [False, True])
+def test_fused_overlap_decode_uses_cpu_full_kv_and_reused_selection_buffers(capturing):
     impl = _make_impl()
     ql_nope = torch.arange(12, dtype=torch.float32).reshape(2, 2, 3)
     q_pe = torch.ones((2, 2, 1), dtype=torch.float32)
@@ -82,7 +82,7 @@ def test_fused_overlap_decode_uses_cpu_full_kv_and_reused_selection_buffers():
         ),
         patch(
             "vllm_ascend.attention.sfa_v1.get_forward_context",
-            return_value=SimpleNamespace(capturing=False),
+            return_value=SimpleNamespace(capturing=capturing),
         ),
     ):
         out = impl._execute_fused_overlap_offload_decode(
@@ -114,26 +114,38 @@ def test_fused_overlap_decode_uses_cpu_full_kv_and_reused_selection_buffers():
     )
 
 
-def test_fused_overlap_shared_owner_rejects_graph_capture():
+def test_fused_overlap_selection_state_reuses_fixed_storage():
     impl = _make_impl()
+    first = impl._ensure_fused_overlap_selection_state(
+        token_count=2,
+        topk_head_count=1,
+        topk=4,
+        cache_blocks_per_row=2,
+        runtime_blocks_per_row=1,
+        device=torch.device("cpu"),
+    )
+    pointers = tuple(t.data_ptr() for t in (
+        impl.selection_kv_block_table,
+        impl.selection_kv_block_status,
+        impl.fused_overlap_last_req_ids,
+    ))
 
-    with (
-        patch(
-            "vllm_ascend.attention.sfa_v1.get_forward_context",
-            return_value=SimpleNamespace(capturing=True),
-        ),
-        pytest.raises(RuntimeError, match="requires --enforce-eager"),
-    ):
-        impl._execute_fused_overlap_offload_decode(
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            "model.layers.0.self_attn",
-        )
+    second = impl._ensure_fused_overlap_selection_state(
+        token_count=1,
+        topk_head_count=1,
+        topk=4,
+        cache_blocks_per_row=2,
+        runtime_blocks_per_row=1,
+        device=torch.device("cpu"),
+    )
+
+    assert tuple(t.data_ptr() for t in (
+        impl.selection_kv_block_table,
+        impl.selection_kv_block_status,
+        impl.fused_overlap_last_req_ids,
+    )) == pointers
+    assert first[0].shape == (2, 1)
+    assert second[0].shape == (1, 1)
 
 
 def test_fused_overlap_selection_invalidation_uses_req_ids_not_row_position():

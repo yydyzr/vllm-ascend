@@ -229,20 +229,57 @@ def test_current_token_d2h_uses_tp0_and_all_ranks_barrier(monkeypatch, tp_rank):
 
     worker.save_current_kv_tokens("layer.0", tensor, tensor, tensor, 1, 1)
 
-    assert worker._save_current_kv_tokens_on_owner.call_count == (1 if tp_rank == 0 else 0)
+    if tp_rank == 0:
+        worker._save_current_kv_tokens_on_owner.assert_called_once_with(
+            "layer.0",
+            tensor,
+            tensor,
+            tensor,
+            1,
+            1,
+            capturing=False,
+        )
+    else:
+        worker._save_current_kv_tokens_on_owner.assert_not_called()
     worker.tp_group.broadcast.assert_called_once_with(worker.d2h_status_npu, src=0)
     worker.tp_group.barrier.assert_called_once_with()
 
 
-def test_current_token_d2h_rejects_capture_before_collectives(monkeypatch):
+def test_current_token_d2h_eager_inactive_skips_copy_and_collectives(monkeypatch):
     worker = _make_d2h_worker(tp_rank=0)
+    worker.fused_step_has_offload = False
     monkeypatch.setattr(worker_module, "_is_current_stream_capturing", lambda: False)
     tensor = torch.zeros(1, dtype=torch.int32)
 
-    with pytest.raises(RuntimeError, match="requires --enforce-eager"):
-        worker.save_current_kv_tokens("layer.0", tensor, tensor, tensor, 1, 1, capturing=True)
+    worker.save_current_kv_tokens("layer.0", tensor, tensor, tensor, 1, 1)
 
+    worker._save_current_kv_tokens_on_owner.assert_not_called()
     worker.tp_group.broadcast.assert_not_called()
+    worker.tp_group.barrier.assert_not_called()
+
+
+@pytest.mark.parametrize("tp_rank", [0, 1])
+def test_current_token_d2h_capture_records_static_all_rank_path(monkeypatch, tp_rank):
+    worker = _make_d2h_worker(tp_rank=tp_rank)
+    worker.fused_step_has_offload = False
+    monkeypatch.setattr(worker_module, "_is_current_stream_capturing", lambda: False)
+    tensor = torch.zeros(1, dtype=torch.int32)
+
+    worker.save_current_kv_tokens("layer.0", tensor, tensor, tensor, 1, 1, capturing=True)
+
+    if tp_rank == 0:
+        worker._save_current_kv_tokens_on_owner.assert_called_once_with(
+            "layer.0",
+            tensor,
+            tensor,
+            tensor,
+            1,
+            1,
+            capturing=True,
+        )
+    else:
+        worker._save_current_kv_tokens_on_owner.assert_not_called()
+    worker.tp_group.broadcast.assert_called_once_with(worker.d2h_status_npu, src=0)
     worker.tp_group.barrier.assert_not_called()
 
 
@@ -266,3 +303,68 @@ def test_owner_zero_copy_skips_sparse_copy(monkeypatch):
     worker._save_current_kv_tokens_on_owner("layer.0", tensor, tensor, tensor, 1, 1)
 
     sparse_copy.assert_not_called()
+
+
+def test_owner_capture_zero_copy_still_records_sparse_copy(monkeypatch):
+    worker = _make_runtime_worker(tp_rank=0)
+    worker._get_offload_layer_id = MagicMock(return_value=0)
+    worker.d2h_slot_mapping_cpu = torch.empty(1, dtype=torch.int32)
+    worker.d2h_token_to_req_cpu = torch.empty(1, dtype=torch.int32)
+    worker.d2h_cum_query_lens_cpu = torch.empty(1, dtype=torch.int32)
+    worker.cpu_block_table_host_buffer = torch.empty((1, 1), dtype=torch.int32)
+    worker.cpu_block_table = SimpleNamespace(gpu=torch.empty((1, 1), dtype=torch.int32))
+    worker.d2h_num_tokens_buffer_cpu = MagicMock()
+    worker.d2h_num_tokens_buffer_cpu.__getitem__.return_value.item.side_effect = AssertionError(
+        "capture must not read copy_count on the host"
+    )
+    worker._compute_step_offload_addrs_cpu = MagicMock()
+    worker.d2h_batch_copy_args_buffer_cpu = torch.zeros(4, dtype=torch.int8)
+    worker.d2h_batch_copy_args_buffer_npu = MagicMock()
+    worker.d2h_addr_buffer_npu = MagicMock()
+    worker.d2h_gvas_buffer_npu = MagicMock()
+    worker.d2h_size_buffer_npu = MagicMock()
+    worker.d2h_num_tokens_buffer_npu = MagicMock()
+    worker.k_caches_npu = [SimpleNamespace(device=torch.device("cpu"))]
+    worker.d2h_save_event = MagicMock()
+    current_stream = MagicMock()
+    subscribed_streams = set()
+    monkeypatch.setattr(worker_module.envs, "VLLM_ASCEND_SFA_DEBUG", False)
+    monkeypatch.setattr(worker_module.torch_npu.npu, "current_stream", lambda: current_stream)
+    monkeypatch.setattr(worker_module, "get_subscribed_compute_streams", lambda: subscribed_streams)
+    subscribe_report = MagicMock()
+    launch_host_func = MagicMock()
+    monkeypatch.setattr(worker_module.torch_npu.npu, "_subscribe_report", subscribe_report)
+    monkeypatch.setattr(worker_module.torch_npu.npu, "_launch_host_func", launch_host_func)
+    sparse_copy = MagicMock()
+    monkeypatch.setattr(worker_module.offload, "sparse_copy", sparse_copy)
+    tensor = torch.zeros(1, dtype=torch.int32)
+
+    worker._save_current_kv_tokens_on_owner(
+        "layer.0",
+        tensor,
+        tensor,
+        tensor,
+        1,
+        1,
+        capturing=True,
+    )
+
+    subscribe_report.assert_called_once_with(current_stream)
+    launch_host_func.assert_called_once_with(
+        current_stream,
+        worker._compute_step_offload_addrs_cpu,
+        (1, 1, 0),
+    )
+    worker.d2h_batch_copy_args_buffer_npu.copy_.assert_called_once_with(
+        worker.d2h_batch_copy_args_buffer_cpu,
+        non_blocking=True,
+    )
+    sparse_copy.assert_called_once_with(
+        worker.d2h_addr_buffer_npu,
+        worker.d2h_gvas_buffer_npu,
+        worker.d2h_size_buffer_npu,
+        worker.d2h_num_tokens_buffer_npu,
+        torch.device("cpu"),
+    )
+    worker.d2h_save_event.record.assert_not_called()
+    worker.d2h_save_event.synchronize.assert_not_called()
