@@ -13,8 +13,8 @@ except ImportError:  # pragma: no cover
     torch_npu = None
 
 from vllm_ascend.attention.npu_host_func_stream import ensure_host_func_stream_subscribed
-_graph_inputs_step_count = 0
-_graph_output_step_count = 0
+_graph_inputs_step_counts: dict[int, int] = {}
+_graph_output_step_counts: dict[int, int] = {}
 
 
 def dump_op_inputs(
@@ -136,7 +136,6 @@ def _is_stream_capturing() -> bool:
 
 def _dump_fused_inputs_host_callback(args: tuple) -> None:
     """ACLGraph host callback: CPU-only save. No NPU ops / logger."""
-    global _graph_inputs_step_count
     # Skip capture-time host_func runs (warmup / multi-graph capture). Only
     # count decode replays so DUMP_STEP aligns with eager.
     if _is_stream_capturing():
@@ -152,8 +151,8 @@ def _dump_fused_inputs_host_callback(args: tuple) -> None:
         dump_steps,
         staged_inputs,
     ) = args
-    step = _graph_inputs_step_count
-    _graph_inputs_step_count += 1
+    step = _graph_inputs_step_counts.get(layer_id, 0)
+    _graph_inputs_step_counts[layer_id] = step + 1
     steps = _normalize_dump_steps(dump_steps)
     if step not in steps:
         return
@@ -173,7 +172,6 @@ def _dump_fused_inputs_host_callback(args: tuple) -> None:
 
 def _dump_fused_output_host_callback(args: tuple) -> None:
     """ACLGraph host callback: CPU-only save of fused output. No NPU ops / logger."""
-    global _graph_output_step_count
     if _is_stream_capturing():
         return
     (
@@ -187,8 +185,8 @@ def _dump_fused_output_host_callback(args: tuple) -> None:
         dump_steps,
         staged_output,
     ) = args
-    step = _graph_output_step_count
-    _graph_output_step_count += 1
+    step = _graph_output_step_counts.get(layer_id, 0)
+    _graph_output_step_counts[layer_id] = step + 1
     steps = _normalize_dump_steps(dump_steps)
     if step not in steps:
         return
@@ -224,7 +222,7 @@ def launch_graph_fused_inputs_dump(
     """Record a graph-safe fused-inputs dump on ``stream`` (default: current).
 
     Uses the same ``VLLM_ASCEND_SFA_DUMP_STEP`` set as eager: each host_func
-    invocation advances a step counter; only matching steps are written.
+    invocation advances a per-layer step counter; only matching steps are written.
     """
     if torch_npu is None:
         return

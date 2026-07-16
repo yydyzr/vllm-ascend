@@ -1730,7 +1730,7 @@ class AscendSFAImpl(MLAAttentionImpl):
         if layer_match is None:
             return None
         layer_id = int(layer_match.group(1))
-        if layer_id != envs.VLLM_ASCEND_SFA_DUMP_LAYER:
+        if layer_id not in envs.VLLM_ASCEND_SFA_DUMP_LAYER:
             return None
 
         return layer_id, self.tp_rank

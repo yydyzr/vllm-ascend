@@ -4,7 +4,7 @@
 Usage:
   # dump selected decode steps (eager + graph share this env):
   #   export VLLM_ASCEND_SFA_DUMP_DIR=/tmp/sfa-dump
-  #   export VLLM_ASCEND_SFA_DUMP_LAYER=0
+  #   export VLLM_ASCEND_SFA_DUMP_LAYER=0,58
   #   export VLLM_ASCEND_SFA_DUMP_STEP=0,1,3
 
   # fused_overlap vs no-offload SFA

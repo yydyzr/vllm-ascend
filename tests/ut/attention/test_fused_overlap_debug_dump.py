@@ -26,7 +26,7 @@ def test_dump_op_inputs_writes_step_in_name(tmp_path: Path):
 
 
 def test_host_callback_filters_by_dump_steps(tmp_path: Path, monkeypatch):
-    monkeypatch.setattr(dump_mod, "_graph_inputs_step_count", 0)
+    monkeypatch.setattr(dump_mod, "_graph_inputs_step_counts", {})
     monkeypatch.setattr(dump_mod, "_is_stream_capturing", lambda: False)
     staged = {
         "full_kv_cache": torch.ones(2, 2),
@@ -55,8 +55,34 @@ def test_host_callback_filters_by_dump_steps(tmp_path: Path, monkeypatch):
     ]
 
 
+def test_host_callback_uses_per_layer_step_counters(tmp_path: Path, monkeypatch):
+    monkeypatch.setattr(dump_mod, "_graph_inputs_step_counts", {})
+    monkeypatch.setattr(dump_mod, "_is_stream_capturing", lambda: False)
+    staged = {"full_kv_cache": torch.ones(2, 2)}
+    dump_steps = frozenset({0})
+    for layer_id in (0, 58):
+        dump_mod._dump_fused_inputs_host_callback(
+            (
+                str(tmp_path),
+                "fused_graph",
+                f"model.layers.{layer_id}.self_attn",
+                layer_id,
+                "npu_fused_sparse_attention_overlap",
+                0,
+                99,
+                dump_steps,
+                staged,
+            )
+        )
+    files = sorted(p.name for p in tmp_path.glob("sfa_fused_graph_inputs_*.pt"))
+    assert files == [
+        "sfa_fused_graph_inputs_layer0_step0_rank0_pid99.pt",
+        "sfa_fused_graph_inputs_layer58_step0_rank0_pid99.pt",
+    ]
+
+
 def test_host_callback_skips_during_capture(tmp_path: Path, monkeypatch):
-    monkeypatch.setattr(dump_mod, "_graph_inputs_step_count", 0)
+    monkeypatch.setattr(dump_mod, "_graph_inputs_step_counts", {})
     monkeypatch.setattr(dump_mod, "_is_stream_capturing", lambda: True)
     staged = {"full_kv_cache": torch.ones(2, 2)}
     dump_mod._dump_fused_inputs_host_callback(
@@ -72,5 +98,5 @@ def test_host_callback_skips_during_capture(tmp_path: Path, monkeypatch):
             staged,
         )
     )
-    assert dump_mod._graph_inputs_step_count == 0
+    assert dump_mod._graph_inputs_step_counts == {}
     assert list(tmp_path.glob("sfa_fused_graph_inputs_*.pt")) == []
