@@ -12,9 +12,7 @@ try:
 except ImportError:  # pragma: no cover
     torch_npu = None
 
-# Streams that have called ``_subscribe_report`` for host_func dumps.
-_SUBSCRIBED_DUMP_STREAMS: set[Any] = set()
-# Decode-step counter inside ACLGraph host_func dumps (per process).
+from vllm_ascend.attention.npu_host_func_stream import ensure_host_func_stream_subscribed
 _graph_inputs_step_count = 0
 _graph_output_step_count = 0
 
@@ -80,15 +78,6 @@ def dump_op_output(
     torch.save(payload, temporary)
     os.replace(temporary, output_path)
     return output_path
-
-
-def _ensure_dump_stream_subscribed(stream: Any) -> None:
-    if torch_npu is None:
-        return
-    if stream in _SUBSCRIBED_DUMP_STREAMS:
-        return
-    torch_npu.npu._subscribe_report(stream)
-    _SUBSCRIBED_DUMP_STREAMS.add(stream)
 
 
 def _stage_value_for_host_dump(value: Any) -> Any:
@@ -240,7 +229,7 @@ def launch_graph_fused_inputs_dump(
     if torch_npu is None:
         return
     current = stream if stream is not None else torch_npu.npu.current_stream()
-    _ensure_dump_stream_subscribed(current)
+    ensure_host_func_stream_subscribed(current)
     staged = stage_op_inputs_for_host_dump(inputs)
     torch_npu.npu._launch_host_func(
         current,
@@ -275,7 +264,7 @@ def launch_graph_fused_output_dump(
     if torch_npu is None:
         return
     current = stream if stream is not None else torch_npu.npu.current_stream()
-    _ensure_dump_stream_subscribed(current)
+    ensure_host_func_stream_subscribed(current)
     staged = _stage_value_for_host_dump(output)
     torch_npu.npu._launch_host_func(
         current,

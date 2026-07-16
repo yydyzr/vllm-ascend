@@ -48,9 +48,7 @@ from vllm_ascend.distributed.kv_transfer.sfa_kv_offload.offload_kv_cache_layout 
     is_offload_c8_kv_cache,
 )
 
-_SUBSCRIBED_COMPUTE_STREAMS = set()
-def get_subscribed_compute_streams() -> set:
-    return _SUBSCRIBED_COMPUTE_STREAMS
+from vllm_ascend.attention.npu_host_func_stream import ensure_host_func_stream_subscribed
 
 def _is_current_stream_capturing() -> bool:
     for npu_runtime in (getattr(torch_npu, "npu", None), getattr(torch, "npu", None)):
@@ -937,10 +935,7 @@ class SFAKVOffloadWorker:
         addr_args = self._pack_fused_d2h_addr_args(num_actual_tokens, num_reqs, layer_id)
         current_compute_stream = torch_npu.npu.current_stream()
         if capturing:
-            subscribed_compute_streams = get_subscribed_compute_streams()
-            if current_compute_stream not in subscribed_compute_streams:
-                torch_npu.npu._subscribe_report(current_compute_stream)
-                subscribed_compute_streams.add(current_compute_stream)
+            ensure_host_func_stream_subscribed(current_compute_stream)
             torch_npu.npu._launch_host_func(
                 current_compute_stream,
                 self._compute_step_offload_addrs_cpu,
@@ -1167,10 +1162,7 @@ class SFAKVOffloadWorker:
             if self.layer_save_tasks[layer_id]:
                 self.pending_save_layer_ids.add(layer_id)
             current_compute_stream = torch_npu.npu.current_stream()
-            subscribed_compute_streams = get_subscribed_compute_streams()
-            if current_compute_stream not in subscribed_compute_streams:
-                torch_npu.npu._subscribe_report(current_compute_stream)
-                subscribed_compute_streams.add(current_compute_stream)
+            ensure_host_func_stream_subscribed(current_compute_stream)
             torch_npu.npu._launch_host_func(
                 current_compute_stream,
                 self.prepare_lru_resident_and_load_cpu,
