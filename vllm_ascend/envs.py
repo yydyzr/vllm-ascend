@@ -145,6 +145,12 @@ env_variables: dict[str, Callable[[], Any]] = {
         for part in os.getenv("VLLM_ASCEND_SFA_DUMP_STEP", "0").split(",")
         if part.strip()
     ) or frozenset({0}),
+    # Log sampled (and optional spec) token ids per decode step for comparing
+    # eager vs ACLGraph runs. 0 = off (default), 1 = on. Emits WARNING logs
+    # tagged [sfa_decode_token] from model_runner after each decode forward.
+    "VLLM_ASCEND_SFA_DECODE_TOKEN_LOG": lambda: bool(
+        int(os.getenv("VLLM_ASCEND_SFA_DECODE_TOKEN_LOG", "0"))
+    ),
     # SFA PD memfabric-pull per-layer KV checksum verification
     # (.float().sum().item() device->host syncs -- expensive). Off by default.
     # 0 = off (default), 1 = on (correctness debugging). Independent of

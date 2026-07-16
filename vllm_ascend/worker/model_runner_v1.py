@@ -357,6 +357,12 @@ class NPUModelRunner(GPUModelRunner):
         self.sampler = AscendSampler()
         self.attn_state: AscendAttentionState | None = None
         self._sfa_decode_token_log_step = 0
+        if envs.VLLM_ASCEND_SFA_DECODE_TOKEN_LOG:
+            logger.warning(
+                "[sfa_decode_token] logging enabled in model_runner_v1 "
+                "(async_scheduling=%s); grep this tag in worker logs",
+                self.use_async_scheduling,
+            )
 
         # Ascend-specific configurations
         self.ascend_config = get_ascend_config()
@@ -2765,10 +2771,23 @@ class NPUModelRunner(GPUModelRunner):
         )
 
         if isinstance(valid_sampled_token_ids, list) and valid_sampled_token_ids:
+            sampled_token_ids_for_log = valid_sampled_token_ids
+        elif (
+            self.use_async_scheduling
+            and sampler_output.sampled_token_ids is not None
+            and sampler_output.sampled_token_ids.numel() > 0
+        ):
+            # Async scheduling intentionally leaves valid_sampled_token_ids
+            # empty to avoid CPU sync; force a one-off D2H for debug logging.
+            sampled_token_ids_for_log = self._to_list(sampler_output.sampled_token_ids)
+        else:
+            sampled_token_ids_for_log = None
+
+        if sampled_token_ids_for_log is not None:
             maybe_log_decode_step_tokens(
                 step=self._sfa_decode_token_log_step,
                 req_ids=req_ids_output_copy,
-                sampled_token_ids=valid_sampled_token_ids,
+                sampled_token_ids=sampled_token_ids_for_log,
                 spec_token_ids=output_spec_token_ids,
                 total_num_scheduled_tokens=scheduler_output.total_num_scheduled_tokens,
                 cudagraph_mode=self.compilation_config.cudagraph_mode,
