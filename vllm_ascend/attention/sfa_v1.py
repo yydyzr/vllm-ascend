@@ -1990,27 +1990,6 @@ class AscendSFAImpl(MLAAttentionImpl):
         full_kv_actual_seq = self._to_int32_device(actual_seq_lengths_key_decode, ql_nope_decode.device)
         full_q_actual_seq = self._to_int32_device(actual_seq_lengths_query_decode, ql_nope_decode.device)
 
-        # FULL_DECODE_ONLY pads to a captured graph size by appending tokens
-        # with slot_mapping=-1 and requests with KV length 0. The fused op
-        # still schedules those query rows, so turn them into a valid dummy
-        # read whose output is discarded instead of passing a zero-KV row to
-        # the kernel. Real request rows remain unchanged.
-        padding_token_rows = attn_metadata.slot_mapping[:num_tokens] < 0
-        padding_request_rows = full_kv_actual_seq <= 0
-        dummy_topk = torch.full_like(topk_indices_decode, -1)
-        dummy_topk[..., 0] = 0
-        topk_indices_decode = torch.where(
-            padding_token_rows.view(num_tokens, 1, 1),
-            dummy_topk,
-            topk_indices_decode,
-        )
-        full_kv_block_table = torch.where(
-            padding_request_rows.view(num_reqs, 1),
-            full_kv_block_table[:1].expand_as(full_kv_block_table),
-            full_kv_block_table,
-        )
-        full_kv_actual_seq = full_kv_actual_seq.masked_fill(padding_request_rows, 1)
-
         row_count = num_tokens * topk_head_count
         selection_kv_cache = self._flatten_selection_buffer(
             kv_cache[3],
