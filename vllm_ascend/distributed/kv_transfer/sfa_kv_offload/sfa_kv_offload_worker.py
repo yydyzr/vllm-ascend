@@ -909,6 +909,24 @@ class SFAKVOffloadWorker:
             self.d2h_size_buffer_cpu[num_k_copies:copy_idx].fill_(self.token_size_bytes_v)
         self.d2h_num_tokens_buffer_cpu[0] = copy_idx
 
+        # This callback also runs during FULL graph replay. Keep the probe on
+        # layer 0 so one line identifies the runtime padded metadata without
+        # flooding logs for every model layer.
+        if envs.VLLM_ASCEND_SFA_DEBUG and layer_id == 0:
+            logger.info(
+                "[fused_overlap_offload][d2h-host][debug] "
+                "num_actual_tokens=%s num_reqs=%s copy_count=%s "
+                "slots=%s token_to_req=%s cum_query_lens=%s "
+                "offload_num_tokens=%s",
+                num_actual_tokens,
+                num_reqs,
+                copy_idx,
+                slots.tolist(),
+                token_to_req.tolist(),
+                cum_query_lens.tolist(),
+                offload_num_tokens.tolist(),
+            )
+
     def save_cpu(self, layer_id: int | None = None) -> None:
         if layer_id is None:
             layer_id = self.current_layer_save
