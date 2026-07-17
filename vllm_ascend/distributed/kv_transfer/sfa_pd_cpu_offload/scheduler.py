@@ -37,6 +37,8 @@ from vllm_ascend.distributed.kv_transfer.sfa_kv_offload.config_data import (
 )
 from vllm_ascend.distributed.kv_transfer.sfa_kv_offload.sfa_kv_offload_scheduler import (
     CPUBlockManager,
+    get_num_finalized_scheduled_tokens,
+    get_num_scheduled_tokens,
 )
 from vllm_ascend.distributed.kv_transfer.sfa_pd_cpu_offload.protocol import (
     SfaPDProducerMetadata,
@@ -50,12 +52,6 @@ if TYPE_CHECKING:
 
 _INDEXER_GROUP_IDX = 0
 _MAIN_GROUP_IDX = 1
-
-
-def _num_finalized_scheduled_tokens(scheduler_output: "SchedulerOutput", req_id: str) -> int:
-    num_scheduled_tokens = scheduler_output.num_scheduled_tokens[req_id]
-    draft_tokens = scheduler_output.scheduled_spec_decode_tokens.get(req_id, [])
-    return max(num_scheduled_tokens - len(draft_tokens), 0)
 
 
 class _SendReqInfo:
@@ -356,6 +352,9 @@ class SFAPDCpuOffloadScheduler:
             num_full=num_full,
             partial_hbm_bid=partial_hbm_bid,
             main_hbm_ids=list(main_hbm_ids),
+            # fused_overlap: prompt_len seed for first-decode offload_token_start
+            # before the req appears in scheduled_cached_reqs. Not a durable
+            # watermark — later steps use vLLM num_computed_tokens.
             num_cpu_saved_tokens=prompt_len if self.use_fused_overlap_offload else 0,
         )
         self._request_trackers[request.request_id] = tracker
@@ -466,8 +465,8 @@ class SFAPDCpuOffloadScheduler:
         # Seed every newly-allocated remote-prefill request ONCE (prefill: no
         # decode offload). The worker needs this to build request_map so
         # get_finished can report done_recving. For fused_overlap, the tracker
-        # records the remote prefill length, which is the correct D2H start for
-        # a same-step first decode before scheduled_cached_reqs is populated.
+        # keeps prompt_len as a one-shot D2H start seed when the first decode
+        # lands before scheduled_cached_reqs is populated.
         seeded: set[str] = set()
         for req_id in list(self._reqs_need_recv):
             tracker = self._request_trackers[req_id]
@@ -475,9 +474,13 @@ class SFAPDCpuOffloadScheduler:
                 self.use_fused_overlap_offload
                 and req_id in scheduler_output.num_scheduled_tokens
             ):
-                num_computed = tracker.num_cpu_saved_tokens
-                num_new_tokens = _num_finalized_scheduled_tokens(scheduler_output, req_id)
-                num_tokens_after_step = num_computed + num_new_tokens
+                # Prefer vLLM num_computed when present; else prompt_len seed.
+                num_computed = num_computed_by_req.get(
+                    req_id,
+                    tracker.num_cpu_saved_tokens,
+                )
+                d2h_num_tokens = get_num_scheduled_tokens(scheduler_output, req_id)
+                num_tokens_after_step = num_computed + d2h_num_tokens
                 num_blocks_needed = cdiv(num_tokens_after_step, self._main_block_size)
                 num_offloaded = len(tracker.allocated_block_ids_cpu)
                 num_new_offload_blocks = max(num_blocks_needed - num_offloaded, 0)
@@ -488,11 +491,10 @@ class SFAPDCpuOffloadScheduler:
                 )
                 if offload_dst:
                     tracker.allocated_block_ids_cpu.extend(offload_dst)
-                tracker.num_cpu_saved_tokens = num_tokens_after_step
                 _add_req(
                     req_id,
                     offload_token_start=num_computed,
-                    offload_num_tokens=num_new_tokens,
+                    offload_num_tokens=d2h_num_tokens,
                     num_tokens_after_step=num_tokens_after_step,
                 )
             else:
@@ -515,16 +517,16 @@ class SFAPDCpuOffloadScheduler:
             tracker = self._request_trackers[req_id]
             tracker.main_hbm_ids.extend(new_main_hbm_by_req.get(req_id, []))
             if self.use_fused_overlap_offload:
-                # A request can be scheduled before it appears in
-                # scheduled_cached_reqs. In that case use the token count
-                # tracked from remote prefill and prior fused D2H steps; do
-                # not fall back to zero, which would overwrite token 0.
+                # Authoritative start is scheduled_cached_reqs.num_computed_tokens
+                # (already adjusted for MTP accept/reject by vLLM). Fall back to
+                # the prompt_len seed only when the req is not in cached_reqs yet;
+                # never invent progress from scheduled/finalized counts.
                 num_computed = num_computed_by_req.get(
                     req_id,
                     tracker.num_cpu_saved_tokens,
                 )
-                num_new_tokens = _num_finalized_scheduled_tokens(scheduler_output, req_id)
-                num_tokens_after_step = num_computed + num_new_tokens
+                d2h_num_tokens = get_num_scheduled_tokens(scheduler_output, req_id)
+                num_tokens_after_step = num_computed + d2h_num_tokens
                 num_blocks_needed = cdiv(num_tokens_after_step, self._main_block_size)
                 num_offloaded = len(tracker.allocated_block_ids_cpu)
                 num_new_offload_blocks = max(num_blocks_needed - num_offloaded, 0)
@@ -535,7 +537,6 @@ class SFAPDCpuOffloadScheduler:
                 )
                 if offload_dst:
                     tracker.allocated_block_ids_cpu.extend(offload_dst)
-                tracker.num_cpu_saved_tokens = num_tokens_after_step
                 if envs.VLLM_ASCEND_SFA_DEBUG:
                     logger.info(
                         "SFAPD fused offload req %s: tokens=[%d:%d) "
@@ -550,13 +551,13 @@ class SFAPDCpuOffloadScheduler:
                 _add_req(
                     req_id,
                     offload_token_start=num_computed,
-                    offload_num_tokens=num_new_tokens,
+                    offload_num_tokens=d2h_num_tokens,
                     num_tokens_after_step=num_tokens_after_step,
                 )
                 continue
 
             num_computed = num_computed_by_req.get(req_id, 0)
-            num_new_tokens = _num_finalized_scheduled_tokens(scheduler_output, req_id)
+            num_new_tokens = get_num_finalized_scheduled_tokens(scheduler_output, req_id)
             num_blocks_after_step = (num_computed + num_new_tokens) // self._main_block_size
             num_offloaded = len(tracker.allocated_block_ids_cpu)
             end = min(num_blocks_after_step, len(tracker.main_hbm_ids))

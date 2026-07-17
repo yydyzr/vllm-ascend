@@ -157,6 +157,59 @@ class TestSFAKVOffloadSchedulerMetadata(unittest.TestCase):
         self.assertEqual(req_meta.offload_num_tokens, 1)
         self.assertEqual(req_meta.num_tokens_after_step, 101)
 
+    def test_fused_mtp_decode_d2h_covers_draft_tokens(self, _mock):
+        """fused attention only reads CPU KV, so D2H must include MTP drafts."""
+        scheduler = self._make_scheduler(KV_OFFLOAD_MODE_FUSED_OVERLAP, block_size=16)
+        scheduler._request_trackers["r1"] = RequestTracker(
+            req_id="r1",
+            allocated_block_ids_npu=[10, 11, 12, 13, 14, 15],
+            allocated_block_ids_cpu=[1, 2, 3, 4, 5, 6],
+        )
+        scheduler._unfinished_requests["r1"] = (MagicMock(), [])
+        scheduler._unfinished_request_ids.add("r1")
+
+        # 1 finalized + 2 draft tokens in the same decode step.
+        sched_output = _make_sched_output(
+            cached_req_ids=["r1"],
+            cached_num_computed_tokens=[96],
+            cached_new_block_ids=[[16]],
+            num_scheduled_tokens={"r1": 3},
+        )
+        sched_output.scheduled_spec_decode_tokens = {"r1": [101, 102]}
+
+        meta = scheduler.build_connector_meta(sched_output)
+        req_meta = meta.requests[0]
+        self.assertEqual(req_meta.offload_token_start, 96)
+        self.assertEqual(req_meta.offload_num_tokens, 3)
+        self.assertEqual(req_meta.num_tokens_after_step, 99)
+        # Peak token 99 needs cdiv(99, 16)=7 CPU blocks; already had 6.
+        self.assertEqual(req_meta.num_new_offload_blocks, 1)
+        self.assertEqual(len(scheduler._request_trackers["r1"].allocated_block_ids_cpu), 7)
+
+    def test_legacy_mtp_decode_still_uses_finalized_only(self, _mock):
+        scheduler = self._make_scheduler(KV_OFFLOAD_MODE_LEGACY, block_size=16)
+        scheduler._request_trackers["r1"] = RequestTracker(
+            req_id="r1",
+            allocated_block_ids_npu=[10, 11, 12, 13, 14, 15],
+            allocated_block_ids_cpu=[1, 2, 3, 4, 5, 6],
+        )
+        scheduler._unfinished_requests["r1"] = (MagicMock(), [])
+        scheduler._unfinished_request_ids.add("r1")
+
+        sched_output = _make_sched_output(
+            cached_req_ids=["r1"],
+            cached_num_computed_tokens=[96],
+            cached_new_block_ids=[[16]],
+            num_scheduled_tokens={"r1": 3},
+        )
+        sched_output.scheduled_spec_decode_tokens = {"r1": [101, 102]}
+
+        meta = scheduler.build_connector_meta(sched_output)
+        req_meta = meta.requests[0]
+        # Legacy still offloads by full blocks of finalized progress only.
+        self.assertEqual(req_meta.offload_num_tokens, 0)
+        self.assertEqual(req_meta.num_new_offload_blocks, 0)
+
     def test_fused_prefill_chunk_spans_multiple_blocks(self, _mock):
         scheduler = self._make_scheduler(KV_OFFLOAD_MODE_FUSED_OVERLAP)
         new_req = MagicMock()

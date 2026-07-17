@@ -23,7 +23,10 @@ class RequestTracker:
     # step. The decode-filled range [num_offloaded:num_blocks_after_step] is the
     # offload source. (num_offloaded == len(allocated_block_ids_cpu).)
     main_hbm_ids: list[int] = field(default_factory=list)
-    # fused_overlap: count of main MLA tokens already saved to CPU.
+    # PD fused_overlap only: prompt_len seed used as offload_token_start when
+    # the request is not yet in scheduled_cached_reqs (first decode after
+    # remote prefill). Authoritative progress is vLLM num_computed_tokens;
+    # do not self-advance this field with scheduled/finalized counts.
     num_cpu_saved_tokens: int = 0
 
     def update(
@@ -57,6 +60,7 @@ class ReqMeta:
     offload_src_hbm_ids: list[int] = field(default_factory=list)
     offload_dst_cpu_ids: list[int] = field(default_factory=list)
     # fused_overlap: per-step token-range offload metadata.
+    # offload_num_tokens is the D2H window and includes MTP/spec drafts.
     num_tokens_after_step: int = 0
     offload_token_start: int = 0
     offload_num_tokens: int = 0

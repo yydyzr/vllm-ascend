@@ -1932,6 +1932,72 @@ class AscendSFAImpl(MLAAttentionImpl):
                 changed_count,
             )
 
+    def _validate_fused_overlap_mtp_decode_metadata(
+        self,
+        attn_metadata: M,
+        *,
+        num_tokens: int,
+        num_reqs: int,
+        full_q_actual_seq: torch.Tensor,
+        full_kv_actual_seq: torch.Tensor,
+    ) -> None:
+        """Validate fused decode metadata for 1-token and MTP (multi-token/req).
+
+        fused_overlap uses TND: ``full_q_actual_seq`` is per-request cumulative
+        query length (length ``num_reqs``, last value == ``num_tokens``).
+        When ``num_tokens != num_reqs``, ``token_to_req`` is required so
+        selection invalidation and D2H can map each query row to a request.
+        """
+        if attn_metadata.token_to_req is None:
+            raise RuntimeError(
+                "fused_overlap offload decode requires token_to_req metadata "
+                f"(num_tokens={num_tokens} num_reqs={num_reqs})"
+            )
+        if full_q_actual_seq.numel() != num_reqs:
+            raise RuntimeError(
+                "fused_overlap full_q_actual_seq must have one entry per decode "
+                f"request: got {full_q_actual_seq.numel()} for num_reqs={num_reqs}"
+            )
+        if full_kv_actual_seq.numel() != num_reqs:
+            raise RuntimeError(
+                "fused_overlap full_kv_actual_seq must have one entry per decode "
+                f"request: got {full_kv_actual_seq.numel()} for num_reqs={num_reqs}"
+            )
+
+        # Graph capture may use dummy / padded metadata; keep strict checks for eager.
+        if get_forward_context().capturing:
+            return
+
+        token_to_req = attn_metadata.token_to_req[:num_tokens]
+        if token_to_req.numel() != num_tokens:
+            raise RuntimeError(
+                "fused_overlap token_to_req length mismatch: "
+                f"got {token_to_req.numel()} for num_tokens={num_tokens}"
+            )
+        invalid_req_mapping = (token_to_req < 0) | (token_to_req >= num_reqs)
+        if bool(invalid_req_mapping.any().item()):
+            raise RuntimeError(
+                "fused_overlap token_to_req contains request indices outside "
+                f"decode request range: num_tokens={num_tokens} num_reqs={num_reqs}"
+            )
+
+        q_cum_last = int(full_q_actual_seq[-1].item())
+        if q_cum_last != num_tokens:
+            raise RuntimeError(
+                "fused_overlap TND full_q_actual_seq must end at num_tokens: "
+                f"full_q_actual_seq[-1]={q_cum_last} num_tokens={num_tokens} "
+                f"num_reqs={num_reqs}"
+            )
+
+        if num_tokens != num_reqs and envs.VLLM_ASCEND_SFA_DEBUG:
+            logger.info(
+                "[fused_overlap_offload][mtp] num_tokens=%s num_reqs=%s "
+                "full_q_actual_seq=%s",
+                num_tokens,
+                num_reqs,
+                full_q_actual_seq.detach().cpu().tolist(),
+            )
+
     def _execute_fused_overlap_offload_decode(
         self,
         ql_nope_decode: torch.Tensor,
@@ -1989,6 +2055,13 @@ class AscendSFAImpl(MLAAttentionImpl):
         full_kv_block_table = self._to_int32_device(full_kv_block_table[:num_reqs], ql_nope_decode.device)
         full_kv_actual_seq = self._to_int32_device(actual_seq_lengths_key_decode, ql_nope_decode.device)
         full_q_actual_seq = self._to_int32_device(actual_seq_lengths_query_decode, ql_nope_decode.device)
+        self._validate_fused_overlap_mtp_decode_metadata(
+            attn_metadata,
+            num_tokens=num_tokens,
+            num_reqs=num_reqs,
+            full_q_actual_seq=full_q_actual_seq,
+            full_kv_actual_seq=full_kv_actual_seq,
+        )
 
         row_count = num_tokens * topk_head_count
         selection_kv_cache = self._flatten_selection_buffer(

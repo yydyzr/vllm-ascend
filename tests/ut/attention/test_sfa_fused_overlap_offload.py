@@ -110,9 +110,163 @@ def test_fused_overlap_decode_uses_cpu_full_kv_and_reused_selection_buffers(capt
     assert captured["full_kv_block_table"].shape == (2, 2)
     assert captured["selection_topk_block_size"] == 1
     torch.testing.assert_close(
+        captured["full_q_actual_seq"],
+        torch.tensor([1, 2], dtype=torch.int32),
+    )
+    torch.testing.assert_close(
         impl.fused_overlap_last_req_ids[:2],
         torch.tensor([101, 202], dtype=torch.int64),
     )
+
+
+def test_fused_overlap_decode_supports_mtp_multi_token_per_req():
+    """MTP/SpecDecoding: num_tokens != num_reqs uses TND + token_to_req."""
+    impl = _make_impl()
+    # 2 requests × 2 query tokens (1 accepted + 1 draft each)
+    num_tokens, num_reqs = 4, 2
+    ql_nope = torch.arange(num_tokens * 2 * 3, dtype=torch.float32).reshape(num_tokens, 2, 3)
+    q_pe = torch.ones((num_tokens, 2, 1), dtype=torch.float32)
+    topk = torch.arange(num_tokens * 4, dtype=torch.int64).reshape(num_tokens, 4) % 4
+    selection_kv = torch.zeros((num_tokens, 8, 1, 3), dtype=torch.float32)
+    selection_rope = torch.zeros((num_tokens, 8, 1, 1), dtype=torch.float32)
+    kv_cache = (None, None, None, selection_kv, selection_rope)
+    full_kv_cpu = torch.zeros((4, 4, 1, 3), dtype=torch.float32)
+    full_rope_cpu = torch.zeros((4, 4, 1, 1), dtype=torch.float32)
+    full_block_table = torch.tensor([[0, 1], [2, 3]], dtype=torch.int32)
+    metadata = SimpleNamespace(
+        num_decodes=num_reqs,
+        token_to_req=torch.tensor([0, 0, 1, 1], dtype=torch.int32),
+        req_ids_tensor=torch.tensor([11, 22], dtype=torch.int64),
+    )
+    captured = {}
+
+    def fake_fused_op(**kwargs):
+        captured.update(kwargs)
+        return kwargs["query"][..., :3] + 1
+
+    with (
+        patch.object(impl, "_require_custom_op", return_value=fake_fused_op),
+        patch(
+            "vllm_ascend.attention.sfa_v1.get_fused_overlap_cpu_kv_inputs",
+            return_value=(full_kv_cpu, full_rope_cpu, full_block_table),
+        ),
+        patch(
+            "vllm_ascend.attention.sfa_v1.get_forward_context",
+            return_value=SimpleNamespace(capturing=False),
+        ),
+    ):
+        out = impl._execute_fused_overlap_offload_decode(
+            ql_nope,
+            q_pe,
+            kv_cache,
+            topk,
+            metadata,
+            # TND cumulative query lengths: req0 has 2 tokens, req1 has 2
+            torch.tensor([2, 4], dtype=torch.int32),
+            torch.tensor([8, 10], dtype=torch.int32),
+            "model.layers.0.self_attn",
+        )
+
+    assert out.shape == (num_tokens, 2, 3)
+    assert captured["query"].shape == (num_tokens, 2, 4)
+    assert captured["selection_topk_indices"].shape == (num_tokens, 1, 4)
+    assert captured["selection_kv_block_table"].shape == (num_tokens, 1)
+    assert captured["selection_kv_block_status"].shape == (num_tokens, 1, 5)
+    assert captured["full_kv_block_table"].shape == (num_reqs, 2)
+    assert captured["layout_query"] == "TND"
+    torch.testing.assert_close(
+        captured["full_q_actual_seq"],
+        torch.tensor([2, 4], dtype=torch.int32),
+    )
+    torch.testing.assert_close(
+        impl.fused_overlap_last_req_ids[:num_tokens],
+        torch.tensor([11, 11, 22, 22], dtype=torch.int64),
+    )
+
+
+def test_fused_overlap_decode_rejects_mtp_without_token_to_req():
+    impl = _make_impl()
+    ql_nope = torch.zeros((4, 2, 3), dtype=torch.float32)
+    q_pe = torch.zeros((4, 2, 1), dtype=torch.float32)
+    topk = torch.zeros((4, 4), dtype=torch.int64)
+    selection_kv = torch.zeros((4, 8, 1, 3), dtype=torch.float32)
+    selection_rope = torch.zeros((4, 8, 1, 1), dtype=torch.float32)
+    kv_cache = (None, None, None, selection_kv, selection_rope)
+    metadata = SimpleNamespace(
+        num_decodes=2,
+        token_to_req=None,
+        req_ids_tensor=torch.tensor([1, 2], dtype=torch.int64),
+    )
+
+    with (
+        patch.object(impl, "_require_custom_op", return_value=lambda **kwargs: kwargs["query"]),
+        patch(
+            "vllm_ascend.attention.sfa_v1.get_fused_overlap_cpu_kv_inputs",
+            return_value=(
+                torch.zeros((2, 4, 1, 3)),
+                torch.zeros((2, 4, 1, 1)),
+                torch.zeros((2, 1), dtype=torch.int32),
+            ),
+        ),
+        patch(
+            "vllm_ascend.attention.sfa_v1.get_forward_context",
+            return_value=SimpleNamespace(capturing=False),
+        ),
+        pytest.raises(RuntimeError, match="requires token_to_req"),
+    ):
+        impl._execute_fused_overlap_offload_decode(
+            ql_nope,
+            q_pe,
+            kv_cache,
+            topk,
+            metadata,
+            torch.tensor([2, 4], dtype=torch.int32),
+            torch.tensor([4, 4], dtype=torch.int32),
+            "model.layers.0.self_attn",
+        )
+
+
+def test_fused_overlap_decode_rejects_bad_tnd_q_actual_seq():
+    impl = _make_impl()
+    ql_nope = torch.zeros((4, 2, 3), dtype=torch.float32)
+    q_pe = torch.zeros((4, 2, 1), dtype=torch.float32)
+    topk = torch.zeros((4, 4), dtype=torch.int64)
+    selection_kv = torch.zeros((4, 8, 1, 3), dtype=torch.float32)
+    selection_rope = torch.zeros((4, 8, 1, 1), dtype=torch.float32)
+    kv_cache = (None, None, None, selection_kv, selection_rope)
+    metadata = SimpleNamespace(
+        num_decodes=2,
+        token_to_req=torch.tensor([0, 0, 1, 1], dtype=torch.int32),
+        req_ids_tensor=torch.tensor([1, 2], dtype=torch.int64),
+    )
+
+    with (
+        patch.object(impl, "_require_custom_op", return_value=lambda **kwargs: kwargs["query"]),
+        patch(
+            "vllm_ascend.attention.sfa_v1.get_fused_overlap_cpu_kv_inputs",
+            return_value=(
+                torch.zeros((2, 4, 1, 3)),
+                torch.zeros((2, 4, 1, 1)),
+                torch.zeros((2, 1), dtype=torch.int32),
+            ),
+        ),
+        patch(
+            "vllm_ascend.attention.sfa_v1.get_forward_context",
+            return_value=SimpleNamespace(capturing=False),
+        ),
+        pytest.raises(RuntimeError, match="full_q_actual_seq must end at num_tokens"),
+    ):
+        impl._execute_fused_overlap_offload_decode(
+            ql_nope,
+            q_pe,
+            kv_cache,
+            topk,
+            metadata,
+            # Wrong: ends at 3, but there are 4 query tokens
+            torch.tensor([2, 3], dtype=torch.int32),
+            torch.tensor([4, 4], dtype=torch.int32),
+            "model.layers.0.self_attn",
+        )
 
 
 def test_fused_overlap_selection_state_reuses_fixed_storage():
@@ -147,6 +301,36 @@ def test_fused_overlap_selection_state_reuses_fixed_storage():
     )) == pointers
     assert first[0].shape == (2, 1)
     assert second[0].shape == (1, 1)
+
+
+def test_fused_overlap_selection_invalidation_keeps_same_req_multi_token_rows():
+    """Same request on multiple MTP rows should not invalidate those rows."""
+    impl = _make_impl()
+    status = torch.arange(20, dtype=torch.int32).reshape(4, 1, 5)
+    last_req_ids = torch.tensor([10, 10, 20, 20], dtype=torch.int64)
+    metadata = SimpleNamespace(
+        token_to_req=torch.tensor([0, 0, 1, 1], dtype=torch.int32),
+        req_ids_tensor=torch.tensor([10, 20], dtype=torch.int64),
+    )
+
+    with patch(
+        "vllm_ascend.attention.sfa_v1.get_forward_context",
+        return_value=SimpleNamespace(capturing=False),
+    ):
+        impl._invalidate_fused_overlap_selection_rows(
+            status,
+            last_req_ids,
+            metadata,
+            num_tokens=4,
+            num_reqs=2,
+        )
+
+    # No request identity change → selection status kept for hit reuse.
+    torch.testing.assert_close(
+        status,
+        torch.arange(20, dtype=torch.int32).reshape(4, 1, 5),
+    )
+    torch.testing.assert_close(last_req_ids, torch.tensor([10, 10, 20, 20], dtype=torch.int64))
 
 
 def test_fused_overlap_selection_invalidation_uses_req_ids_not_row_position():
