@@ -71,12 +71,19 @@ inline at::Tensor BuildActualSeqQueryForSfa(const at::Tensor &full_q_actual_seq,
                                             int64_t bsz_seq,
                                             const at::Tensor &like_tensor)
 {
-    if (full_q_actual_seq.defined() &&
-        full_q_actual_seq.numel() == bsz_seq &&
-        full_q_actual_seq.is_contiguous()) {
-        return full_q_actual_seq;
+    // TND: full_q_actual_seq length is num_reqs (B), with cumulative query
+    // lengths ending at total tokens (query.size(0) == bsz_seq). MTP decode
+    // has num_tokens != num_reqs, so do NOT require numel == bsz_seq.
+    // Legacy fallback (no Q seq provided): treat each token as its own seq.
+    if (full_q_actual_seq.defined() && full_q_actual_seq.numel() > 0) {
+        TORCH_CHECK(
+            full_q_actual_seq.numel() <= bsz_seq,
+            "full_q_actual_seq numel (", full_q_actual_seq.numel(),
+            ") must be <= query token count (", bsz_seq,
+            ") for TND fused sparse attention overlap");
+        return full_q_actual_seq.contiguous();
     }
-    return at::ones({bsz_seq}, like_tensor.options());
+    return at::ones({bsz_seq}, like_tensor.options().dtype(at::kInt));
 }
 
 inline at::Tensor BuildFullCacheSparseIndicesForSfa(const at::Tensor &selection_topk_indices,
