@@ -851,9 +851,13 @@ class SFAKVOffloadWorker:
                 return None
 
             global_pos = int(offload_token_start[req_idx].item()) + local_offset
+            if global_pos < 0:
+                return None
             npu_block_id = slot // self.block_size
             npu_offset_in_block = slot % self.block_size
             cpu_block_idx = global_pos // self.block_size
+            if cpu_block_idx >= cpu_block_table.shape[1]:
+                return None
             cpu_offset_in_block = global_pos % self.block_size
             cpu_block_id = int(cpu_block_table[req_idx, cpu_block_idx].item())
             if cpu_block_id <= 0:
@@ -900,18 +904,21 @@ class SFAKVOffloadWorker:
         if num_k_copies > 0:
             if num_k_copies < num_actual_tokens:
                 self.d2h_gvas_buffer_cpu[num_k_copies:copy_idx] = (
-                    self.d2h_gvas_buffer_cpu[v_staging_offset:v_staging_offset + num_k_copies]
+                    self.d2h_gvas_buffer_cpu[
+                        v_staging_offset:v_staging_offset + num_k_copies
+                    ].clone()
                 )
                 self.d2h_addr_buffer_cpu[num_k_copies:copy_idx] = (
-                    self.d2h_addr_buffer_cpu[v_staging_offset:v_staging_offset + num_k_copies]
+                    self.d2h_addr_buffer_cpu[
+                        v_staging_offset:v_staging_offset + num_k_copies
+                    ].clone()
                 )
             self.d2h_size_buffer_cpu[:num_k_copies].fill_(self.token_size_bytes_k)
             self.d2h_size_buffer_cpu[num_k_copies:copy_idx].fill_(self.token_size_bytes_v)
         self.d2h_num_tokens_buffer_cpu[0] = copy_idx
 
-        # This callback also runs during FULL graph replay. Keep the probe on
-        # layer 0 so one line identifies the runtime padded metadata without
-        # flooding logs for every model layer.
+        # Keep the eager/PIECEWISE probe on layer 0 to avoid flooding logs.
+        # FULL replay uses the C++ callback below and does not enter this method.
         if envs.VLLM_ASCEND_SFA_DEBUG and layer_id == 0:
             logger.info(
                 "[fused_overlap_offload][d2h-host][debug] "
@@ -1091,18 +1098,39 @@ class SFAKVOffloadWorker:
         )
 
         args = (num_actual_tokens, num_reqs, layer_id)
-        current_compute_stream = torch_npu.npu.current_stream()
         if capturing:
-            subscribed_compute_streams = get_subscribed_compute_streams()
-            if current_compute_stream not in subscribed_compute_streams:
-                torch_npu.npu._subscribe_report(current_compute_stream)
-                subscribed_compute_streams.add(current_compute_stream)
-            torch_npu.npu._launch_host_func(
-                current_compute_stream,
-                self._compute_step_offload_addrs_cpu,
-                args,
+            if not getattr(self, "_fused_overlap_cpp_callback_logged", False):
+                logger.info(
+                    "[fused_overlap_offload][d2h][capture] "
+                    "descriptor_callback=cpp_aclrtLaunchHostFunc "
+                    "num_actual_tokens=%s num_reqs=%s",
+                    num_actual_tokens,
+                    num_reqs,
+                )
+                self._fused_overlap_cpp_callback_logged = True
+            self.cpu_sparse_attn.enqueue_current_kv_d2h_descriptors(
+                self.d2h_slot_mapping_cpu,
+                self.d2h_token_to_req_cpu,
+                self.d2h_cum_query_lens_cpu,
+                self.fused_offload_token_start_cpu,
+                self.fused_offload_num_tokens_cpu,
+                self.cpu_block_table_host_buffer,
+                self.block_size,
+                self.token_size_bytes_k,
+                self.token_size_bytes_v,
+                self.gvas_k_bases[layer_id],
+                self.gvas_v_bases[layer_id],
+                self.npu_k_bases[layer_id],
+                self.npu_v_bases[layer_id],
+                num_actual_tokens,
+                num_reqs,
+                self.d2h_gvas_buffer_cpu,
+                self.d2h_addr_buffer_cpu,
+                self.d2h_size_buffer_cpu,
+                self.d2h_num_tokens_buffer_cpu,
             )
         else:
+            current_compute_stream = torch_npu.npu.current_stream()
             self._compute_step_offload_addrs_cpu(args)
 
         if not capturing:

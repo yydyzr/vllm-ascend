@@ -18,6 +18,7 @@ from unittest.mock import MagicMock
 # 1. cpu_sparse_attn cpp extension JIT build (torch.utils.cpp_extension.load).
 import torch.utils.cpp_extension as _cpp_extension  # noqa: E402
 
+_real_cpp_extension_load = _cpp_extension.load
 _cpp_extension.load = MagicMock(return_value=MagicMock())  # noqa: E402
 
 # 2. memfabric_hybrid.offload is not exported in the sandbox install.
@@ -29,12 +30,15 @@ if not hasattr(memfabric_hybrid, "offload"):  # noqa: E402
 import pytest  # noqa: E402
 import torch  # noqa: E402
 
-from vllm_ascend.distributed.kv_transfer.sfa_kv_offload import (  # noqa: E402
-    sfa_kv_offload_worker as worker_module,
-)
-from vllm_ascend.distributed.kv_transfer.sfa_kv_offload.sfa_kv_offload_worker import (  # noqa: E402
-    SFAKVOffloadWorker,
-)
+try:
+    from vllm_ascend.distributed.kv_transfer.sfa_kv_offload import (  # noqa: E402
+        sfa_kv_offload_worker as worker_module,
+    )
+    from vllm_ascend.distributed.kv_transfer.sfa_kv_offload.sfa_kv_offload_worker import (  # noqa: E402
+        SFAKVOffloadWorker,
+    )
+finally:
+    _cpp_extension.load = _real_cpp_extension_load
 
 
 def _make_worker_without_init() -> SFAKVOffloadWorker:
@@ -318,6 +322,19 @@ def test_owner_capture_zero_copy_still_records_sparse_copy(monkeypatch):
         "capture must not read copy_count on the host"
     )
     worker._compute_step_offload_addrs_cpu = MagicMock()
+    worker.cpu_sparse_attn = MagicMock()
+    worker.fused_offload_token_start_cpu = MagicMock()
+    worker.fused_offload_num_tokens_cpu = MagicMock()
+    worker.block_size = 128
+    worker.token_size_bytes_k = 1024
+    worker.token_size_bytes_v = 128
+    worker.gvas_k_bases = [2 * 1024 * 1024]
+    worker.gvas_v_bases = [4 * 1024 * 1024]
+    worker.npu_k_bases = [6 * 1024 * 1024]
+    worker.npu_v_bases = [8 * 1024 * 1024]
+    worker.d2h_gvas_buffer_cpu = MagicMock()
+    worker.d2h_addr_buffer_cpu = MagicMock()
+    worker.d2h_size_buffer_cpu = MagicMock()
     worker.d2h_batch_copy_args_buffer_cpu = torch.zeros(4, dtype=torch.int8)
     worker.d2h_batch_copy_args_buffer_npu = MagicMock()
     worker.d2h_addr_buffer_npu = MagicMock()
@@ -326,15 +343,11 @@ def test_owner_capture_zero_copy_still_records_sparse_copy(monkeypatch):
     worker.d2h_num_tokens_buffer_npu = MagicMock()
     worker.k_caches_npu = [SimpleNamespace(device=torch.device("cpu"))]
     worker.d2h_save_event = MagicMock()
-    current_stream = MagicMock()
-    subscribed_streams = set()
+    current_stream = MagicMock(
+        side_effect=AssertionError("capture must not use the Python current-stream API")
+    )
     monkeypatch.setattr(worker_module.envs, "VLLM_ASCEND_SFA_DEBUG", False)
-    monkeypatch.setattr(worker_module.torch_npu.npu, "current_stream", lambda: current_stream)
-    monkeypatch.setattr(worker_module, "get_subscribed_compute_streams", lambda: subscribed_streams)
-    subscribe_report = MagicMock()
-    launch_host_func = MagicMock()
-    monkeypatch.setattr(worker_module.torch_npu.npu, "_subscribe_report", subscribe_report)
-    monkeypatch.setattr(worker_module.torch_npu.npu, "_launch_host_func", launch_host_func)
+    monkeypatch.setattr(worker_module.torch_npu.npu, "current_stream", current_stream)
     sparse_copy = MagicMock()
     monkeypatch.setattr(worker_module.offload, "sparse_copy", sparse_copy)
     tensor = torch.zeros(1, dtype=torch.int32)
@@ -349,12 +362,29 @@ def test_owner_capture_zero_copy_still_records_sparse_copy(monkeypatch):
         capturing=True,
     )
 
-    subscribe_report.assert_called_once_with(current_stream)
-    launch_host_func.assert_called_once_with(
-        current_stream,
-        worker._compute_step_offload_addrs_cpu,
-        (1, 1, 0),
+    worker.cpu_sparse_attn.enqueue_current_kv_d2h_descriptors.assert_called_once_with(
+        worker.d2h_slot_mapping_cpu,
+        worker.d2h_token_to_req_cpu,
+        worker.d2h_cum_query_lens_cpu,
+        worker.fused_offload_token_start_cpu,
+        worker.fused_offload_num_tokens_cpu,
+        worker.cpu_block_table_host_buffer,
+        worker.block_size,
+        worker.token_size_bytes_k,
+        worker.token_size_bytes_v,
+        worker.gvas_k_bases[0],
+        worker.gvas_v_bases[0],
+        worker.npu_k_bases[0],
+        worker.npu_v_bases[0],
+        1,
+        1,
+        worker.d2h_gvas_buffer_cpu,
+        worker.d2h_addr_buffer_cpu,
+        worker.d2h_size_buffer_cpu,
+        worker.d2h_num_tokens_buffer_cpu,
     )
+    worker._compute_step_offload_addrs_cpu.assert_not_called()
+    current_stream.assert_not_called()
     worker.d2h_batch_copy_args_buffer_npu.copy_.assert_called_once_with(
         worker.d2h_batch_copy_args_buffer_cpu,
         non_blocking=True,
@@ -368,3 +398,38 @@ def test_owner_capture_zero_copy_still_records_sparse_copy(monkeypatch):
     )
     worker.d2h_save_event.record.assert_not_called()
     worker.d2h_save_event.synchronize.assert_not_called()
+
+
+def test_python_descriptor_builder_compacts_padded_v_entries_without_overlap(monkeypatch):
+    worker = _make_runtime_worker(tp_rank=0)
+    worker.block_size = 128
+    worker.token_size_bytes_k = 1024
+    worker.token_size_bytes_v = 128
+    worker.npu_k_bases = [10_000_000]
+    worker.npu_v_bases = [20_000_000]
+    worker.gvas_k_bases = [30_000_000]
+    worker.gvas_v_bases = [40_000_000]
+    worker.d2h_slot_mapping_cpu = torch.tensor([0, 1, 2, -1], dtype=torch.int32)
+    worker.d2h_token_to_req_cpu = torch.tensor([0, 1, 2, 3], dtype=torch.int32)
+    worker.d2h_cum_query_lens_cpu = torch.tensor([1, 2, 3, 4], dtype=torch.int32)
+    worker.fused_offload_token_start_cpu = torch.tensor([0, 0, 0, -1], dtype=torch.int32)
+    worker.fused_offload_num_tokens_cpu = torch.tensor([1, 1, 1, 0], dtype=torch.int32)
+    worker.cpu_block_table_host_buffer = torch.tensor([[1], [2], [3], [0]], dtype=torch.int32)
+    worker.d2h_gvas_buffer_cpu = torch.zeros(8, dtype=torch.int64)
+    worker.d2h_addr_buffer_cpu = torch.zeros(8, dtype=torch.int64)
+    worker.d2h_size_buffer_cpu = torch.zeros(8, dtype=torch.int32)
+    worker.d2h_num_tokens_buffer_cpu = torch.zeros(1, dtype=torch.int32)
+    monkeypatch.setattr(worker_module.envs, "VLLM_ASCEND_SFA_DEBUG", False)
+
+    worker._compute_step_offload_addrs_cpu((4, 4, 0))
+
+    assert worker.d2h_num_tokens_buffer_cpu.tolist() == [6]
+    assert worker.d2h_gvas_buffer_cpu[:6].tolist() == [
+        30_000_000 + 128 * 1024,
+        30_000_000 + 2 * 128 * 1024,
+        30_000_000 + 3 * 128 * 1024,
+        40_000_000 + 128 * 128,
+        40_000_000 + 2 * 128 * 128,
+        40_000_000 + 3 * 128 * 128,
+    ]
+    assert worker.d2h_size_buffer_cpu[:6].tolist() == [1024, 1024, 1024, 128, 128, 128]

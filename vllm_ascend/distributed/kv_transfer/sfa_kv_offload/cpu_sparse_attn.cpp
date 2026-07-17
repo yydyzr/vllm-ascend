@@ -1,5 +1,6 @@
 #include <torch/extension.h>
 #include <limits>
+#include <memory>
 #include <optional>
 #include <iostream>
 #include <chrono>
@@ -648,6 +649,309 @@ compute_lru_resident_addrs(
     return num_tokens_to_load_sum;
 }
 
+namespace {
+
+struct CurrentKvD2HDescriptorPayload {
+    at::Tensor slot_mapping;
+    at::Tensor token_to_req;
+    at::Tensor cum_query_lens;
+    at::Tensor offload_token_start;
+    at::Tensor offload_num_tokens;
+    at::Tensor cpu_block_table;
+    at::Tensor gvas_buffer;
+    at::Tensor addr_buffer;
+    at::Tensor size_buffer;
+    at::Tensor num_tokens_buffer;
+    int32_t block_size;
+    int32_t token_size_bytes_k;
+    int32_t token_size_bytes_v;
+    int64_t cpu_k_base;
+    int64_t cpu_v_base;
+    int64_t npu_k_base;
+    int64_t npu_v_base;
+    int32_t num_actual_tokens;
+    int32_t num_reqs;
+};
+
+void check_cpu_descriptor_tensor(
+    const at::Tensor& tensor,
+    const at::ScalarType dtype,
+    const char* name)
+{
+    TORCH_CHECK(tensor.device().is_cpu(), name, " must be a CPU tensor");
+    TORCH_CHECK(tensor.scalar_type() == dtype, name, " has an unexpected dtype");
+    TORCH_CHECK(tensor.is_contiguous(), name, " must be contiguous");
+}
+
+std::unique_ptr<CurrentKvD2HDescriptorPayload> make_current_kv_d2h_payload(
+    const at::Tensor& slot_mapping,
+    const at::Tensor& token_to_req,
+    const at::Tensor& cum_query_lens,
+    const at::Tensor& offload_token_start,
+    const at::Tensor& offload_num_tokens,
+    const at::Tensor& cpu_block_table,
+    const int32_t block_size,
+    const int32_t token_size_bytes_k,
+    const int32_t token_size_bytes_v,
+    const int64_t cpu_k_base,
+    const int64_t cpu_v_base,
+    const int64_t npu_k_base,
+    const int64_t npu_v_base,
+    const int32_t num_actual_tokens,
+    const int32_t num_reqs,
+    const at::Tensor& gvas_buffer,
+    const at::Tensor& addr_buffer,
+    const at::Tensor& size_buffer,
+    const at::Tensor& num_tokens_buffer)
+{
+    check_cpu_descriptor_tensor(slot_mapping, at::kInt, "slot_mapping");
+    check_cpu_descriptor_tensor(token_to_req, at::kInt, "token_to_req");
+    check_cpu_descriptor_tensor(cum_query_lens, at::kInt, "cum_query_lens");
+    check_cpu_descriptor_tensor(offload_token_start, at::kInt, "offload_token_start");
+    check_cpu_descriptor_tensor(offload_num_tokens, at::kInt, "offload_num_tokens");
+    check_cpu_descriptor_tensor(cpu_block_table, at::kInt, "cpu_block_table");
+    check_cpu_descriptor_tensor(gvas_buffer, at::kLong, "gvas_buffer");
+    check_cpu_descriptor_tensor(addr_buffer, at::kLong, "addr_buffer");
+    check_cpu_descriptor_tensor(size_buffer, at::kInt, "size_buffer");
+    check_cpu_descriptor_tensor(num_tokens_buffer, at::kInt, "num_tokens_buffer");
+
+    TORCH_CHECK(num_actual_tokens >= 0, "num_actual_tokens must not be negative");
+    TORCH_CHECK(num_reqs >= 0, "num_reqs must not be negative");
+    TORCH_CHECK(block_size > 0, "block_size must be positive");
+    TORCH_CHECK(token_size_bytes_k > 0 && token_size_bytes_v > 0,
+                "token sizes must be positive");
+    TORCH_CHECK(cpu_k_base > 0 && cpu_v_base > 0 && npu_k_base > 0 && npu_v_base > 0,
+                "current-token D2H base addresses must be non-zero");
+    TORCH_CHECK(slot_mapping.numel() >= num_actual_tokens,
+                "slot_mapping is smaller than num_actual_tokens");
+    TORCH_CHECK(token_to_req.numel() >= num_actual_tokens,
+                "token_to_req is smaller than num_actual_tokens");
+    TORCH_CHECK(cum_query_lens.numel() >= num_reqs,
+                "cum_query_lens is smaller than num_reqs");
+    TORCH_CHECK(offload_token_start.numel() >= num_reqs,
+                "offload_token_start is smaller than num_reqs");
+    TORCH_CHECK(offload_num_tokens.numel() >= num_reqs,
+                "offload_num_tokens is smaller than num_reqs");
+    TORCH_CHECK(cpu_block_table.dim() == 2 && cpu_block_table.size(0) >= num_reqs,
+                "cpu_block_table does not contain all request rows");
+    TORCH_CHECK(cpu_block_table.size(1) > 0, "cpu_block_table must contain block columns");
+    TORCH_CHECK(gvas_buffer.numel() >= static_cast<int64_t>(num_actual_tokens) * 2,
+                "gvas_buffer is too small");
+    TORCH_CHECK(addr_buffer.numel() >= static_cast<int64_t>(num_actual_tokens) * 2,
+                "addr_buffer is too small");
+    TORCH_CHECK(size_buffer.numel() >= static_cast<int64_t>(num_actual_tokens) * 2,
+                "size_buffer is too small");
+    TORCH_CHECK(num_tokens_buffer.numel() >= 1, "num_tokens_buffer is empty");
+
+    return std::make_unique<CurrentKvD2HDescriptorPayload>(CurrentKvD2HDescriptorPayload{
+        slot_mapping,
+        token_to_req,
+        cum_query_lens,
+        offload_token_start,
+        offload_num_tokens,
+        cpu_block_table,
+        gvas_buffer,
+        addr_buffer,
+        size_buffer,
+        num_tokens_buffer,
+        block_size,
+        token_size_bytes_k,
+        token_size_bytes_v,
+        cpu_k_base,
+        cpu_v_base,
+        npu_k_base,
+        npu_v_base,
+        num_actual_tokens,
+        num_reqs,
+    });
+}
+
+void build_current_kv_d2h_descriptors(CurrentKvD2HDescriptorPayload* payload) noexcept
+{
+    if (payload == nullptr) {
+        return;
+    }
+
+    auto* num_tokens = payload->num_tokens_buffer.data_ptr<int32_t>();
+    num_tokens[0] = 0;
+    if (payload->num_actual_tokens <= 0 || payload->num_reqs <= 0) {
+        return;
+    }
+
+    const auto* slots = payload->slot_mapping.data_ptr<int32_t>();
+    const auto* token_to_req = payload->token_to_req.data_ptr<int32_t>();
+    const auto* cum_query_lens = payload->cum_query_lens.data_ptr<int32_t>();
+    const auto* offload_token_start = payload->offload_token_start.data_ptr<int32_t>();
+    const auto* offload_num_tokens = payload->offload_num_tokens.data_ptr<int32_t>();
+    const auto* cpu_block_table = payload->cpu_block_table.data_ptr<int32_t>();
+    auto* gvas = payload->gvas_buffer.data_ptr<int64_t>();
+    auto* addrs = payload->addr_buffer.data_ptr<int64_t>();
+    auto* sizes = payload->size_buffer.data_ptr<int32_t>();
+
+    const int32_t max_num_blocks = payload->cpu_block_table.size(1);
+    const int64_t block_size_bytes_k =
+        static_cast<int64_t>(payload->block_size) * payload->token_size_bytes_k;
+    const int64_t block_size_bytes_v =
+        static_cast<int64_t>(payload->block_size) * payload->token_size_bytes_v;
+    const int32_t v_staging_offset = payload->num_actual_tokens;
+    int32_t num_k_copies = 0;
+
+    for (int32_t batch_idx = 0; batch_idx < payload->num_actual_tokens; ++batch_idx) {
+        const int32_t req_idx = token_to_req[batch_idx];
+        if (req_idx < 0 || req_idx >= payload->num_reqs) {
+            continue;
+        }
+
+        const int32_t req_offload_num_tokens = offload_num_tokens[req_idx];
+        if (req_offload_num_tokens <= 0) {
+            continue;
+        }
+
+        const int32_t query_start = req_idx == 0 ? 0 : cum_query_lens[req_idx - 1];
+        const int32_t local_offset = batch_idx - query_start;
+        if (local_offset < 0 || local_offset >= req_offload_num_tokens) {
+            continue;
+        }
+
+        const int32_t slot = slots[batch_idx];
+        if (slot < 0) {
+            continue;
+        }
+
+        const int64_t global_pos =
+            static_cast<int64_t>(offload_token_start[req_idx]) + local_offset;
+        if (global_pos < 0) {
+            continue;
+        }
+        const int64_t cpu_block_idx = global_pos / payload->block_size;
+        if (cpu_block_idx < 0 || cpu_block_idx >= max_num_blocks) {
+            continue;
+        }
+
+        const int32_t cpu_block_id =
+            cpu_block_table[static_cast<int64_t>(req_idx) * max_num_blocks + cpu_block_idx];
+        if (cpu_block_id <= 0) {
+            continue;
+        }
+
+        const int32_t cpu_offset_in_block =
+            static_cast<int32_t>(global_pos % payload->block_size);
+        const int32_t npu_block_id = slot / payload->block_size;
+        const int32_t npu_offset_in_block = slot % payload->block_size;
+        const int32_t staging_idx = v_staging_offset + num_k_copies;
+
+        gvas[num_k_copies] = payload->cpu_k_base
+            + static_cast<int64_t>(cpu_block_id) * block_size_bytes_k
+            + static_cast<int64_t>(cpu_offset_in_block) * payload->token_size_bytes_k;
+        addrs[num_k_copies] = payload->npu_k_base
+            + static_cast<int64_t>(npu_block_id) * block_size_bytes_k
+            + static_cast<int64_t>(npu_offset_in_block) * payload->token_size_bytes_k;
+        gvas[staging_idx] = payload->cpu_v_base
+            + static_cast<int64_t>(cpu_block_id) * block_size_bytes_v
+            + static_cast<int64_t>(cpu_offset_in_block) * payload->token_size_bytes_v;
+        addrs[staging_idx] = payload->npu_v_base
+            + static_cast<int64_t>(npu_block_id) * block_size_bytes_v
+            + static_cast<int64_t>(npu_offset_in_block) * payload->token_size_bytes_v;
+        ++num_k_copies;
+    }
+
+    if (num_k_copies < payload->num_actual_tokens) {
+        // Destination starts before source. Forward element-wise copy is safe
+        // even when the compacted V range overlaps its staging range.
+        for (int32_t idx = 0; idx < num_k_copies; ++idx) {
+            gvas[num_k_copies + idx] = gvas[v_staging_offset + idx];
+            addrs[num_k_copies + idx] = addrs[v_staging_offset + idx];
+        }
+    }
+
+    for (int32_t idx = 0; idx < num_k_copies; ++idx) {
+        sizes[idx] = payload->token_size_bytes_k;
+        sizes[num_k_copies + idx] = payload->token_size_bytes_v;
+    }
+    num_tokens[0] = num_k_copies * 2;
+}
+
+int32_t compute_current_kv_d2h_descriptors(
+    const at::Tensor& slot_mapping,
+    const at::Tensor& token_to_req,
+    const at::Tensor& cum_query_lens,
+    const at::Tensor& offload_token_start,
+    const at::Tensor& offload_num_tokens,
+    const at::Tensor& cpu_block_table,
+    const int32_t block_size,
+    const int32_t token_size_bytes_k,
+    const int32_t token_size_bytes_v,
+    const int64_t cpu_k_base,
+    const int64_t cpu_v_base,
+    const int64_t npu_k_base,
+    const int64_t npu_v_base,
+    const int32_t num_actual_tokens,
+    const int32_t num_reqs,
+    const at::Tensor& gvas_buffer,
+    const at::Tensor& addr_buffer,
+    const at::Tensor& size_buffer,
+    const at::Tensor& num_tokens_buffer)
+{
+    auto payload = make_current_kv_d2h_payload(
+        slot_mapping, token_to_req, cum_query_lens, offload_token_start,
+        offload_num_tokens, cpu_block_table, block_size, token_size_bytes_k,
+        token_size_bytes_v, cpu_k_base, cpu_v_base, npu_k_base, npu_v_base,
+        num_actual_tokens, num_reqs, gvas_buffer, addr_buffer, size_buffer,
+        num_tokens_buffer);
+    build_current_kv_d2h_descriptors(payload.get());
+    return num_tokens_buffer.data_ptr<int32_t>()[0];
+}
+
+void current_kv_d2h_descriptor_callback(void* args) noexcept
+{
+    build_current_kv_d2h_descriptors(
+        static_cast<CurrentKvD2HDescriptorPayload*>(args));
+}
+
+void enqueue_current_kv_d2h_descriptors(
+    const at::Tensor& slot_mapping,
+    const at::Tensor& token_to_req,
+    const at::Tensor& cum_query_lens,
+    const at::Tensor& offload_token_start,
+    const at::Tensor& offload_num_tokens,
+    const at::Tensor& cpu_block_table,
+    const int32_t block_size,
+    const int32_t token_size_bytes_k,
+    const int32_t token_size_bytes_v,
+    const int64_t cpu_k_base,
+    const int64_t cpu_v_base,
+    const int64_t npu_k_base,
+    const int64_t npu_v_base,
+    const int32_t num_actual_tokens,
+    const int32_t num_reqs,
+    const at::Tensor& gvas_buffer,
+    const at::Tensor& addr_buffer,
+    const at::Tensor& size_buffer,
+    const at::Tensor& num_tokens_buffer)
+{
+    auto payload = make_current_kv_d2h_payload(
+        slot_mapping, token_to_req, cum_query_lens, offload_token_start,
+        offload_num_tokens, cpu_block_table, block_size, token_size_bytes_k,
+        token_size_bytes_v, cpu_k_base, cpu_v_base, npu_k_base, npu_v_base,
+        num_actual_tokens, num_reqs, gvas_buffer, addr_buffer, size_buffer,
+        num_tokens_buffer);
+    auto* raw_payload = payload.release();
+    const aclError ret = aclrtLaunchHostFunc(
+        c10_npu::getCurrentNPUStream().stream(),
+        current_kv_d2h_descriptor_callback,
+        raw_payload);
+    if (ret != ACL_SUCCESS) {
+        delete raw_payload;
+    }
+    // ACL graph replay reuses this callback argument. Keep it alive for the
+    // process lifetime; freeing it after the first callback would leave later
+    // replays with a dangling pointer.
+    TORCH_CHECK(ret == ACL_SUCCESS,
+                "aclrtLaunchHostFunc for current-token D2H failed, error code: ", ret);
+}
+
+}  // namespace
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
 {
     namespace py = pybind11;
@@ -663,4 +967,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
           "CPU LRU resident compact miss prepare with OpenMP row-level parallelism");
     m.def("compute_lru_resident_addrs", &compute_lru_resident_addrs,
           "Compute sparse H2D metadata for compact LRU resident miss loads");
+    m.def("compute_current_kv_d2h_descriptors", &compute_current_kv_d2h_descriptors,
+          "Synchronously compute current-token D2H sparse-copy metadata");
+    m.def("enqueue_current_kv_d2h_descriptors", &enqueue_current_kv_d2h_descriptors,
+          "Enqueue a replay-safe current-token D2H descriptor host callback");
 }
