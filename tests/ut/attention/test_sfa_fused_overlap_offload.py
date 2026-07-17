@@ -65,6 +65,7 @@ def test_fused_overlap_decode_uses_cpu_full_kv_and_reused_selection_buffers(capt
     full_block_table = torch.tensor([[0, 1], [1, 2]], dtype=torch.int32)
     metadata = SimpleNamespace(
         num_decodes=2,
+        slot_mapping=torch.tensor([0, 1], dtype=torch.int64),
         token_to_req=torch.tensor([0, 1], dtype=torch.int32),
         req_ids_tensor=torch.tensor([101, 202], dtype=torch.int64),
     )
@@ -111,6 +112,75 @@ def test_fused_overlap_decode_uses_cpu_full_kv_and_reused_selection_buffers(capt
     torch.testing.assert_close(
         impl.fused_overlap_last_req_ids[:2],
         torch.tensor([101, 202], dtype=torch.int64),
+    )
+
+
+def test_fused_overlap_decode_replaces_full_graph_padding_with_valid_dummy_row():
+    impl = _make_impl()
+    ql_nope = torch.arange(24, dtype=torch.float32).reshape(4, 2, 3)
+    q_pe = torch.ones((4, 2, 1), dtype=torch.float32)
+    topk = torch.tensor(
+        [
+            [0, 1, 2, 3],
+            [3, 2, 1, 0],
+            [1, 3, 0, 2],
+            [3, 2, 1, 0],
+        ],
+        dtype=torch.int64,
+    )
+    selection_kv = torch.zeros((4, 8, 1, 3), dtype=torch.float32)
+    selection_rope = torch.zeros((4, 8, 1, 1), dtype=torch.float32)
+    kv_cache = (None, None, None, selection_kv, selection_rope)
+    full_kv_cpu = torch.zeros((4, 4, 1, 3), dtype=torch.float32)
+    full_rope_cpu = torch.zeros((4, 4, 1, 1), dtype=torch.float32)
+    full_block_table = torch.tensor(
+        [[4, 5], [6, 7], [8, 9], [0, 0]],
+        dtype=torch.int32,
+    )
+    metadata = SimpleNamespace(
+        num_decodes=4,
+        slot_mapping=torch.tensor([10, 20, 30, -1], dtype=torch.int64),
+        token_to_req=torch.tensor([0, 1, 2, 3], dtype=torch.int32),
+        req_ids_tensor=torch.tensor([101, 202, 303, 0], dtype=torch.int64),
+    )
+    captured = {}
+
+    def fake_fused_op(**kwargs):
+        captured.update(kwargs)
+        return kwargs["query"]
+
+    with (
+        patch.object(impl, "_require_custom_op", return_value=fake_fused_op),
+        patch(
+            "vllm_ascend.attention.sfa_v1.get_fused_overlap_cpu_kv_inputs",
+            return_value=(full_kv_cpu, full_rope_cpu, full_block_table),
+        ),
+        patch(
+            "vllm_ascend.attention.sfa_v1.get_forward_context",
+            return_value=SimpleNamespace(capturing=True),
+        ),
+    ):
+        impl._execute_fused_overlap_offload_decode(
+            ql_nope,
+            q_pe,
+            kv_cache,
+            topk,
+            metadata,
+            torch.tensor([1, 2, 3, 4], dtype=torch.int32),
+            torch.tensor([5, 5, 5, 0], dtype=torch.int32),
+            "model.layers.0.self_attn",
+        )
+
+    expected_topk = topk.to(torch.int32).unsqueeze(1)
+    expected_topk[-1, 0] = torch.tensor([0, -1, -1, -1], dtype=torch.int32)
+    torch.testing.assert_close(captured["selection_topk_indices"], expected_topk)
+    torch.testing.assert_close(
+        captured["full_kv_actual_seq"],
+        torch.tensor([5, 5, 5, 1], dtype=torch.int32),
+    )
+    torch.testing.assert_close(
+        captured["full_kv_block_table"],
+        torch.tensor([[4, 5], [6, 7], [8, 9], [4, 5]], dtype=torch.int32),
     )
 
 

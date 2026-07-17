@@ -270,7 +270,7 @@ class SFAKVOffloadWorker:
         max_block_num = cdiv(self.max_model_len, self.block_size)
         self.cpu_block_table = CpuGpuBuffer(self.max_num_reqs, max_block_num, dtype=torch.int32, device='npu', pin_memory=True)
         self.cpu_block_table_host_buffer = torch.zeros([self.max_num_reqs, max_block_num], dtype=torch.int32, device='cpu', pin_memory=True)
-        self.cpu_block_table_req_hashes = torch.empty(
+        self.cpu_block_table_req_hashes = torch.zeros(
             self.max_num_reqs,
             dtype=torch.int64,
             device='cpu',
