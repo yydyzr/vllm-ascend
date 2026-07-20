@@ -22,6 +22,21 @@ import os
 from collections.abc import Callable
 from typing import Any
 
+
+def _parse_int_set(env_name: str, default: str = "0") -> frozenset[int]:
+    """Parse a comma-separated integer list env var into a frozenset."""
+    raw = os.getenv(env_name, default)
+    values: set[int] = set()
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        values.add(int(part))
+    if not values:
+        values.add(0)
+    return frozenset(values)
+
+
 # The begin-* and end* here are used by the documentation generator
 # to extract the used env vars.
 
@@ -123,13 +138,18 @@ env_variables: dict[str, Callable[[], Any]] = {
     # (debugging). Does NOT gate the expensive MFV checksums (see
     # VLLM_ASCEND_MF_VERIFY) nor one-time startup / operational error logs.
     "VLLM_ASCEND_SFA_DEBUG": lambda: bool(int(os.getenv("VLLM_ASCEND_SFA_DEBUG", "0"))),
-    # Dump the first eager decode operator inputs for the selected layer.
-    # Run once with fused_overlap offload (writes sfa_fused_inputs_*.pt) and once
-    # without kv_offload (writes sfa_sfa_inputs_*.pt), then compare offline.
+    # Dump eager decode operator inputs/outputs for the selected layer/step.
+    # Only TP rank 0 writes dumps. Run once with fused_overlap offload
+    # (writes sfa_fused_inputs_*.pt) and once without kv_offload
+    # (writes sfa_sfa_inputs_*.pt), then compare offline.
     # Empty (default) disables all tensor copies and file I/O on the attention path.
     "VLLM_ASCEND_SFA_DUMP_DIR": lambda: os.getenv("VLLM_ASCEND_SFA_DUMP_DIR", ""),
-    # Zero-based layer index selected by VLLM_ASCEND_SFA_DUMP_DIR.
-    "VLLM_ASCEND_SFA_DUMP_LAYER": lambda: int(os.getenv("VLLM_ASCEND_SFA_DUMP_LAYER", "0")),
+    # Zero-based layer indices selected by VLLM_ASCEND_SFA_DUMP_DIR.
+    # Comma-separated, e.g. "0" or "0,58".
+    "VLLM_ASCEND_SFA_DUMP_LAYER": lambda: _parse_int_set("VLLM_ASCEND_SFA_DUMP_LAYER", "0"),
+    # Zero-based decode-step indices to dump on the selected layers (0 = first decode).
+    # Comma-separated, e.g. "0" or "0,2,5".
+    "VLLM_ASCEND_SFA_DUMP_STEP": lambda: _parse_int_set("VLLM_ASCEND_SFA_DUMP_STEP", "0"),
     # SFA PD memfabric-pull per-layer KV checksum verification
     # (.float().sum().item() device->host syncs -- expensive). Off by default.
     # 0 = off (default), 1 = on (correctness debugging). Independent of

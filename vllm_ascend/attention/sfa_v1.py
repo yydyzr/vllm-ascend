@@ -799,7 +799,8 @@ class AscendSFAImpl(MLAAttentionImpl):
         self.fused_overlap_last_req_ids: torch.Tensor | None = None
         self._fused_overlap_selection_capacity: tuple[int, int, int, int] | None = None
         self._fused_overlap_decode_logged = False
-        self._sfa_decode_debug_dumped = False
+        # Counts eager decode passes on this layer (TP rank 0 only).
+        self._sfa_decode_dump_step_idx = 0
 
     @staticmethod
     def update_graph_params(
@@ -1712,25 +1713,37 @@ class AscendSFAImpl(MLAAttentionImpl):
             )
         return topk_indices.contiguous()
 
-    def _get_first_decode_dump_location(self, layer_name: str) -> tuple[int, int] | None:
-        if (
-            not envs.VLLM_ASCEND_SFA_DUMP_DIR
-            or self._sfa_decode_debug_dumped
-            or get_forward_context().capturing
-        ):
-            return None
-
+    def _parse_dump_layer_id(self, layer_name: str) -> int | None:
         layer_match = re.search(r"(?:^|\.)layers\.(\d+)(?:\.|$)", layer_name)
         if layer_match is None:
             return None
-        layer_id = int(layer_match.group(1))
-        if layer_id != envs.VLLM_ASCEND_SFA_DUMP_LAYER:
+        return int(layer_match.group(1))
+
+    def _resolve_decode_dump_location(self, layer_name: str) -> tuple[int, int] | None:
+        """Return (layer_id, rank) when this call should dump decode op tensors."""
+        if not envs.VLLM_ASCEND_SFA_DUMP_DIR or get_forward_context().capturing:
+            return None
+        # Only TP rank 0 writes dumps to avoid duplicate I/O under TP.
+        if self.tp_rank != 0:
             return None
 
-        rank = self.tp_rank
-        if torch.distributed.is_available() and torch.distributed.is_initialized():
-            rank = torch.distributed.get_rank()
-        return layer_id, rank
+        layer_id = self._parse_dump_layer_id(layer_name)
+        if layer_id is None or layer_id not in envs.VLLM_ASCEND_SFA_DUMP_LAYER:
+            return None
+        if self._sfa_decode_dump_step_idx not in envs.VLLM_ASCEND_SFA_DUMP_STEP:
+            return None
+        return layer_id, 0
+
+    def _maybe_advance_decode_dump_step(self, layer_name: str) -> None:
+        """Advance the per-layer decode-step counter after one decode op pass."""
+        if not envs.VLLM_ASCEND_SFA_DUMP_DIR or get_forward_context().capturing:
+            return
+        if self.tp_rank != 0:
+            return
+        layer_id = self._parse_dump_layer_id(layer_name)
+        if layer_id is None or layer_id not in envs.VLLM_ASCEND_SFA_DUMP_LAYER:
+            return
+        self._sfa_decode_dump_step_idx += 1
 
     def _maybe_dump_first_decode_op_inputs(
         self,
@@ -1740,10 +1753,11 @@ class AscendSFAImpl(MLAAttentionImpl):
         op_name: str,
         inputs: dict[str, Any],
     ) -> None:
-        dump_location = self._get_first_decode_dump_location(layer_name)
+        dump_location = self._resolve_decode_dump_location(layer_name)
         if dump_location is None:
             return
         layer_id, rank = dump_location
+        step = self._sfa_decode_dump_step_idx
         output = dump_op_inputs(
             envs.VLLM_ASCEND_SFA_DUMP_DIR,
             mode=mode,
@@ -1753,11 +1767,13 @@ class AscendSFAImpl(MLAAttentionImpl):
             inputs=inputs,
             rank=rank,
             pid=os.getpid(),
+            step=step,
         )
         logger.warning(
-            "[sfa_decode_dump] saved %s op inputs layer=%s path=%s",
+            "[sfa_decode_dump] saved %s op inputs layer=%s step=%s path=%s",
             mode,
             layer_name,
+            step,
             output,
         )
 
@@ -1769,27 +1785,31 @@ class AscendSFAImpl(MLAAttentionImpl):
         op_name: str,
         output: torch.Tensor,
     ) -> None:
-        dump_location = self._get_first_decode_dump_location(layer_name)
-        if dump_location is None:
-            return
-        layer_id, rank = dump_location
-        output_path = dump_op_output(
-            envs.VLLM_ASCEND_SFA_DUMP_DIR,
-            mode=mode,
-            layer_name=layer_name,
-            layer_id=layer_id,
-            op_name=op_name,
-            output=output,
-            rank=rank,
-            pid=os.getpid(),
-        )
-        self._sfa_decode_debug_dumped = True
-        logger.warning(
-            "[sfa_decode_dump] saved %s op output layer=%s path=%s",
-            mode,
-            layer_name,
-            output_path,
-        )
+        dump_location = self._resolve_decode_dump_location(layer_name)
+        if dump_location is not None:
+            layer_id, rank = dump_location
+            step = self._sfa_decode_dump_step_idx
+            output_path = dump_op_output(
+                envs.VLLM_ASCEND_SFA_DUMP_DIR,
+                mode=mode,
+                layer_name=layer_name,
+                layer_id=layer_id,
+                op_name=op_name,
+                output=output,
+                rank=rank,
+                pid=os.getpid(),
+                step=step,
+            )
+            logger.warning(
+                "[sfa_decode_dump] saved %s op output layer=%s step=%s path=%s",
+                mode,
+                layer_name,
+                step,
+                output_path,
+            )
+        # Count every decode pass on selected layers so DUMP_STEP can target
+        # later steps even when this call did not dump.
+        self._maybe_advance_decode_dump_step(layer_name)
 
     def _flatten_selection_buffer(
         self,

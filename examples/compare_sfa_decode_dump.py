@@ -2,10 +2,15 @@
 """Compare fused_overlap vs no-offload SFA decode operator dumps.
 
 Usage:
+  # dump with:
+  #   VLLM_ASCEND_SFA_DUMP_DIR=/tmp/sfa-dump
+  #   VLLM_ASCEND_SFA_DUMP_LAYER=0,58   # comma-separated layers; TP rank 0 only
+  #   VLLM_ASCEND_SFA_DUMP_STEP=0,2,5   # comma-separated zero-based decode steps
+
   # explicit paths
   python examples/compare_sfa_decode_dump.py \\
-      --fused /tmp/sfa-dump/sfa_fused_inputs_layer0_rank0_pid123.pt \\
-      --sfa   /tmp/sfa-dump/sfa_sfa_inputs_layer0_rank0_pid456.pt
+      --fused /tmp/sfa-dump/sfa_fused_inputs_layer0_step0_rank0_pid123.pt \\
+      --sfa   /tmp/sfa-dump/sfa_sfa_inputs_layer0_step0_rank0_pid456.pt
 
   # auto-pick the newest fused/sfa dump in a directory
   python examples/compare_sfa_decode_dump.py --dump-dir /tmp/sfa-dump
