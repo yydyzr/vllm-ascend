@@ -2024,58 +2024,6 @@ class AscendSFAImpl(MLAAttentionImpl):
                 full_q_actual_seq.detach().cpu().tolist(),
             )
 
-    def _flatten_fused_overlap_mtp_to_token_batch(
-        self,
-        attn_metadata: M,
-        *,
-        num_tokens: int,
-        num_reqs: int,
-        full_q_actual_seq: torch.Tensor,
-        full_kv_actual_seq: torch.Tensor,
-        full_kv_block_table: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Flatten MTP req-batch TND meta into 1-token-per-batch meta.
-
-        Fused overlap is validated for actS1=1 (ordinary decode). MTP keeps
-        query/topk as ``[T, ...]`` but expands B from ``num_reqs`` to
-        ``num_tokens`` so each query token is its own TND batch with actS1=1,
-        matching the known-good non-MTP path. Causal visibility for token
-        ``local`` in a request is ``seq_len - q_len + local + 1``.
-        """
-        assert attn_metadata.token_to_req is not None
-        device = full_q_actual_seq.device
-        token_to_req = attn_metadata.token_to_req[:num_tokens].to(device=device, dtype=torch.long)
-        req_cum_q = full_q_actual_seq.to(device=device, dtype=torch.long)
-        req_seq_lens = full_kv_actual_seq.to(device=device, dtype=torch.long)
-        req_q_lens = torch.diff(req_cum_q, prepend=req_cum_q.new_zeros(1))
-        token_starts = torch.zeros(num_reqs, dtype=torch.long, device=device)
-        if num_reqs > 1:
-            token_starts[1:] = req_cum_q[:-1]
-        local_offsets = torch.arange(num_tokens, device=device, dtype=torch.long) - token_starts[token_to_req]
-        # Per-token KV visible length under sparse_mode=3 with actS1=1.
-        token_kv_lens = (
-            req_seq_lens[token_to_req] - req_q_lens[token_to_req] + local_offsets + 1
-        ).to(dtype=torch.int32)
-        if not get_forward_context().capturing:
-            if bool((token_kv_lens <= 0).any().item()):
-                raise RuntimeError(
-                    "fused_overlap MTP flatten produced non-positive per-token kv lens: "
-                    f"token_kv_lens={token_kv_lens.detach().cpu().tolist()} "
-                    f"req_seq_lens={req_seq_lens.detach().cpu().tolist()} "
-                    f"req_q_lens={req_q_lens.detach().cpu().tolist()}"
-                )
-        token_q_cum = torch.arange(1, num_tokens + 1, device=device, dtype=torch.int32)
-        token_block_table = full_kv_block_table[token_to_req]
-        if envs.VLLM_ASCEND_SFA_DEBUG and not get_forward_context().capturing:
-            logger.info(
-                "[fused_overlap_offload][mtp] flatten to token-batch "
-                "num_tokens=%s num_reqs=%s token_kv_lens=%s",
-                num_tokens,
-                num_reqs,
-                token_kv_lens.detach().cpu().tolist(),
-            )
-        return token_q_cum, token_kv_lens, token_block_table
-
     def _execute_fused_overlap_offload_decode(
         self,
         ql_nope_decode: torch.Tensor,
@@ -2140,18 +2088,21 @@ class AscendSFAImpl(MLAAttentionImpl):
             full_q_actual_seq=full_q_actual_seq,
             full_kv_actual_seq=full_kv_actual_seq,
         )
-        # MTP: fused overlap is stable for actS1=1. Expand req-batch TND meta
-        # into token-batch meta so each query token is one TND batch.
-        if num_tokens != num_reqs:
-            full_q_actual_seq, full_kv_actual_seq, full_kv_block_table = (
-                self._flatten_fused_overlap_mtp_to_token_batch(
-                    attn_metadata,
-                    num_tokens=num_tokens,
-                    num_reqs=num_reqs,
-                    full_q_actual_seq=full_q_actual_seq,
-                    full_kv_actual_seq=full_kv_actual_seq,
-                    full_kv_block_table=full_kv_block_table,
-                )
+        # TND batch B is num_reqs: keep req-level cum_q / seq_lens / block_table.
+        # Do not expand to token-batch; the C++ adapter must not replace cum_q
+        # with ones(num_tokens), or B becomes T while KV actual_seq stays R.
+        if full_q_actual_seq.numel() != full_kv_actual_seq.numel():
+            raise RuntimeError(
+                "fused_overlap Q/KV actual_seq batch mismatch: "
+                f"full_q_actual_seq.numel()={full_q_actual_seq.numel()} "
+                f"full_kv_actual_seq.numel()={full_kv_actual_seq.numel()} "
+                f"num_tokens={num_tokens} num_reqs={num_reqs}"
+            )
+        if full_kv_block_table.shape[0] != full_q_actual_seq.numel():
+            raise RuntimeError(
+                "fused_overlap full_kv_block_table batch mismatch: "
+                f"block_table.shape[0]={full_kv_block_table.shape[0]} "
+                f"full_q_actual_seq.numel()={full_q_actual_seq.numel()}"
             )
 
         row_count = num_tokens * topk_head_count

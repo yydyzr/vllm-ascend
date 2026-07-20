@@ -132,6 +132,16 @@ inline at::Tensor RunFusedSparseAttentionOverlapSideEffectSplit(
     at::Tensor value = key;
     at::Tensor actual_seq_query = BuildActualSeqQueryForSfa(full_q_actual_seq, bsz_seq, selection_topk_indices);
     at::Tensor actual_seq_kv = full_kv_actual_seq.contiguous();
+    TORCH_CHECK(
+        actual_seq_kv.numel() == actual_seq_query.numel(),
+        "full_kv_actual_seq numel (", actual_seq_kv.numel(),
+        ") must equal full_q_actual_seq numel (", actual_seq_query.numel(),
+        ") for fused sparse attention overlap; if Q was expanded to ones(num_tokens), "
+        "rebuild the C++ extension so TND cum_query_lens(length=num_reqs) is preserved");
+    TORCH_CHECK(
+        full_kv_block_table.size(0) == actual_seq_query.numel(),
+        "full_kv_block_table batch (", full_kv_block_table.size(0),
+        ") must equal full_q_actual_seq numel (", actual_seq_query.numel(), ")");
     at::Tensor sfa_output = at::empty(query_nope.sizes(), query_nope.options().dtype(query_nope.dtype()));
 
     c10::optional<at::Tensor> block_table_opt = full_kv_block_table;

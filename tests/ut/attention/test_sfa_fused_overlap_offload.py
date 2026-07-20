@@ -122,7 +122,7 @@ def test_fused_overlap_decode_uses_cpu_full_kv_and_reused_selection_buffers(capt
 
 
 def test_fused_overlap_decode_supports_mtp_multi_token_per_req():
-    """MTP is flattened to 1-token-per-batch meta for the fused op."""
+    """MTP/SpecDecoding keeps req-level TND meta (B=num_reqs)."""
     impl = _make_impl()
     # 2 requests × 2 query tokens (1 accepted + 1 draft each)
     num_tokens, num_reqs = 4, 2
@@ -176,47 +176,19 @@ def test_fused_overlap_decode_supports_mtp_multi_token_per_req():
     assert captured["selection_topk_indices"].shape == (num_tokens, 1, 4)
     assert captured["selection_kv_block_table"].shape == (num_tokens, 1)
     assert captured["selection_kv_block_status"].shape == (num_tokens, 1, 5)
-    # Flattened: one block-table row per query token.
-    assert captured["full_kv_block_table"].shape == (num_tokens, 2)
+    assert captured["full_kv_block_table"].shape == (num_reqs, 2)
     assert captured["layout_query"] == "TND"
     torch.testing.assert_close(
         captured["full_q_actual_seq"],
-        torch.tensor([1, 2, 3, 4], dtype=torch.int32),
+        torch.tensor([2, 4], dtype=torch.int32),
     )
     torch.testing.assert_close(
         captured["full_kv_actual_seq"],
-        torch.tensor([7, 8, 9, 10], dtype=torch.int32),
-    )
-    torch.testing.assert_close(
-        captured["full_kv_block_table"],
-        torch.tensor([[0, 1], [0, 1], [2, 3], [2, 3]], dtype=torch.int32),
+        torch.tensor([8, 10], dtype=torch.int32),
     )
     torch.testing.assert_close(
         impl.fused_overlap_last_req_ids[:num_tokens],
         torch.tensor([11, 11, 22, 22], dtype=torch.int64),
-    )
-
-
-def test_flatten_fused_overlap_mtp_to_token_batch():
-    impl = _make_impl()
-    metadata = SimpleNamespace(token_to_req=torch.tensor([0, 0, 1, 1], dtype=torch.int32))
-    with patch(
-        "vllm_ascend.attention.sfa_v1.get_forward_context",
-        return_value=SimpleNamespace(capturing=False),
-    ):
-        q_cum, kv_lens, block_table = impl._flatten_fused_overlap_mtp_to_token_batch(
-            metadata,
-            num_tokens=4,
-            num_reqs=2,
-            full_q_actual_seq=torch.tensor([2, 4], dtype=torch.int32),
-            full_kv_actual_seq=torch.tensor([8, 10], dtype=torch.int32),
-            full_kv_block_table=torch.tensor([[0, 1], [2, 3]], dtype=torch.int32),
-        )
-    torch.testing.assert_close(q_cum, torch.tensor([1, 2, 3, 4], dtype=torch.int32))
-    torch.testing.assert_close(kv_lens, torch.tensor([7, 8, 9, 10], dtype=torch.int32))
-    torch.testing.assert_close(
-        block_table,
-        torch.tensor([[0, 1], [0, 1], [2, 3], [2, 3]], dtype=torch.int32),
     )
 
 
