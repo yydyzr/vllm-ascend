@@ -1923,13 +1923,39 @@ class AscendSFAImpl(MLAAttentionImpl):
         selection_kv_block_status.masked_fill_(changed_rows.view(num_tokens, 1, 1), -1)
         last_req_ids.copy_(current_req_ids)
 
+        # Selection status stores absolute topk token indices. History hits can
+        # still be reused under MTP; only entries that fall in this step's
+        # rewritten window must be cleared. That window is exactly the current
+        # query span [seq_len - q_len, seq_len), which covers newly written
+        # tokens and spec-reject rewrites. The trailing status slot is
+        # actual_seq metadata, not a topk index.
+        seq_lens = attn_metadata.seq_lens[:num_reqs].to(
+            device=selection_kv_block_status.device, dtype=torch.long
+        )
+        cum_query_lens = attn_metadata.cum_query_lens[:num_reqs].to(
+            device=selection_kv_block_status.device, dtype=torch.long
+        )
+        query_lens = torch.diff(cum_query_lens, prepend=cum_query_lens.new_zeros(1))
+        rewrite_start = (seq_lens - query_lens)[token_to_req].view(num_tokens, 1, 1)
+        rewrite_end = seq_lens[token_to_req].view(num_tokens, 1, 1)
+        topk_status = selection_kv_block_status[..., :-1]
+        rewritten_hits = (
+            (topk_status >= 0)
+            & (topk_status >= rewrite_start)
+            & (topk_status < rewrite_end)
+        )
+        topk_status.masked_fill_(rewritten_hits, -1)
+
         if envs.VLLM_ASCEND_SFA_DEBUG and not get_forward_context().capturing:
             changed_count = int(changed_rows.sum().item())
+            rewritten_count = int(rewritten_hits.sum().item())
             logger.info(
-                "[fused_overlap_offload][selection][debug] num_tokens=%s num_reqs=%s changed_rows=%s",
+                "[fused_overlap_offload][selection][debug] num_tokens=%s num_reqs=%s "
+                "changed_rows=%s rewritten_topk_hits=%s",
                 num_tokens,
                 num_reqs,
                 changed_count,
+                rewritten_count,
             )
 
     def _validate_fused_overlap_mtp_decode_metadata(
@@ -1998,6 +2024,58 @@ class AscendSFAImpl(MLAAttentionImpl):
                 full_q_actual_seq.detach().cpu().tolist(),
             )
 
+    def _flatten_fused_overlap_mtp_to_token_batch(
+        self,
+        attn_metadata: M,
+        *,
+        num_tokens: int,
+        num_reqs: int,
+        full_q_actual_seq: torch.Tensor,
+        full_kv_actual_seq: torch.Tensor,
+        full_kv_block_table: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Flatten MTP req-batch TND meta into 1-token-per-batch meta.
+
+        Fused overlap is validated for actS1=1 (ordinary decode). MTP keeps
+        query/topk as ``[T, ...]`` but expands B from ``num_reqs`` to
+        ``num_tokens`` so each query token is its own TND batch with actS1=1,
+        matching the known-good non-MTP path. Causal visibility for token
+        ``local`` in a request is ``seq_len - q_len + local + 1``.
+        """
+        assert attn_metadata.token_to_req is not None
+        device = full_q_actual_seq.device
+        token_to_req = attn_metadata.token_to_req[:num_tokens].to(device=device, dtype=torch.long)
+        req_cum_q = full_q_actual_seq.to(device=device, dtype=torch.long)
+        req_seq_lens = full_kv_actual_seq.to(device=device, dtype=torch.long)
+        req_q_lens = torch.diff(req_cum_q, prepend=req_cum_q.new_zeros(1))
+        token_starts = torch.zeros(num_reqs, dtype=torch.long, device=device)
+        if num_reqs > 1:
+            token_starts[1:] = req_cum_q[:-1]
+        local_offsets = torch.arange(num_tokens, device=device, dtype=torch.long) - token_starts[token_to_req]
+        # Per-token KV visible length under sparse_mode=3 with actS1=1.
+        token_kv_lens = (
+            req_seq_lens[token_to_req] - req_q_lens[token_to_req] + local_offsets + 1
+        ).to(dtype=torch.int32)
+        if not get_forward_context().capturing:
+            if bool((token_kv_lens <= 0).any().item()):
+                raise RuntimeError(
+                    "fused_overlap MTP flatten produced non-positive per-token kv lens: "
+                    f"token_kv_lens={token_kv_lens.detach().cpu().tolist()} "
+                    f"req_seq_lens={req_seq_lens.detach().cpu().tolist()} "
+                    f"req_q_lens={req_q_lens.detach().cpu().tolist()}"
+                )
+        token_q_cum = torch.arange(1, num_tokens + 1, device=device, dtype=torch.int32)
+        token_block_table = full_kv_block_table[token_to_req]
+        if envs.VLLM_ASCEND_SFA_DEBUG and not get_forward_context().capturing:
+            logger.info(
+                "[fused_overlap_offload][mtp] flatten to token-batch "
+                "num_tokens=%s num_reqs=%s token_kv_lens=%s",
+                num_tokens,
+                num_reqs,
+                token_kv_lens.detach().cpu().tolist(),
+            )
+        return token_q_cum, token_kv_lens, token_block_table
+
     def _execute_fused_overlap_offload_decode(
         self,
         ql_nope_decode: torch.Tensor,
@@ -2062,6 +2140,19 @@ class AscendSFAImpl(MLAAttentionImpl):
             full_q_actual_seq=full_q_actual_seq,
             full_kv_actual_seq=full_kv_actual_seq,
         )
+        # MTP: fused overlap is stable for actS1=1. Expand req-batch TND meta
+        # into token-batch meta so each query token is one TND batch.
+        if num_tokens != num_reqs:
+            full_q_actual_seq, full_kv_actual_seq, full_kv_block_table = (
+                self._flatten_fused_overlap_mtp_to_token_batch(
+                    attn_metadata,
+                    num_tokens=num_tokens,
+                    num_reqs=num_reqs,
+                    full_q_actual_seq=full_q_actual_seq,
+                    full_kv_actual_seq=full_kv_actual_seq,
+                    full_kv_block_table=full_kv_block_table,
+                )
+            )
 
         row_count = num_tokens * topk_head_count
         selection_kv_cache = self._flatten_selection_buffer(

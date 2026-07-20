@@ -68,6 +68,8 @@ def test_fused_overlap_decode_uses_cpu_full_kv_and_reused_selection_buffers(capt
         slot_mapping=torch.tensor([0, 1], dtype=torch.int64),
         token_to_req=torch.tensor([0, 1], dtype=torch.int32),
         req_ids_tensor=torch.tensor([101, 202], dtype=torch.int64),
+        seq_lens=torch.tensor([4, 4], dtype=torch.int32),
+        cum_query_lens=torch.tensor([1, 2], dtype=torch.int32),
     )
     captured = {}
 
@@ -120,7 +122,7 @@ def test_fused_overlap_decode_uses_cpu_full_kv_and_reused_selection_buffers(capt
 
 
 def test_fused_overlap_decode_supports_mtp_multi_token_per_req():
-    """MTP/SpecDecoding: num_tokens != num_reqs uses TND + token_to_req."""
+    """MTP is flattened to 1-token-per-batch meta for the fused op."""
     impl = _make_impl()
     # 2 requests × 2 query tokens (1 accepted + 1 draft each)
     num_tokens, num_reqs = 4, 2
@@ -137,6 +139,8 @@ def test_fused_overlap_decode_supports_mtp_multi_token_per_req():
         num_decodes=num_reqs,
         token_to_req=torch.tensor([0, 0, 1, 1], dtype=torch.int32),
         req_ids_tensor=torch.tensor([11, 22], dtype=torch.int64),
+        seq_lens=torch.tensor([8, 10], dtype=torch.int32),
+        cum_query_lens=torch.tensor([2, 4], dtype=torch.int32),
     )
     captured = {}
 
@@ -172,15 +176,47 @@ def test_fused_overlap_decode_supports_mtp_multi_token_per_req():
     assert captured["selection_topk_indices"].shape == (num_tokens, 1, 4)
     assert captured["selection_kv_block_table"].shape == (num_tokens, 1)
     assert captured["selection_kv_block_status"].shape == (num_tokens, 1, 5)
-    assert captured["full_kv_block_table"].shape == (num_reqs, 2)
+    # Flattened: one block-table row per query token.
+    assert captured["full_kv_block_table"].shape == (num_tokens, 2)
     assert captured["layout_query"] == "TND"
     torch.testing.assert_close(
         captured["full_q_actual_seq"],
-        torch.tensor([2, 4], dtype=torch.int32),
+        torch.tensor([1, 2, 3, 4], dtype=torch.int32),
+    )
+    torch.testing.assert_close(
+        captured["full_kv_actual_seq"],
+        torch.tensor([7, 8, 9, 10], dtype=torch.int32),
+    )
+    torch.testing.assert_close(
+        captured["full_kv_block_table"],
+        torch.tensor([[0, 1], [0, 1], [2, 3], [2, 3]], dtype=torch.int32),
     )
     torch.testing.assert_close(
         impl.fused_overlap_last_req_ids[:num_tokens],
         torch.tensor([11, 11, 22, 22], dtype=torch.int64),
+    )
+
+
+def test_flatten_fused_overlap_mtp_to_token_batch():
+    impl = _make_impl()
+    metadata = SimpleNamespace(token_to_req=torch.tensor([0, 0, 1, 1], dtype=torch.int32))
+    with patch(
+        "vllm_ascend.attention.sfa_v1.get_forward_context",
+        return_value=SimpleNamespace(capturing=False),
+    ):
+        q_cum, kv_lens, block_table = impl._flatten_fused_overlap_mtp_to_token_batch(
+            metadata,
+            num_tokens=4,
+            num_reqs=2,
+            full_q_actual_seq=torch.tensor([2, 4], dtype=torch.int32),
+            full_kv_actual_seq=torch.tensor([8, 10], dtype=torch.int32),
+            full_kv_block_table=torch.tensor([[0, 1], [2, 3]], dtype=torch.int32),
+        )
+    torch.testing.assert_close(q_cum, torch.tensor([1, 2, 3, 4], dtype=torch.int32))
+    torch.testing.assert_close(kv_lens, torch.tensor([7, 8, 9, 10], dtype=torch.int32))
+    torch.testing.assert_close(
+        block_table,
+        torch.tensor([[0, 1], [0, 1], [2, 3], [2, 3]], dtype=torch.int32),
     )
 
 
@@ -303,14 +339,26 @@ def test_fused_overlap_selection_state_reuses_fixed_storage():
     assert second[0].shape == (1, 1)
 
 
-def test_fused_overlap_selection_invalidation_keeps_same_req_multi_token_rows():
-    """Same request on multiple MTP rows should not invalidate those rows."""
+def test_fused_overlap_selection_invalidation_clears_rewritten_topk_only():
+    """MTP may reuse history hits; only topk indices in the rewrite window clear."""
     impl = _make_impl()
-    status = torch.arange(20, dtype=torch.int32).reshape(4, 1, 5)
+    # topk=4, trailing slot is actual_seq metadata (not a token index).
+    # req0 window [8, 10), req1 window [18, 20)
+    status = torch.tensor(
+        [
+            [[5, 8, 9, 100, 4]],
+            [[3, 7, 8, 11, 4]],
+            [[1, 18, 19, 30, 4]],
+            [[0, 17, 20, 40, 4]],
+        ],
+        dtype=torch.int32,
+    )
     last_req_ids = torch.tensor([10, 10, 20, 20], dtype=torch.int64)
     metadata = SimpleNamespace(
         token_to_req=torch.tensor([0, 0, 1, 1], dtype=torch.int32),
         req_ids_tensor=torch.tensor([10, 20], dtype=torch.int64),
+        seq_lens=torch.tensor([10, 20], dtype=torch.int32),
+        cum_query_lens=torch.tensor([2, 4], dtype=torch.int32),
     )
 
     with patch(
@@ -325,21 +373,32 @@ def test_fused_overlap_selection_invalidation_keeps_same_req_multi_token_rows():
             num_reqs=2,
         )
 
-    # No request identity change → selection status kept for hit reuse.
     torch.testing.assert_close(
         status,
-        torch.arange(20, dtype=torch.int32).reshape(4, 1, 5),
+        torch.tensor(
+            [
+                [[5, -1, -1, 100, 4]],
+                [[3, 7, -1, 11, 4]],
+                [[1, -1, -1, 30, 4]],
+                [[0, 17, 20, 40, 4]],
+            ],
+            dtype=torch.int32,
+        ),
     )
     torch.testing.assert_close(last_req_ids, torch.tensor([10, 10, 20, 20], dtype=torch.int64))
 
 
-def test_fused_overlap_selection_invalidation_uses_req_ids_not_row_position():
+def test_fused_overlap_selection_invalidation_keeps_same_req_one_token_decode():
+    """Ordinary 1-token decode may keep selection hits outside the rewrite window."""
     impl = _make_impl()
-    status = torch.zeros((3, 1, 5), dtype=torch.int32)
-    last_req_ids = torch.tensor([10, 20, 30], dtype=torch.int64)
+    status = torch.tensor([[[1, 2, 3, 4, 1]], [[5, 6, 7, 8, 1]]], dtype=torch.int32)
+    last_req_ids = torch.tensor([10, 20], dtype=torch.int64)
     metadata = SimpleNamespace(
-        token_to_req=torch.tensor([0, 1, 0], dtype=torch.int32),
-        req_ids_tensor=torch.tensor([10, 99], dtype=torch.int64),
+        token_to_req=torch.tensor([0, 1], dtype=torch.int32),
+        req_ids_tensor=torch.tensor([10, 20], dtype=torch.int64),
+        # windows [99, 100) and [199, 200) — none of the cached hits overlap
+        seq_lens=torch.tensor([100, 200], dtype=torch.int32),
+        cum_query_lens=torch.tensor([1, 2], dtype=torch.int32),
     )
 
     with patch(
@@ -350,14 +409,44 @@ def test_fused_overlap_selection_invalidation_uses_req_ids_not_row_position():
             status,
             last_req_ids,
             metadata,
-            num_tokens=3,
+            num_tokens=2,
+            num_reqs=2,
+        )
+
+    torch.testing.assert_close(
+        status,
+        torch.tensor([[[1, 2, 3, 4, 1]], [[5, 6, 7, 8, 1]]], dtype=torch.int32),
+    )
+    torch.testing.assert_close(last_req_ids, torch.tensor([10, 20], dtype=torch.int64))
+
+
+def test_fused_overlap_selection_invalidation_uses_req_ids_not_row_position():
+    """1-token decode: invalidate only rows whose request identity changed."""
+    impl = _make_impl()
+    status = torch.zeros((2, 1, 5), dtype=torch.int32)
+    last_req_ids = torch.tensor([10, 20], dtype=torch.int64)
+    metadata = SimpleNamespace(
+        token_to_req=torch.tensor([0, 1], dtype=torch.int32),
+        req_ids_tensor=torch.tensor([10, 99], dtype=torch.int64),
+        seq_lens=torch.tensor([10, 20], dtype=torch.int32),
+        cum_query_lens=torch.tensor([1, 2], dtype=torch.int32),
+    )
+
+    with patch(
+        "vllm_ascend.attention.sfa_v1.get_forward_context",
+        return_value=SimpleNamespace(capturing=False),
+    ):
+        impl._invalidate_fused_overlap_selection_rows(
+            status,
+            last_req_ids,
+            metadata,
+            num_tokens=2,
             num_reqs=2,
         )
 
     torch.testing.assert_close(status[0], torch.zeros((1, 5), dtype=torch.int32))
     torch.testing.assert_close(status[1], torch.full((1, 5), -1, dtype=torch.int32))
-    torch.testing.assert_close(status[2], torch.full((1, 5), -1, dtype=torch.int32))
-    torch.testing.assert_close(last_req_ids, torch.tensor([10, 99, 10], dtype=torch.int64))
+    torch.testing.assert_close(last_req_ids, torch.tensor([10, 99], dtype=torch.int64))
 
 
 def test_fused_overlap_selection_invalidation_rejects_out_of_range_token_to_req():
