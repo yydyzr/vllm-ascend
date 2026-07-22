@@ -25,7 +25,7 @@ def _fake_memfabric(raw_engine: MagicMock) -> ModuleType:
 
 def test_memfabric_initialization_publishes_session_from_engine_port():
     raw_engine = MagicMock()
-    raw_engine.get_rpc_port.return_value = 23456
+    raw_engine.get_rpc_port.return_value = "10.0.0.8:23456_991"
     raw_engine.initialize.return_value = 0
     module = _fake_memfabric(raw_engine)
     manager = GlobalMemfabricTE()
@@ -39,22 +39,36 @@ def test_memfabric_initialization_publishes_session_from_engine_port():
     module.set_log_level.assert_called_once_with(2)
     module.set_conf_store_tls.assert_called_once_with(False, "")
     raw_engine.initialize.assert_called_once_with(
-        "tcp://192.168.1.10",
-        "192.168.1.10",
+        "tcp://192.168.1.10:23456",
+        "192.168.1.10:23456",
         MEMFABRIC_ROLE_PREFILL,
         3,
         store_server_role=MEMFABRIC_ROLE_PREFILL,
     )
     assert raw_engine.method_calls[:2] == [
+        call.get_rpc_port(),
         call.initialize(
-            "tcp://192.168.1.10",
-            "192.168.1.10",
+            "tcp://192.168.1.10:23456",
+            "192.168.1.10:23456",
             MEMFABRIC_ROLE_PREFILL,
             3,
             store_server_role=MEMFABRIC_ROLE_PREFILL,
         ),
-        call.get_rpc_port(),
     ]
+
+
+@pytest.mark.parametrize(
+    ("endpoint", "expected"),
+    [(12345, 12345), ("127.0.0.1:23456", 23456), ("10.0.0.1:34567_8", 34567)],
+)
+def test_memfabric_rpc_port_parsing(endpoint, expected):
+    assert GlobalMemfabricTE._parse_rpc_port(endpoint) == expected
+
+
+@pytest.mark.parametrize("endpoint", ["invalid", 0, 65536])
+def test_memfabric_rejects_invalid_rpc_port(endpoint):
+    with pytest.raises(RuntimeError, match="invalid RPC"):
+        GlobalMemfabricTE._parse_rpc_port(endpoint)
 
 
 def test_memfabric_configuration_is_idempotent_but_role_bound():
