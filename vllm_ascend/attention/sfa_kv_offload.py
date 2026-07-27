@@ -145,6 +145,13 @@ class AscendSFAKVOffloadMetadataBuilder(AscendSFAMetadataBuilder):
 class AscendSFAKVOffloadImpl(AscendSFAImpl):
     """SFA implementation that routes main MLA K/V through the CPU pool."""
 
+    # Process-wide selection hit stats for VLLM_ASCEND_SFA_DEBUG.
+    # Each Attention layer has its own impl instance; these class counters accumulate
+    # across layers so consecutive log lines in one forward show growing totals.
+    _fused_overlap_hit_global_hits = 0
+    _fused_overlap_hit_global_valid = 0
+    _fused_overlap_hit_global_calls = 0
+
     def __init__(
         self,
         num_heads: int,
@@ -215,7 +222,7 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
         self._fused_overlap_selection_capacity: tuple[int, int, int, int] | None = None
         self._fused_overlap_decode_logged = False
         self._sfa_decode_dump_step_idx = 0
-        # Cumulative selection hit stats for VLLM_ASCEND_SFA_DEBUG (eager only).
+        # Per-layer lifetime selection hit stats for VLLM_ASCEND_SFA_DEBUG.
         self._fused_overlap_hit_total_hits = 0
         self._fused_overlap_hit_total_valid = 0
         self._fused_overlap_hit_num_steps = 0
@@ -725,6 +732,13 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
                 int(oob_hits.sum().item()),
             )
 
+    @classmethod
+    def _reset_fused_overlap_selection_hit_stats(cls) -> None:
+        """Reset process-wide hit counters (tests / explicit debug restarts)."""
+        cls._fused_overlap_hit_global_hits = 0
+        cls._fused_overlap_hit_global_valid = 0
+        cls._fused_overlap_hit_global_calls = 0
+
     def _maybe_log_fused_overlap_selection_hit_ratio(
         self,
         *,
@@ -737,6 +751,10 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
         A topk entry is counted as hit if its absolute token id already exists in
         that row's ``selection_kv_block_status[..., :-1]``. This matches the
         kernel's status-lookup precondition; it is not a kernel-internal counter.
+
+        ``avg_hit_ratio`` / ``total_*`` are process-wide across all layers so
+        consecutive layer lines in one forward show growing totals. ``layer_avg``
+        / ``layer_*`` are this impl instance only.
         """
         if not envs_ascend.VLLM_ASCEND_SFA_DEBUG or get_forward_context().capturing:
             return
@@ -758,24 +776,40 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
         hit_count = int(hits.sum().item())
         miss_count = valid_count - hit_count
         hit_ratio = (hit_count / valid_count) if valid_count > 0 else 0.0
+
         self._fused_overlap_hit_total_hits += hit_count
         self._fused_overlap_hit_total_valid += valid_count
         self._fused_overlap_hit_num_steps += 1
-        avg_hit_ratio = (
+        layer_avg_hit_ratio = (
             self._fused_overlap_hit_total_hits / self._fused_overlap_hit_total_valid
             if self._fused_overlap_hit_total_valid > 0
+            else 0.0
+        )
+
+        cls = type(self)
+        cls._fused_overlap_hit_global_hits += hit_count
+        cls._fused_overlap_hit_global_valid += valid_count
+        cls._fused_overlap_hit_global_calls += 1
+        avg_hit_ratio = (
+            cls._fused_overlap_hit_global_hits / cls._fused_overlap_hit_global_valid
+            if cls._fused_overlap_hit_global_valid > 0
             else 0.0
         )
         logger.info(
             "[fused_overlap_offload][selection][hit] layer=%s "
             "valid_topk=%s hit=%s miss=%s hit_ratio=%.4f avg_hit_ratio=%.4f "
-            "(steps=%s total_valid=%s total_hit=%s)",
+            "(calls=%s total_valid=%s total_hit=%s) "
+            "layer_avg=%.4f (layer_steps=%s layer_total_valid=%s layer_total_hit=%s)",
             layer_name,
             valid_count,
             hit_count,
             miss_count,
             hit_ratio,
             avg_hit_ratio,
+            cls._fused_overlap_hit_global_calls,
+            cls._fused_overlap_hit_global_valid,
+            cls._fused_overlap_hit_global_hits,
+            layer_avg_hit_ratio,
             self._fused_overlap_hit_num_steps,
             self._fused_overlap_hit_total_valid,
             self._fused_overlap_hit_total_hits,
