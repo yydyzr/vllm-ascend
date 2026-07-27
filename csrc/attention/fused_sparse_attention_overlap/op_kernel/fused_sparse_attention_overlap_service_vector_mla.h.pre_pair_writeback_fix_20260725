@@ -73,10 +73,6 @@ public:
     __aicore__ inline void MergeKv(const RunInfo &runInfo);
     __aicore__ inline int64_t GetKeyGmOffset(int64_t realS2Idx, const RunInfo &runInfo, int64_t s2IdLimit);
     __aicore__ inline int64_t GetKeyRopeGmOffset(int64_t realS2Idx, const RunInfo &runInfo, int64_t s2IdLimit);
-    __aicore__ inline bool CanUsePairedKvCopy(
-        int64_t realS2Idx1, int64_t realS2Idx2,
-        int64_t keyOffset1, int64_t keyOffset2, int64_t s2IdLimit,
-        const RunInfo &runInfo, int64_t &keySrcStride, int64_t &keyRopeSrcStride);
     __aicore__ inline void GetRealS2Idx(int64_t s2GmOffset, int64_t &realS2Idx, int64_t topkGmBaseOffset,
                                         const RunInfo &runInfo);
     __aicore__ inline int64_t GetSelectionRow(const RunInfo &runInfo);
@@ -116,22 +112,22 @@ public:
         LocalTensor<int16_t> membershipStorageLocal,
         LocalTensor<uint32_t> membershipByteOffsetLocal,
         LocalTensor<int16_t> gatheredMembershipLocal,
-        LocalTensor<int32_t> gatheredMembershipInt32Local,
         int64_t membershipBase, int32_t previousValidCount, int64_t s2IdLimit,
         bool &membershipSlotMapLoaded);
     __aicore__ inline bool IsSelectionMembershipMapReady(
         int64_t membershipBase, LocalTensor<int16_t> controlLocal);
     __aicore__ inline void ClearSelectionUpdatePlanMarker(int64_t membershipBase);
     __aicore__ inline void WriteSelectionUpdatePlan(
-        int64_t membershipBase, int32_t planCount, int32_t selectionHitCount,
-        LocalTensor<int16_t> membershipStorageLocal, int64_t planOffset,
-        bool preserveMembershipMap);
+        int64_t membershipBase, LocalTensor<int32_t> planLocal, int32_t planCount,
+        int32_t selectionHitCount, int64_t s2IdLimit,
+        LocalTensor<int16_t> membershipStorageLocal,
+        bool membershipMapLocalPreserved);
     __aicore__ inline void PublishTokenSetResidentSelectionMap(
         LocalTensor<int32_t> residentStatusLocal,
         LocalTensor<int16_t> membershipStorageLocal,
         int64_t membershipBase, int32_t validTopkNum, int64_t s2IdLimit);
     __aicore__ inline int32_t BuildDenseResidentSelectionPlan(
-        LocalTensor<int32_t> gatheredSlotLocal,
+        LocalTensor<int16_t> gatheredSlotLocal,
         LocalTensor<int32_t> insertStatusLocal,
         LocalTensor<int32_t> hitSourceLocal);
     __aicore__ inline int16_t EncodeSelectionPlanValue(int32_t planValue) const;
@@ -1036,38 +1032,6 @@ __aicore__ inline int64_t FusedSparseAttentionOverlapVectorService<FusedSparseAt
 }
 
 template <typename FusedSparseAttentionOverlapTraits>
-__aicore__ inline bool
-FusedSparseAttentionOverlapVectorService<FusedSparseAttentionOverlapTraits>::CanUsePairedKvCopy(
-    int64_t realS2Idx1, int64_t realS2Idx2,
-    int64_t keyOffset1, int64_t keyOffset2, int64_t s2IdLimit,
-    const RunInfo &runInfo, int64_t &keySrcStride, int64_t &keyRopeSrcStride)
-{
-    keySrcStride = 0;
-    keyRopeSrcStride = 0;
-    if constexpr (PAGE_ATTENTION) {
-        int64_t blockTableSrcStride =
-            ((keyOffset1 > keyOffset2 ? (keyOffset1 - keyOffset2) :
-              (keyOffset2 - keyOffset1)) - constInfo.sparseBlockSize);
-        keySrcStride = blockTableSrcStride * constInfo.headDim * sizeof(KV_T);
-        keyRopeSrcStride = blockTableSrcStride * constInfo.headDimRope * sizeof(KV_T);
-    } else {
-        int64_t keyRopeOffset1 = GetKeyRopeGmOffset(realS2Idx1, runInfo, s2IdLimit);
-        int64_t keyRopeOffset2 = GetKeyRopeGmOffset(realS2Idx2, runInfo, s2IdLimit);
-        keySrcStride = ((keyOffset1 > keyOffset2 ? (keyOffset1 - keyOffset2) :
-                         (keyOffset2 - keyOffset1)) - constInfo.sparseBlockSize) *
-                       constInfo.headDim * sizeof(KV_T);
-        keyRopeSrcStride = ((keyRopeOffset1 > keyRopeOffset2 ? (keyRopeOffset1 - keyRopeOffset2) :
-                             (keyRopeOffset2 - keyRopeOffset1)) - constInfo.sparseBlockSize) *
-                           constInfo.headDimRope * sizeof(KV_T);
-    }
-
-    return keySrcStride < INT32_MAX && keySrcStride >= 0 &&
-        (PAGE_ATTENTION || (keyRopeSrcStride < INT32_MAX && keyRopeSrcStride >= 0)) &&
-        realS2Idx1 + constInfo.sparseBlockSize < s2IdLimit &&
-        realS2Idx2 + constInfo.sparseBlockSize < s2IdLimit;
-}
-
-template <typename FusedSparseAttentionOverlapTraits>
 __aicore__ inline void
 FusedSparseAttentionOverlapVectorService<FusedSparseAttentionOverlapTraits>::CopyInSingleKv(int64_t &mte2Size, int64_t mte3Size, int64_t mergeMte3Idx, int64_t realS2Idx,
                                        int64_t keyBNBOffset, int64_t selectionTokenOffset,
@@ -1158,10 +1122,26 @@ __aicore__ inline void FusedSparseAttentionOverlapVectorService<FusedSparseAtten
 
     int64_t keySrcStride = 0;
     int64_t keyRopeSrcStride = 0;
-    bool usePairedCopy = CanUsePairedKvCopy(
-        realS2Idx1, realS2Idx2, keyOffset1, keyOffset2, s2IdLimit,
-        runInfo, keySrcStride, keyRopeSrcStride);
-    if (unlikely(!usePairedCopy)) {
+    if constexpr (PAGE_ATTENTION) {
+        int64_t blkTableSrcStride =
+        ((keyOffset1 > keyOffset2 ? (keyOffset1 - keyOffset2) :
+        (keyOffset2 - keyOffset1)) - constInfo.sparseBlockSize);
+        keySrcStride = blkTableSrcStride * constInfo.headDim * sizeof(KV_T);
+        keyRopeSrcStride = blkTableSrcStride * constInfo.headDimRope * sizeof(KV_T);
+    } else {
+        int64_t keyRopeOffset1 = GetKeyRopeGmOffset(realS2Idx1, runInfo, s2IdLimit);
+        int64_t keyRopeOffset2 = GetKeyRopeGmOffset(realS2Idx2, runInfo, s2IdLimit);
+        keySrcStride = ((keyOffset1 > keyOffset2 ? (keyOffset1 - keyOffset2) :
+                        (keyOffset2 - keyOffset1)) - constInfo.sparseBlockSize) * constInfo.headDim * sizeof(KV_T);
+        keyRopeSrcStride = ((keyRopeOffset1 > keyRopeOffset2 ? (keyRopeOffset1 - keyRopeOffset2) :
+                            (keyRopeOffset2 - keyRopeOffset1)) - constInfo.sparseBlockSize) *
+                             constInfo.headDimRope * sizeof(KV_T);
+    }
+    
+    if (unlikely(keySrcStride >= INT32_MAX || keySrcStride < 0 ||
+        (!PAGE_ATTENTION && (keyRopeSrcStride >= INT32_MAX || keyRopeSrcStride < 0)) ||
+        realS2Idx1 + constInfo.sparseBlockSize >= s2IdLimit ||
+        realS2Idx2 + constInfo.sparseBlockSize >= s2IdLimit)) {
         // stride溢出、stride为负数、s2超长等异常场景，还原�?条搬运指�?
         CopyInSingleKv(mte2Size, mte3Size, mergeMte3Idx, realS2Idx1, keyOffset1, -1, s2IdLimit, runInfo);
         CopyInSingleKv(mte2Size, mte3Size, mergeMte3Idx, realS2Idx2, keyOffset2, -1, s2IdLimit, runInfo);
@@ -1899,7 +1879,6 @@ FusedSparseAttentionOverlapVectorService<FusedSparseAttentionOverlapTraits>::IsT
     LocalTensor<int16_t> membershipStorageLocal,
     LocalTensor<uint32_t> membershipByteOffsetLocal,
     LocalTensor<int16_t> gatheredMembershipLocal,
-    LocalTensor<int32_t> gatheredMembershipInt32Local,
     int64_t membershipBase, int32_t previousValidCount, int64_t s2IdLimit,
     bool &membershipSlotMapLoaded)
 {
@@ -1941,32 +1920,39 @@ FusedSparseAttentionOverlapVectorService<FusedSparseAttentionOverlapTraits>::IsT
 
     int64_t topkBlockAlign = CeilDiv(
         static_cast<int64_t>(topkCount),
-        static_cast<int64_t>(BYTE_BLOCK / sizeof(half))) *
-        static_cast<int64_t>(BYTE_BLOCK / sizeof(half));
-    int64_t scratchOffset = mapCopyIntCount;
-    if (scratchOffset + topkBlockAlign * 2 +
-            static_cast<int64_t>(BYTE_BLOCK / sizeof(int16_t)) >
-        static_cast<int64_t>(ConstInfo::BUFFER_SIZE_BYTE_32K * 2 / sizeof(int16_t))) {
+        static_cast<int64_t>(BYTE_BLOCK / sizeof(int32_t))) *
+        static_cast<int64_t>(BYTE_BLOCK / sizeof(int32_t));
+    int64_t scratchOffset = mapCopyIntCount * sizeof(int16_t) / sizeof(int32_t);
+    if (scratchOffset + topkBlockAlign * 4 >
+        static_cast<int64_t>(ConstInfo::BUFFER_SIZE_BYTE_32K * 2 / sizeof(int32_t))) {
         return false;
     }
-    LocalTensor<half> gatheredHalfLocal =
-        membershipStorageLocal[scratchOffset].ReinterpretCast<half>();
-    LocalTensor<half> reduceResultLocal = gatheredHalfLocal[topkBlockAlign];
-    LocalTensor<half> reduceWorkLocal =
-        reduceResultLocal[BYTE_BLOCK / sizeof(half)];
-    Cast(gatheredHalfLocal, gatheredMembershipLocal, RoundMode::CAST_NONE, topkCount);
+    LocalTensor<int32_t> scratchStorageLocal = membershipStorageLocal.ReinterpretCast<int32_t>();
+    LocalTensor<float> gatheredFloat =
+        scratchStorageLocal[scratchOffset].ReinterpretCast<float>();
+    LocalTensor<float> expectedFloat =
+        scratchStorageLocal[scratchOffset + topkBlockAlign].ReinterpretCast<float>();
+    LocalTensor<float> differenceFloat =
+        scratchStorageLocal[scratchOffset + topkBlockAlign * 2].ReinterpretCast<float>();
+    LocalTensor<float> reduceWorkLocal =
+        scratchStorageLocal[scratchOffset + topkBlockAlign * 3].ReinterpretCast<float>();
+    LocalTensor<int16_t> clampedMembershipLocal =
+        membershipStorageLocal[(scratchOffset + topkBlockAlign) *
+                               sizeof(int32_t) / sizeof(int16_t)];
+    Mins(clampedMembershipLocal, gatheredMembershipLocal,
+         static_cast<int16_t>(1), topkCount);
     PipeBarrier<PIPE_V>();
-    ReduceMin(reduceResultLocal, gatheredHalfLocal, reduceWorkLocal, topkCount);
+    Cast(gatheredFloat, clampedMembershipLocal, RoundMode::CAST_ROUND, topkCount);
+    Duplicate(expectedFloat, 1.0f, topkCount);
+    PipeBarrier<PIPE_V>();
+    Sub(differenceFloat, gatheredFloat, expectedFloat, topkCount);
+    PipeBarrier<PIPE_V>();
+    Abs(differenceFloat, differenceFloat, topkCount);
+    PipeBarrier<PIPE_V>();
+    ReduceMax(gatheredFloat, differenceFloat, reduceWorkLocal, topkCount);
     SetFlag<AscendC::HardEvent::V_S>(0);
     WaitFlag<AscendC::HardEvent::V_S>(0);
-    bool allHit =
-        (reduceResultLocal.ReinterpretCast<uint16_t>().GetValue(0) & 0x8000U) == 0;
-    if (!allHit) {
-        Cast(gatheredMembershipInt32Local, gatheredHalfLocal,
-             RoundMode::CAST_RINT, topkCount);
-        PipeBarrier<PIPE_V>();
-    }
-    return allHit;
+    return gatheredFloat.GetValue(0) == 0.0f;
 }
 
 template <typename FusedSparseAttentionOverlapTraits>
@@ -2011,7 +1997,7 @@ FusedSparseAttentionOverlapVectorService<FusedSparseAttentionOverlapTraits>::Dec
 template <typename FusedSparseAttentionOverlapTraits>
 __aicore__ inline int32_t
 FusedSparseAttentionOverlapVectorService<FusedSparseAttentionOverlapTraits>::BuildDenseResidentSelectionPlan(
-    LocalTensor<int32_t> gatheredSlotLocal,
+    LocalTensor<int16_t> gatheredSlotLocal,
     LocalTensor<int32_t> insertStatusLocal,
     LocalTensor<int32_t> hitSourceLocal)
 {
@@ -2107,13 +2093,27 @@ FusedSparseAttentionOverlapVectorService<FusedSparseAttentionOverlapTraits>::Pub
 template <typename FusedSparseAttentionOverlapTraits>
 __aicore__ inline void
 FusedSparseAttentionOverlapVectorService<FusedSparseAttentionOverlapTraits>::WriteSelectionUpdatePlan(
-    int64_t membershipBase, int32_t planCount, int32_t selectionHitCount,
-    LocalTensor<int16_t> membershipStorageLocal, int64_t planOffset,
-    bool preserveMembershipMap)
+    int64_t membershipBase, LocalTensor<int32_t> planLocal, int32_t planCount,
+    int32_t selectionHitCount, int64_t s2IdLimit,
+    LocalTensor<int16_t> membershipStorageLocal,
+    bool membershipMapLocalPreserved)
 {
     if (planCount <= 0 ||
         selectionMembershipStride_ < SELECTION_MEMBERSHIP_STORAGE_INT16_COUNT) {
         return;
+    }
+
+    int64_t activeMapCount = CeilDiv(
+        s2IdLimit, static_cast<int64_t>(BYTE_BLOCK / sizeof(int16_t))) *
+        static_cast<int64_t>(BYTE_BLOCK / sizeof(int16_t));
+    bool preserveMembershipMap = membershipMapLocalPreserved &&
+        activeMapCount + planCount <= SELECTION_MEMBERSHIP_MAP_INT16_COUNT;
+    int64_t planOffset = preserveMembershipMap ? activeMapCount : 0;
+
+    for (int32_t planIdx = 0; planIdx < planCount; planIdx++) {
+        membershipStorageLocal.SetValue(
+            planOffset + planIdx,
+            EncodeSelectionPlanValue(planLocal.GetValue(planIdx)));
     }
     LocalTensor<int16_t> controlLocal =
         membershipStorageLocal[SELECTION_MEMBERSHIP_CONTROL_OFFSET_INT16_COUNT];
@@ -2180,9 +2180,6 @@ FusedSparseAttentionOverlapVectorService<FusedSparseAttentionOverlapTraits>::Pro
     LocalTensor<int16_t> gatheredMembershipLocal =
         tmpBuff1.Get<int16_t>()[statusLocalStride * 2 *
                                 sizeof(int32_t) / sizeof(int16_t)];
-    LocalTensor<int32_t> gatheredMembershipInt32Local =
-        tmpBuff1.Get<int32_t>()[statusLocalStride * 2 +
-            topkBlockAlign * sizeof(int16_t) / sizeof(int32_t)];
 
     DataCopyExtParams topkParams;
     topkParams.blockCount = 1;
@@ -2224,8 +2221,8 @@ FusedSparseAttentionOverlapVectorService<FusedSparseAttentionOverlapTraits>::Pro
     bool membershipSlotMapLoaded = false;
     bool tokenSetResidentHit = IsTokenSetResidentSelectionHit(
         currentTopkLocal, membershipStorageLocal, indexLocal,
-        gatheredMembershipLocal, gatheredMembershipInt32Local, membershipBase,
-        previousValidCount, s2IdLimit, membershipSlotMapLoaded);
+        gatheredMembershipLocal, membershipBase, previousValidCount, s2IdLimit,
+        membershipSlotMapLoaded);
     if (tokenSetResidentHit) {
         ClearSelectionUpdatePlanMarker(membershipBase);
         selectionKvActualSeqGm_.SetValue(selectionRow, previousValidCount);
@@ -2238,23 +2235,16 @@ FusedSparseAttentionOverlapVectorService<FusedSparseAttentionOverlapTraits>::Pro
         activeMapCount * static_cast<int64_t>(sizeof(int16_t)) +
             topkBlockAlign * 4 * static_cast<int64_t>(sizeof(int32_t)) <=
             static_cast<int64_t>(ConstInfo::BUFFER_SIZE_BYTE_32K * 2);
-    membershipMapLocalPreserved = membershipMapLocalPreserved &&
-        activeMapCount + topkCount <= SELECTION_MEMBERSHIP_MAP_INT16_COUNT;
-    int64_t selectionPlanLocalOffset =
-        membershipMapLocalPreserved ? activeMapCount : 0;
     int64_t selectionGroupBaseRow =
         selectionRow / static_cast<int64_t>(constInfo.kvHeadNum) *
         static_cast<int64_t>(constInfo.kvHeadNum);
     int32_t validTopkNum = membershipSlotMapLoaded ?
         BuildDenseResidentSelectionPlan(
-            gatheredMembershipInt32Local, insertStatusLocal, hitSourceLocal) :
+            gatheredMembershipLocal, insertStatusLocal, hitSourceLocal) :
         BuildSetResidentSelectionPlan(
             selectionRow, selectionGroupBaseRow, s2IdLimit,
             currentTopkLocal, residentStatusLocal, sourceStatusLocal,
             indexLocal, insertStatusLocal, hitSourceLocal, sortBufferLocal);
-    LocalTensor<int16_t> compactPlanLocal =
-        membershipStorageLocal[selectionPlanLocalOffset];
-    bool compactPlanStarted = false;
 
     bool statusDirty = previousValidCount != validTopkNum;
     int32_t updateCount = 0;
@@ -2265,11 +2255,6 @@ FusedSparseAttentionOverlapVectorService<FusedSparseAttentionOverlapTraits>::Pro
     for (int32_t topkPosition = 0; topkPosition < validTopkNum; topkPosition++) {
         int32_t planValue = hitSourceLocal.GetValue(topkPosition);
         if (planValue >= 0 && (planValue & SELECTION_PLAN_HIT_FLAG) != 0) {
-            if (compactPlanStarted) {
-                compactPlanLocal.SetValue(
-                    topkPosition,
-                    static_cast<int16_t>((planValue & SELECTION_PLAN_HIT_SLOT_MASK) + 1));
-            }
             selectionHitCount++;
             continue;
         }
@@ -2296,21 +2281,6 @@ FusedSparseAttentionOverlapVectorService<FusedSparseAttentionOverlapTraits>::Pro
         hitSourceLocal.SetValue(
             topkPosition,
             SELECTION_PLAN_UPDATE_FLAG | destinationSlot);
-        if (!compactPlanStarted && updateCount > SELECTION_SYNC_COPY_THRESHOLD) {
-            Duplicate(compactPlanLocal, SELECTION_COMPACT_PLAN_INVALID, topkCount);
-            PipeBarrier<PIPE_V>();
-            SetFlag<AscendC::HardEvent::V_S>(0);
-            WaitFlag<AscendC::HardEvent::V_S>(0);
-            for (int32_t planIdx = 0; planIdx <= topkPosition; planIdx++) {
-                compactPlanLocal.SetValue(
-                    planIdx,
-                    EncodeSelectionPlanValue(hitSourceLocal.GetValue(planIdx)));
-            }
-            compactPlanStarted = true;
-        } else if (compactPlanStarted) {
-            compactPlanLocal.SetValue(
-                topkPosition, static_cast<int16_t>(-(destinationSlot + 1)));
-        }
         if (membershipMapLocalPreserved) {
             if (staleToken >= 0 && staleToken < SELECTION_MEMBERSHIP_MAX_TOKEN) {
                 membershipStorageLocal.SetValue(staleToken, -1);
@@ -2366,8 +2336,8 @@ FusedSparseAttentionOverlapVectorService<FusedSparseAttentionOverlapTraits>::Pro
             validTopkNum, s2IdLimit);
     } else {
         WriteSelectionUpdatePlan(
-            membershipBase, static_cast<int32_t>(topkCount), selectionHitCount,
-            membershipStorageLocal, selectionPlanLocalOffset,
+            membershipBase, hitSourceLocal, static_cast<int32_t>(topkCount),
+            selectionHitCount, s2IdLimit, membershipStorageLocal,
             membershipMapLocalPreserved);
     }
     selectionKvActualSeqGm_.SetValue(selectionRow, validTopkNum);
@@ -2452,7 +2422,6 @@ __aicore__ inline void FusedSparseAttentionOverlapVectorService<FusedSparseAtten
     int64_t planCount = s2GmLimit - s2GmStartOffset;
     LocalTensor<int16_t> planLocal =
         v0ValidSizeBuff.Get<int16_t>()[SELECTION_STATUS_UB_OFFSET * sizeof(int32_t) / sizeof(int16_t)];
-    LocalTensor<uint32_t> packedPlanLocal = planLocal.ReinterpretCast<uint32_t>();
     DataCopyExtParams planParams;
     planParams.blockCount = 1;
     planParams.blockLen = static_cast<uint32_t>(planCount * sizeof(int16_t));
@@ -2479,18 +2448,9 @@ __aicore__ inline void FusedSparseAttentionOverlapVectorService<FusedSparseAtten
             s2IdLimit = runInfo.curActualSeqLenOri - runInfo.actS1Size +
                         runInfo.gS1Idx / constInfo.gSize + 1;
         }
-        int64_t cachedPackedPlanIdx = -1;
-        uint32_t cachedPackedPlanValue = 0;
         for (int64_t idx = 0; idx < writeCount; idx++) {
             int64_t planIdx = localOffset - s2GmStartOffset + idx;
-            int64_t packedPlanIdx = planIdx / 2;
-            if (packedPlanIdx != cachedPackedPlanIdx) {
-                cachedPackedPlanValue = packedPlanLocal.GetValue(packedPlanIdx);
-                cachedPackedPlanIdx = packedPlanIdx;
-            }
-            int16_t planValue = (planIdx & 1) == 0 ?
-                static_cast<int16_t>(cachedPackedPlanValue & 0xFFFFU) :
-                static_cast<int16_t>(cachedPackedPlanValue >> 16);
+            int16_t planValue = planLocal.GetValue(planIdx);
             if (!IsSelectionPlanUpdate(planValue)) {
                 continue;
             }
@@ -2503,15 +2463,8 @@ __aicore__ inline void FusedSparseAttentionOverlapVectorService<FusedSparseAtten
                 bool pairHasSelectionHit = false;
                 int64_t pairPlanIdx = pairOffset - s2GmStartOffset;
                 if (pairPlanIdx >= 0 && pairPlanIdx + 1 < planCount) {
-                    int64_t pairPackedPlanIdx = pairPlanIdx / 2;
-                    uint32_t pairPackedPlanValue =
-                        pairPackedPlanIdx == cachedPackedPlanIdx ?
-                            cachedPackedPlanValue :
-                            packedPlanLocal.GetValue(pairPackedPlanIdx);
-                    int16_t pairPlan0 =
-                        static_cast<int16_t>(pairPackedPlanValue & 0xFFFFU);
-                    int16_t pairPlan1 =
-                        static_cast<int16_t>(pairPackedPlanValue >> 16);
+                    int16_t pairPlan0 = planLocal.GetValue(pairPlanIdx);
+                    int16_t pairPlan1 = planLocal.GetValue(pairPlanIdx + 1);
                     pairHasSelectionHit = IsSelectionPlanHit(pairPlan0) ||
                         IsSelectionPlanHit(pairPlan1);
                 }
@@ -2521,13 +2474,8 @@ __aicore__ inline void FusedSparseAttentionOverlapVectorService<FusedSparseAtten
                 GetRealS2Idx(pairOffset + 1, realS2Idx1, runInfo.topKBaseOffset, runInfo);
                 int64_t keyOffset0 = GetKeyGmOffset(realS2Idx0, runInfo, s2IdLimit);
                 int64_t keyOffset1 = GetKeyGmOffset(realS2Idx1, runInfo, s2IdLimit);
-                int64_t keySrcStride = 0;
-                int64_t keyRopeSrcStride = 0;
-                bool usedPairedCopy = !pairHasSelectionHit && keyOffset0 >= 0 && keyOffset1 >= 0 &&
-                    CanUsePairedKvCopy(
-                        realS2Idx0, realS2Idx1, keyOffset0, keyOffset1, s2IdLimit,
-                        runInfo, keySrcStride, keyRopeSrcStride);
-                if (usedPairedCopy && keyOffset1 < keyOffset0) {
+                if (!pairHasSelectionHit && keyOffset0 >= 0 && keyOffset1 >= 0 &&
+                    keyOffset1 < keyOffset0) {
                     int64_t srcAbsoluteOffset = (absoluteOffset == pairOffset) ? pairOffset + 1 : pairOffset;
                     if (srcAbsoluteOffset >= localOffset && srcAbsoluteOffset < localOffset + writeCount) {
                         srcIdx = srcAbsoluteOffset - localOffset;
@@ -2812,8 +2760,6 @@ __aicore__ inline void FusedSparseAttentionOverlapVectorService<FusedSparseAtten
     int32_t cachedSelectionBlockNum = -1;
     LocalTensor<int16_t> selectionPlanLocal =
         v0ValidSizeBuff.Get<int16_t>()[SELECTION_STATUS_UB_OFFSET * sizeof(int32_t) / sizeof(int16_t)];
-    LocalTensor<uint32_t> packedSelectionPlanLocal =
-        selectionPlanLocal.ReinterpretCast<uint32_t>();
     if (useSelectionPlanSource && s2GmStartOffset < s2GmLimit) {
         int64_t logicalPlanStart =
             static_cast<int64_t>(runInfo.s2Idx) *
@@ -2843,8 +2789,6 @@ __aicore__ inline void FusedSparseAttentionOverlapVectorService<FusedSparseAtten
             WaitFlag<AscendC::HardEvent::MTE3_MTE2>(mergeMte3Idx % 2);
             needWaitMte3ToMte2 = false;
         }
-        int16_t currentPlanValue0 = SELECTION_COMPACT_PLAN_INVALID;
-        int16_t currentPlanValue1 = SELECTION_COMPACT_PLAN_INVALID;
         if (useSelectionPlanSource) {
             int64_t bufferedTokenCount = mte2Size - mte3Size;
             int64_t selectionRunLimit = 32 - bufferedTokenCount;
@@ -2853,12 +2797,9 @@ __aicore__ inline void FusedSparseAttentionOverlapVectorService<FusedSparseAtten
                 selectionRunLimit = remainingTokenCount;
             }
             int64_t localPlanStart = s2GmOffsetArray - s2GmStartOffset;
-            uint32_t packedPlanValue =
-                packedSelectionPlanLocal.GetValue(localPlanStart / 2);
-            currentPlanValue0 = static_cast<int16_t>(packedPlanValue & 0xFFFFU);
-            currentPlanValue1 = static_cast<int16_t>(packedPlanValue >> 16);
-            int32_t firstSourceSlot = IsSelectionPlanHit(currentPlanValue0) ?
-                DecodeSelectionPlanSlot(currentPlanValue0) : -1;
+            int16_t firstPlanValue = selectionPlanLocal.GetValue(localPlanStart);
+            int32_t firstSourceSlot = IsSelectionPlanHit(firstPlanValue) ?
+                DecodeSelectionPlanSlot(firstPlanValue) : -1;
             int64_t selectionRunStart = GetSelectionSlotTokenOffset(
                 selectionRow, firstSourceSlot, cachedSelectionBlockTableIdx,
                 cachedSelectionBlockNum);
@@ -2869,35 +2810,18 @@ __aicore__ inline void FusedSparseAttentionOverlapVectorService<FusedSparseAtten
                     selectionRunLimit = remainingInSelectionBlock;
                 }
             }
-            int64_t selectionRunCount = selectionRunStart >= 0 ? 1 : 0;
-            if (selectionRunCount == 1 && selectionRunLimit > 1 &&
-                IsSelectionPlanHit(currentPlanValue1) &&
-                DecodeSelectionPlanSlot(currentPlanValue1) == firstSourceSlot + 1) {
-                selectionRunCount = 2;
-            }
-            while (selectionRunCount >= 2 && selectionRunCount < selectionRunLimit) {
-                int64_t nextPlanStart = localPlanStart + selectionRunCount;
-                uint32_t nextPackedPlanValue =
-                    packedSelectionPlanLocal.GetValue(nextPlanStart / 2);
-                int16_t nextPlanValue0 =
-                    static_cast<int16_t>(nextPackedPlanValue & 0xFFFFU);
-                if (!IsSelectionPlanHit(nextPlanValue0) ||
-                    DecodeSelectionPlanSlot(nextPlanValue0) !=
-                        firstSourceSlot + selectionRunCount) {
+            int64_t selectionRunCount = 0;
+            for (; selectionRunStart >= 0 && selectionRunCount < selectionRunLimit;
+                 selectionRunCount++) {
+                int16_t planValue =
+                    selectionPlanLocal.GetValue(localPlanStart + selectionRunCount);
+                if (!IsSelectionPlanHit(planValue)) {
                     break;
                 }
-                selectionRunCount++;
-                if (selectionRunCount >= selectionRunLimit) {
+                int32_t sourceSlot = DecodeSelectionPlanSlot(planValue);
+                if (sourceSlot != firstSourceSlot + selectionRunCount) {
                     break;
                 }
-                int16_t nextPlanValue1 =
-                    static_cast<int16_t>(nextPackedPlanValue >> 16);
-                if (!IsSelectionPlanHit(nextPlanValue1) ||
-                    DecodeSelectionPlanSlot(nextPlanValue1) !=
-                        firstSourceSlot + selectionRunCount) {
-                    break;
-                }
-                selectionRunCount++;
             }
             if (selectionRunCount > 2 && (selectionRunCount & 1) != 0 &&
                 s2GmOffsetArray + selectionRunCount < s2GmLimit) {
@@ -2929,14 +2853,18 @@ __aicore__ inline void FusedSparseAttentionOverlapVectorService<FusedSparseAtten
         int64_t selectionTokenOffset0 = -1;
         int64_t selectionTokenOffset1 = -1;
         if (useSelectionPlanSource) {
-            int32_t sourceSlot0 = IsSelectionPlanHit(currentPlanValue0) ?
-                DecodeSelectionPlanSlot(currentPlanValue0) : -1;
+            int64_t localPlanIdx0 = s2GmOffsetArray - s2GmStartOffset;
+            int16_t planValue0 = selectionPlanLocal.GetValue(localPlanIdx0);
+            int32_t sourceSlot0 = IsSelectionPlanHit(planValue0) ?
+                DecodeSelectionPlanSlot(planValue0) : -1;
             selectionTokenOffset0 = GetSelectionSlotTokenOffset(
                 selectionRow, sourceSlot0, cachedSelectionBlockTableIdx,
                 cachedSelectionBlockNum);
             if (s2GmOffsetArray + constInfo.sparseBlockSize < s2GmLimit) {
-                int32_t sourceSlot1 = IsSelectionPlanHit(currentPlanValue1) ?
-                    DecodeSelectionPlanSlot(currentPlanValue1) : -1;
+                int64_t localPlanIdx1 = localPlanIdx0 + constInfo.sparseBlockSize;
+                int16_t planValue1 = selectionPlanLocal.GetValue(localPlanIdx1);
+                int32_t sourceSlot1 = IsSelectionPlanHit(planValue1) ?
+                    DecodeSelectionPlanSlot(planValue1) : -1;
                 selectionTokenOffset1 = GetSelectionSlotTokenOffset(
                     selectionRow, sourceSlot1, cachedSelectionBlockTableIdx,
                     cachedSelectionBlockNum);

@@ -430,6 +430,7 @@ at::Tensor npu_fused_sparse_attention_overlap_meta(
     const at::Tensor &selection_kv_cache,
     const at::Tensor &selection_kv_block_table,
     const at::Tensor &selection_kv_block_status,
+    const at::Tensor &selection_membership_map,
     const at::Tensor &selection_topk_indices,
     const at::Tensor &full_k_rope,
     const at::Tensor &full_kv_cache,

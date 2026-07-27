@@ -36,8 +36,13 @@ inline at::Tensor ConstructSelectionKvActualSeqForSideEffect(const at::Tensor &s
     int64_t topk = selection_topk_indices.size(selection_topk_indices.dim() - 1);
     if (selection_kv_block_table.size(0) == 1 &&
         selection_kv_block_status.is_contiguous() &&
-        selection_kv_block_status.numel() == topk + 1) {
-        return selection_kv_block_status.view({1, topk + 1}).select(1, topk);
+        selection_kv_block_status.dim() > 0 &&
+        selection_kv_block_status.numel() ==
+            selection_kv_block_status.size(selection_kv_block_status.dim() - 1) &&
+        selection_kv_block_status.size(selection_kv_block_status.dim() - 1) > topk) {
+        int64_t status_stride =
+            selection_kv_block_status.size(selection_kv_block_status.dim() - 1);
+        return selection_kv_block_status.view({1, status_stride}).select(1, topk);
     }
     return ConstructSelectionKvActualSeq(selection_kv_block_table, selection_topk_indices);
 }
@@ -93,6 +98,7 @@ inline at::Tensor RunFusedSparseAttentionOverlapSideEffectSplit(
     const at::Tensor &selection_kv_cache,
     const at::Tensor &selection_kv_block_table,
     const at::Tensor &selection_kv_block_status,
+    const at::Tensor &selection_membership_map,
     const at::Tensor &selection_topk_indices,
     const at::Tensor &full_k_rope,
     const at::Tensor &full_kv_cache,
@@ -152,6 +158,7 @@ inline at::Tensor RunFusedSparseAttentionOverlapSideEffectSplit(
                  selection_kv_cache,
                  selection_kv_block_table,
                  selection_kv_block_status,
+                 selection_membership_map,
                  scale_value,
                  sparse_block_size,
                  layout_query_ptr,
@@ -169,6 +176,7 @@ inline at::Tensor RunFusedSparseAttentionOverlapSideEffect(
     const at::Tensor &selection_kv_cache,
     const at::Tensor &selection_kv_block_table,
     const at::Tensor &selection_kv_block_status,
+    const at::Tensor &selection_membership_map,
     const at::Tensor &selection_topk_indices,
     const at::Tensor &full_k_rope,
     const at::Tensor &full_kv_cache,
@@ -202,6 +210,7 @@ inline at::Tensor RunFusedSparseAttentionOverlapSideEffect(
         selection_kv_cache,
         selection_kv_block_table,
         selection_kv_block_status,
+        selection_membership_map,
         selection_topk_indices,
         full_k_rope,
         full_kv_cache,
@@ -215,9 +224,7 @@ inline at::Tensor RunFusedSparseAttentionOverlapSideEffect(
         layout_kv_str,
         sparse_mode);
 
-    at::Tensor attention_output = at::zeros(query.sizes(), query.options().dtype(query.dtype()));
-    attention_output.slice(last_dim, 0, kv_cache_dim).copy_(sfa_output);
-    return attention_output;
+    return sfa_output;
 }
 
 inline at::Tensor npu_fused_sparse_attention_overlap(
@@ -226,6 +233,7 @@ inline at::Tensor npu_fused_sparse_attention_overlap(
     const at::Tensor &selection_kv_cache,
     const at::Tensor &selection_kv_block_table,
     const at::Tensor &selection_kv_block_status,
+    const at::Tensor &selection_membership_map,
     const at::Tensor &selection_topk_indices,
     const at::Tensor &full_k_rope,
     const at::Tensor &full_kv_cache,
@@ -245,6 +253,7 @@ inline at::Tensor npu_fused_sparse_attention_overlap(
         selection_kv_cache,
         selection_kv_block_table,
         selection_kv_block_status,
+        selection_membership_map,
         selection_topk_indices,
         full_k_rope,
         full_kv_cache,
@@ -265,6 +274,7 @@ inline at::Tensor npu_fused_sparse_attention_overlap_cpu_source(
     const at::Tensor &selection_kv_cache,
     const at::Tensor &selection_kv_block_table,
     const at::Tensor &selection_kv_block_status,
+    const at::Tensor &selection_membership_map,
     const at::Tensor &selection_topk_indices,
     const at::Tensor &full_k_rope,
     const at::Tensor &full_kv_cache,
@@ -283,6 +293,7 @@ inline at::Tensor npu_fused_sparse_attention_overlap_cpu_source(
                                               selection_kv_cache,
                                               selection_kv_block_table,
                                               selection_kv_block_status,
+                                              selection_membership_map,
                                               selection_topk_indices,
                                               full_k_rope,
                                               full_kv_cache,

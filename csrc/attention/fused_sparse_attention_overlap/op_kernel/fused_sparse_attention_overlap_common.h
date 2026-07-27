@@ -185,6 +185,8 @@ struct ConstInfo {
     // sparse attr
     int64_t sparseBlockSize = 0;
     uint32_t sparseBlockCount = 0;
+    uint32_t selectionStatusStride = 0;
+    uint32_t selectionMembershipStride = 0;
 };
 
 struct MSplitInfo {
