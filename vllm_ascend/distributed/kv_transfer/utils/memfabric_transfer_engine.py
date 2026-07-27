@@ -118,21 +118,25 @@ class GlobalMemfabricTE:
             ) from exc
 
         # Match the MemFabric initialization sequence used by its examples.
+        # session_id / store_url must be ip:port (not bare IP); the library
+        # assigns the listen port at construction via get_rpc_port().
         set_log_level(2)
         set_conf_store_tls(False, "")
         raw_engine = TransferEngine()
-        store_url = f"tcp://{hostname}"
+        advertised_rpc_port = self._parse_rpc_port(raw_engine.get_rpc_port())
+        unique_id = f"{hostname}:{advertised_rpc_port}"
+        store_url = f"tcp://{unique_id}"
 
         logger.info(
             "MemFabric TransferEngine initialize: store_url=%s, unique_id=%s, role=%s, device_id=%s",
             store_url,
-            hostname,
+            unique_id,
             self._role,
             self._device_id,
         )
         ret = raw_engine.initialize(
             store_url,
-            hostname,
+            unique_id,
             self._role,
             self._device_id,
             store_server_role=MEMFABRIC_ROLE_PREFILL,
@@ -143,10 +147,23 @@ class GlobalMemfabricTE:
                 f"ret_value={ret}; hostname={hostname!r} must be a numeric IPv4 "
                 "address reachable by the peer"
             )
-        advertised_rpc_port = raw_engine.get_rpc_port()
-        self._unique_id = f"{hostname}:{advertised_rpc_port}"
+        self._unique_id = unique_id
         return MemfabricBackend(raw_engine, advertised_rpc_port)
 
+    @staticmethod
+    def _parse_rpc_port(endpoint: Any) -> int:
+        """Parse MemFabric get_rpc_port() which may be int or 'IP:PORT[_PID]'."""
+        if isinstance(endpoint, int):
+            port = endpoint
+        else:
+            try:
+                core = str(endpoint).rsplit("_", 1)[0]
+                port = int(core.rsplit(":", 1)[-1])
+            except (TypeError, ValueError) as exc:
+                raise RuntimeError(f"MemFabric returned invalid RPC endpoint: {endpoint!r}") from exc
+        if not 1 <= port <= 65535:
+            raise RuntimeError(f"MemFabric returned invalid RPC port: {endpoint!r}")
+        return port
 
     def register_buffer(self, ptrs: list[int], sizes: list[int]) -> None:
         if len(ptrs) != len(sizes):
