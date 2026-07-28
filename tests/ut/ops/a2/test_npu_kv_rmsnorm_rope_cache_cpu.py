@@ -31,17 +31,36 @@ import traceback
 
 import torch
 import torch_npu
+from memfabric_hybrid import offload
+
+
+def cdiv(a: int, b: int) -> int:
+    return -(-a // b)
 
 
 # DeepSeek-V2 style MLA dims used by the SFA offload path.
-KV_LORA_RANK = 512        # rms_size  -> ckv_cache (k_nope)
-QK_ROPE_HEAD_DIM = 64     # rope_size -> k_cache   (k_pe)
+#
+# Op argument mapping (see sfa_v1.py::exec_kv):
+#   npu_kv_rmsnorm_rope_cache(..., k_cache, ckv_cache, ...)
+#     - k_cache  stores the rope part  (k_pe)  -> qk_rope_head_dim
+#     - ckv_cache stores the rms part  (k_nope) -> kv_lora_rank
+# In the offload manager (sparse_kv_offload_manager.py) the CPU pools are
+# named the other way round: k_caches_cpu holds k_nope (kv_lora_rank) and
+# v_caches_cpu holds k_pe (qk_rope_head_dim). We keep both names below to
+# stay faithful to the production allocation.
+KV_LORA_RANK = 512        # rms_size  -> ckv_cache (k_nope) / manager.k_caches_cpu
+QK_ROPE_HEAD_DIM = 64     # rope_size -> k_cache   (k_pe)   / manager.v_caches_cpu
 NUM_KV_HEADS = 1
 BLOCK_SIZE = 128
 NUM_BLOCKS = 16
 DTYPE = torch.bfloat16
 EPSILON = 1e-5
 BATCH_TOKENS = 8
+
+# Mirrors _CPU_CACHE_ALIGNMENT in sparse_kv_offload_manager.py: the offload
+# CPU pools are 2 MiB aligned so that per-layer delta-addrs are stable for the
+# sparse_copy descriptor path.
+_CPU_CACHE_ALIGNMENT = 2 * 1024 * 1024
 
 
 def _real_npu_available() -> bool:
@@ -97,7 +116,60 @@ def _reference_npu(batch_tokens: int):
     return rows_k.clone(), rows_ckv.clone()
 
 
-def _cpu_cache_pair(pinned: bool):
+def _empty_aligned_int8_cpu_tensors(sizes: list[int]) -> list[torch.Tensor]:
+    """Replica of ``empty_aligned_int8_cpu_tensors`` in the offload manager.
+
+    Allocates the CPU pools through ``memfabric_hybrid.offload.empty`` (pinned,
+    host-registered memory used by the real D2H path) with 2 MiB alignment, so
+    the tensors fed to the op are byte-identical to what the production
+    ``k_caches_cpu`` / ``v_caches_cpu`` pools look like.
+    """
+    chunk_nums = [cdiv(size, _CPU_CACHE_ALIGNMENT) for size in sizes]
+    total_chunk_num = 1 + sum(chunk_nums)
+    raw_tensor = offload.empty(
+        [total_chunk_num * _CPU_CACHE_ALIGNMENT], dtype=torch.int8, pin_memory=True,
+    )
+    base_addr = raw_tensor.data_ptr()
+    if base_addr % _CPU_CACHE_ALIGNMENT:
+        base_addr = (base_addr // _CPU_CACHE_ALIGNMENT + 1) * _CPU_CACHE_ALIGNMENT
+    base_offset = base_addr - raw_tensor.data_ptr()
+    allocate_tensors = []
+    for size, chunk_num in zip(sizes, chunk_nums):
+        allocate_tensors.append(raw_tensor[base_offset:base_offset + size])
+        base_offset += chunk_num * _CPU_CACHE_ALIGNMENT
+    return allocate_tensors
+
+
+def _paged_view(int8_tensor: torch.Tensor, dim: int) -> torch.Tensor:
+    """Reinterpret an int8 offload pool as a paged BF16 cache view.
+
+    Mirrors ``reshape_kv_cache_tensors_for_sparse_kv_offload``:
+    ``raw.view(dtype).view(num_blocks, block_size, num_kv_heads, dim)``.
+    """
+    return int8_tensor.view(DTYPE).view(
+        NUM_BLOCKS, BLOCK_SIZE, NUM_KV_HEADS, dim,
+    )
+
+
+def _offload_cpu_cache_pair() -> tuple[torch.Tensor, torch.Tensor]:
+    """Allocate the CPU KV pools exactly like the offload manager does.
+
+    Returns (k_cache_for_op, ckv_cache_for_op) where:
+      - k_cache_for_op  holds k_pe  (qk_rope_head_dim)  -> op's ``k_cache``
+      - ckv_cache_for_op holds k_nope (kv_lora_rank)    -> op's ``ckv_cache``
+    """
+    nope_bytes = NUM_BLOCKS * BLOCK_SIZE * NUM_KV_HEADS * KV_LORA_RANK * DTYPE.itemsize
+    pe_bytes = NUM_BLOCKS * BLOCK_SIZE * NUM_KV_HEADS * QK_ROPE_HEAD_DIM * DTYPE.itemsize
+    # Allocate k+nope and k_pe together so the per-layer delta-addr invariant
+    # from empty_aligned_int8_cpu_tensors is preserved.
+    nope_pool, pe_pool = _empty_aligned_int8_cpu_tensors([nope_bytes, pe_bytes])
+    k_cache_for_op = _paged_view(pe_pool, QK_ROPE_HEAD_DIM)     # rope part
+    ckv_cache_for_op = _paged_view(nope_pool, KV_LORA_RANK)     # rms  part
+    return k_cache_for_op, ckv_cache_for_op
+
+
+def _pageable_cpu_cache_pair() -> tuple[torch.Tensor, torch.Tensor]:
+    """Fallback: plain pageable torch.zeros CPU caches, for comparison only."""
     cpu = torch.device("cpu")
     k_cache = torch.zeros(
         NUM_BLOCKS, BLOCK_SIZE, NUM_KV_HEADS, QK_ROPE_HEAD_DIM, dtype=DTYPE, device=cpu,
@@ -105,9 +177,6 @@ def _cpu_cache_pair(pinned: bool):
     ckv_cache = torch.zeros(
         NUM_BLOCKS, BLOCK_SIZE, NUM_KV_HEADS, KV_LORA_RANK, dtype=DTYPE, device=cpu,
     )
-    if pinned:
-        k_cache = k_cache.pin_memory()
-        ckv_cache = ckv_cache.pin_memory()
     return k_cache, ckv_cache
 
 
@@ -122,12 +191,19 @@ def _check_close(rows_k: torch.Tensor, rows_ckv: torch.Tensor,
     torch.testing.assert_close(rows_ckv, ref_ckv, rtol=1e-2, atol=1e-2)
 
 
-def probe_writes_to_cpu(pinned: bool, ref_k, ref_ckv) -> bool:
-    label = "pinned" if pinned else "pageable"
-    print(f"\n[case] writes_to_cpu / {label}")
+def _resolve_cpu_cache_pair(allocator: str) -> tuple[torch.Tensor, torch.Tensor]:
+    if allocator == "offload":
+        return _offload_cpu_cache_pair()
+    if allocator == "pageable":
+        return _pageable_cpu_cache_pair()
+    raise ValueError(f"unknown allocator: {allocator}")
+
+
+def probe_writes_to_cpu(allocator: str, ref_k, ref_ckv) -> bool:
+    print(f"\n[case] writes_to_cpu / {allocator}")
     npu = torch.device("npu")
     kv, gamma, cos, sin, index = _make_inputs(BATCH_TOKENS, npu)
-    k_cache_cpu, ckv_cache_cpu = _cpu_cache_pair(pinned)
+    k_cache_cpu, ckv_cache_cpu = _resolve_cpu_cache_pair(allocator)
 
     try:
         _run_op(kv, gamma, cos, sin, index, k_cache_cpu, ckv_cache_cpu, is_output_kv=False)
@@ -151,17 +227,16 @@ def probe_writes_to_cpu(pinned: bool, ref_k, ref_ckv) -> bool:
         print(f"  WRITTEN but mismatch vs NPU reference: {exc}")
         return False
 
-    print(f"  PASS: op wrote {BATCH_TOKENS} rows into CPU {label} cache, "
+    print(f"  PASS: op wrote {BATCH_TOKENS} rows into CPU {allocator} cache, "
           f"matches NPU reference within tol.")
     return True
 
 
-def probe_is_output_kv_with_cpu(pinned: bool) -> bool:
-    label = "pinned" if pinned else "pageable"
-    print(f"\n[case] is_output_kv_with_cpu / {label}")
+def probe_is_output_kv_with_cpu(allocator: str) -> bool:
+    print(f"\n[case] is_output_kv_with_cpu / {allocator}")
     npu = torch.device("npu")
     kv, gamma, cos, sin, index = _make_inputs(BATCH_TOKENS, npu)
-    k_cache_cpu, ckv_cache_cpu = _cpu_cache_pair(pinned)
+    k_cache_cpu, ckv_cache_cpu = _resolve_cpu_cache_pair(allocator)
 
     try:
         k_out, ckv_out, k_rope, c_kv = _run_op(
@@ -196,7 +271,7 @@ def probe_is_output_kv_with_cpu(pinned: bool) -> bool:
     rows_ckv = ckv_cache_cpu.reshape(-1, KV_LORA_RANK)[:BATCH_TOKENS]
     try:
         _check_written(rows_k, rows_ckv)
-        print(f"  CPU {label} caches were written by the op.")
+        print(f"  CPU {allocator} caches were written by the op.")
     except AssertionError as exc:
         print(f"  NO-OP on caches: {exc}")
         ok = False
@@ -205,10 +280,10 @@ def probe_is_output_kv_with_cpu(pinned: bool) -> bool:
 
 def probe_diagnostic() -> None:
     """Just report whether the op raises or accepts CPU output, no assertions."""
-    print("\n[case] diagnostic (raise vs accept)")
+    print("\n[case] diagnostic (raise vs accept) / offload")
     npu = torch.device("npu")
     kv, gamma, cos, sin, index = _make_inputs(BATCH_TOKENS, npu)
-    k_cache_cpu, ckv_cache_cpu = _cpu_cache_pair(pinned=True)
+    k_cache_cpu, ckv_cache_cpu = _offload_cpu_cache_pair()
 
     raised: Exception | None = None
     try:
@@ -218,12 +293,12 @@ def probe_diagnostic() -> None:
         raised = exc
 
     if raised is not None:
-        print(f"  -> npu_kv_rmsnorm_rope_cache RAISED on CPU cache output: "
+        print(f"  -> npu_kv_rmsnorm_rope_cache RAISED on offload CPU cache output: "
               f"{type(raised).__name__}: {raised}")
     else:
         rows_k = k_cache_cpu.reshape(-1, QK_ROPE_HEAD_DIM)[:BATCH_TOKENS]
         rows_ckv = ckv_cache_cpu.reshape(-1, KV_LORA_RANK)[:BATCH_TOKENS]
-        print(f"  -> accepted CPU cache output; "
+        print(f"  -> accepted offload CPU cache output; "
               f"k_written={not torch.all(rows_k == 0)}, "
               f"ckv_written={not torch.all(rows_ckv == 0)}")
 
@@ -238,8 +313,8 @@ def main() -> int:
     print(f"dtype={DTYPE}, kv_lora_rank={KV_LORA_RANK}, "
           f"qk_rope_head_dim={QK_ROPE_HEAD_DIM}, "
           f"block_size={BLOCK_SIZE}, batch_tokens={BATCH_TOKENS}")
-
-    failures: list[str] = []
+    print(f"cpu pool allocator: memfabric_hybrid.offload.empty "
+          f"(pinned, {_CPU_CACHE_ALIGNMENT // (1024 * 1024)} MiB aligned)")
 
     try:
         ref_k, ref_ckv = _reference_npu(BATCH_TOKENS)
@@ -259,19 +334,24 @@ def main() -> int:
 
     results: dict[str, bool] = {}
 
-    for pinned in (True, False):
-        name = f"writes_to_cpu/{'pinned' if pinned else 'pageable'}"
+    # Primary target: the offload allocator (what production would use).
+    # Also probe a plain pageable torch.zeros CPU cache as a baseline to
+    # distinguish "op rejects CPU output" from "op rejects pinned/registered
+    # CPU output specifically".
+    allocators = ["offload", "pageable"]
+    for allocator in allocators:
+        name = f"writes_to_cpu/{allocator}"
         try:
-            results[name] = probe_writes_to_cpu(pinned, ref_k, ref_ckv)
+            results[name] = probe_writes_to_cpu(allocator, ref_k, ref_ckv)
         except Exception:  # noqa: BLE001
             print(f"[{name}] unexpected error:")
             traceback.print_exc()
             results[name] = False
 
-    for pinned in (True, False):
-        name = f"is_output_kv_with_cpu/{'pinned' if pinned else 'pageable'}"
+    for allocator in allocators:
+        name = f"is_output_kv_with_cpu/{allocator}"
         try:
-            results[name] = probe_is_output_kv_with_cpu(pinned)
+            results[name] = probe_is_output_kv_with_cpu(allocator)
         except Exception:  # noqa: BLE001
             print(f"[{name}] unexpected error:")
             traceback.print_exc()
