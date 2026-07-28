@@ -26,6 +26,7 @@ Run directly on an NPU box:
     python tests/ut/ops/a2/test_npu_kv_rmsnorm_rope_cache_cpu.py
 """
 
+import os
 import sys
 import traceback
 
@@ -62,12 +63,39 @@ BATCH_TOKENS = 8
 # sparse_copy descriptor path.
 _CPU_CACHE_ALIGNMENT = 2 * 1024 * 1024
 
+# Size of the memfabric offload pool to pre-register. ``offload.empty`` draws
+# from this pool, so it must be initialized (via ``offload.initialize``) before
+# any allocation. Production uses dram_size_per_dp_GB * 1 GiB; the test only
+# needs ~6 MiB of actual cache, but memfabric may impose a sensible minimum, so
+# default to 1 GiB and allow override from the env.
+_OFFLOAD_POOL_BYTES = int(
+    os.environ.get("VLLM_ASCEND_PROBE_OFFLOAD_POOL_GB", "1")
+) * 1024 * 1024 * 1024
+
 
 def _real_npu_available() -> bool:
     # Under the vllm-ascend UT harness torch_npu is mocked and
     # torch.version.cann is set to None when no NPU is present, so a non-None
     # CANN build id is a reliable real-hardware signal.
     return torch.version.cann is not None and torch.npu.is_available()
+
+
+def _init_offload_pool() -> None:
+    """Register the memfabric offload pool that ``offload.empty`` draws from.
+
+    Mirrors ``SparseKVOffloadManager.__init__``: without
+    ``offload.initialize(config)`` the offload allocator has no pool to carve
+    tensors out of and ``offload.empty`` raises a malloc-failed error.
+    """
+    config = offload.OffloadConfig()
+    config.device_id = torch_npu.npu.current_device()
+    config.size = _OFFLOAD_POOL_BYTES
+    config.world_size = 1
+    config.rank_id = 0
+    offload.initialize(config)
+    print(f"[init] offload pool registered: "
+          f"{_OFFLOAD_POOL_BYTES / (1024 * 1024):.0f} MiB "
+          f"(device_id={config.device_id})")
 
 
 def _make_inputs(batch_tokens: int, device: torch.device):
@@ -315,6 +343,16 @@ def main() -> int:
           f"block_size={BLOCK_SIZE}, batch_tokens={BATCH_TOKENS}")
     print(f"cpu pool allocator: memfabric_hybrid.offload.empty "
           f"(pinned, {_CPU_CACHE_ALIGNMENT // (1024 * 1024)} MiB aligned)")
+
+    # offload.empty draws from a pre-registered memfabric pool, so the pool
+    # must be initialized before any allocation (see SparseKVOffloadManager).
+    try:
+        _init_offload_pool()
+    except Exception:  # noqa: BLE001
+        print("[init] failed to initialize memfabric offload pool:")
+        traceback.print_exc()
+        print("[init] Cannot use the real offload allocator; aborting probe.")
+        return 1
 
     try:
         ref_k, ref_ckv = _reference_npu(BATCH_TOKENS)
