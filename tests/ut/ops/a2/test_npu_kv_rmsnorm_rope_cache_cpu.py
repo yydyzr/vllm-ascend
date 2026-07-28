@@ -13,93 +13,226 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Probe whether ``torch_npu.npu_kv_rmsnorm_rope_cache`` can scatter the
-fused RMSNorm + RoPE result directly into a CPU-resident paged KV cache.
+"""Probe whether ``torch_npu.npu_kv_rmsnorm_rope_cache`` can scatter into
+host-backed KV caches allocated by either:
 
-Background: the sparse KV offload path currently computes K/V on NPU and then
-performs an explicit D2H ``sparse_copy`` into the CPU pool. If the fused op
-accepted CPU output tensors for ``k_cache`` / ``ckv_cache``, we could skip the
-extra copy and let the op write the cache rows straight to host memory.
+  - MemFabric ``offload.empty`` (sparse KV offload CPU pool), or
+  - ``torch_npu.empty_with_swapped_memory`` (NPU-marked, host-backed).
 
-Run directly on an NPU box:
+CPU KV allocation mirrors ``kv_offload_0717``
+``tests/ut/test_fuse_sparse_attention_overlap_precisions.py``:
+``_empty_aligned_cpu_tensor`` / ``_alloc_cpu_kv_tensor``.
+
+WARNING: on some torch_npu builds, swapped tensors SIGSEGV if you touch
+``.shape`` / ``.device`` / ``.data_ptr()`` / ``zero_()`` / ``__repr__``.
+Only pass them into the op; do not print or introspect them. Swap probes
+run in a child process so a segfault becomes FAIL instead of killing the
+parent.
+
+Run on an NPU box:
 
     python tests/ut/ops/a2/test_npu_kv_rmsnorm_rope_cache_cpu.py
 """
 
+from __future__ import annotations
+
 import os
+import signal
+import subprocess
 import sys
 import traceback
+from typing import Literal
 
+import numpy as np
 import torch
 import torch_npu
 from memfabric_hybrid import offload
 
+empty_swapped = getattr(torch_npu, "empty_with_swapped_memory", None)
+CpuKvBackend = Literal["offload", "swap_memory"]
 
-def cdiv(a: int, b: int) -> int:
-    return -(-a // b)
+# Match SparseKVOffloadManager / 0717 op UT CPU KV pool alignment.
+_CPU_CACHE_ALIGNMENT = 2 * 1024 * 1024
+_GIB = 1024 * 1024 * 1024
 
-
-# DeepSeek-V2 style MLA dims used by the SFA offload path.
+# DeepSeek-V2 style MLA dims (PA layout for npu_kv_rmsnorm_rope_cache).
 #
-# Op argument mapping (see sfa_v1.py::exec_kv):
-#   npu_kv_rmsnorm_rope_cache(..., k_cache, ckv_cache, ...)
-#     - k_cache  stores the rope part  (k_pe)  -> qk_rope_head_dim
-#     - ckv_cache stores the rms part  (k_nope) -> kv_lora_rank
-# In the offload manager (sparse_kv_offload_manager.py) the CPU pools are
-# named the other way round: k_caches_cpu holds k_nope (kv_lora_rank) and
-# v_caches_cpu holds k_pe (qk_rope_head_dim). We keep both names below to
-# stay faithful to the production allocation.
-KV_LORA_RANK = 512        # rms_size  -> ckv_cache (k_nope) / manager.k_caches_cpu
-QK_ROPE_HEAD_DIM = 64     # rope_size -> k_cache   (k_pe)   / manager.v_caches_cpu
+# Op args (see sfa_v1.py::exec_kv):
+#   k_cache   = rope part (k_pe)  -> qk_rope_head_dim
+#   ckv_cache = rms part  (k_nope) -> kv_lora_rank
+KV_LORA_RANK = 512
+QK_ROPE_HEAD_DIM = 64
 NUM_KV_HEADS = 1
 BLOCK_SIZE = 128
 NUM_BLOCKS = 16
 DTYPE = torch.bfloat16
 EPSILON = 1e-5
 BATCH_TOKENS = 8
+_SEED = 1234
 
-# Mirrors _CPU_CACHE_ALIGNMENT in sparse_kv_offload_manager.py: the offload
-# CPU pools are 2 MiB aligned so that per-layer delta-addrs are stable for the
-# sparse_copy descriptor path.
-_CPU_CACHE_ALIGNMENT = 2 * 1024 * 1024
-
-# Size of the memfabric offload pool to pre-register. ``offload.empty`` draws
-# from this pool, so it must be initialized (via ``offload.initialize``) before
-# any allocation. Production uses dram_size_per_dp_GB * 1 GiB; the test only
-# needs ~6 MiB of actual cache, but memfabric may impose a sensible minimum, so
-# default to 1 GiB and allow override from the env.
 _OFFLOAD_POOL_BYTES = int(
     os.environ.get("VLLM_ASCEND_PROBE_OFFLOAD_POOL_GB", "1")
-) * 1024 * 1024 * 1024
+) * _GIB
+
+# Planned shapes as Python tuples only — never read swapped_tensor.shape.
+K_CACHE_SHAPE = [NUM_BLOCKS, BLOCK_SIZE, NUM_KV_HEADS, QK_ROPE_HEAD_DIM]
+CKV_CACHE_SHAPE = [NUM_BLOCKS, BLOCK_SIZE, NUM_KV_HEADS, KV_LORA_RANK]
+
+
+def cdiv(a: int, b: int) -> int:
+    return -(a // -b)
 
 
 def _real_npu_available() -> bool:
-    # Under the vllm-ascend UT harness torch_npu is mocked and
-    # torch.version.cann is set to None when no NPU is present, so a non-None
-    # CANN build id is a reliable real-hardware signal.
     return torch.version.cann is not None and torch.npu.is_available()
 
 
-def _init_offload_pool() -> None:
-    """Register the memfabric offload pool that ``offload.empty`` draws from.
+def _align_memory(tensor: torch.Tensor, alignment: int) -> torch.Tensor:
+    """Same as 0717 op UT / KVOffloadDecodeManager alignment helper."""
+    data_ptr = tensor.data_ptr()
+    aligned_addr = (data_ptr + alignment - 1) // alignment * alignment
+    offset = (aligned_addr - data_ptr) // tensor.element_size()
+    return tensor[int(offset):]
 
-    Mirrors ``SparseKVOffloadManager.__init__``: without
-    ``offload.initialize(config)`` the offload allocator has no pool to carve
-    tensors out of and ``offload.empty`` raises a malloc-failed error.
+
+def _empty_aligned_cpu_tensor(
+    shape: list[int],
+    dtype: torch.dtype,
+    alignment: int = _CPU_CACHE_ALIGNMENT,
+) -> torch.Tensor:
+    """Same allocation path as 0717 UT / SparseKVOffloadManager CPU KV.
+
+    Allocate raw int8 bytes from MemFabric, align, then view as ``dtype``.
+    Avoids ``offload.empty(..., bfloat16)`` which some MemFabric builds reject.
     """
+    num_elements = int(np.prod(shape))
+    nbytes = num_elements * torch.empty((), dtype=dtype).element_size()
+    extra_bytes = alignment
+    print(
+        "OFFLOAD_EMPTY shape={} dtype={} nbytes={:.3f} MiB (+align {:.3f} MiB)".format(
+            shape, dtype, nbytes / (1024 * 1024), extra_bytes / (1024 * 1024),
+        ),
+        flush=True,
+    )
+    try:
+        raw = offload.empty([nbytes + extra_bytes], dtype=torch.int8, pin_memory=True)
+    except Exception as exc:
+        raise RuntimeError(
+            f"offload.empty failed for {(nbytes + extra_bytes) / _GIB:.3f} GiB "
+            f"(shape={shape}, dtype={dtype}): {type(exc).__name__}: {exc}. "
+            "Check MemFabric pool size and host free/locked memory."
+        ) from exc
+    aligned = _align_memory(raw, alignment)[:nbytes]
+    return aligned.view(dtype).view(shape)
+
+
+def _alloc_cpu_kv_tensor(
+    backend: CpuKvBackend,
+    shape: list[int],
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """Allocate host-side KV used by the fused op.
+
+    - offload: MemFabric ``offload.empty`` + 2MiB align
+    - swap_memory: ``torch_npu.empty_with_swapped_memory``
+
+    WARNING: on some torch_npu builds, swapped tensors SIGSEGV if you touch
+    ``.shape`` / ``.device`` / ``.data_ptr()`` / ``zero_()`` / ``__repr__``.
+    Only pass them into the op; do not print or introspect them.
+    """
+    if backend == "offload":
+        return _empty_aligned_cpu_tensor(shape, dtype=dtype)
+    if backend == "swap_memory":
+        if empty_swapped is None:
+            raise RuntimeError(
+                "cpu-kv-backend=swap_memory requires "
+                "torch_npu.empty_with_swapped_memory"
+            )
+        # Keep args minimal; do not print/return-repr the result here.
+        print(
+            "SWAP_EMPTY request_shape={} dtype={} (no tensor introspection)".format(
+                shape, dtype,
+            ),
+            flush=True,
+        )
+        return empty_swapped(tuple(shape), dtype=dtype, device="npu")
+    raise ValueError(f"unknown cpu-kv-backend: {backend}")
+
+
+def init_offload_pool(dram_size_gb: float | None = None) -> None:
+    """Mirror SparseKVOffloadManager MemFabric OffloadConfig initialize."""
+    size_bytes = (
+        int(dram_size_gb * _GIB) if dram_size_gb is not None else _OFFLOAD_POOL_BYTES
+    )
     config = offload.OffloadConfig()
     config.device_id = torch_npu.npu.current_device()
-    config.size = _OFFLOAD_POOL_BYTES
+    config.size = size_bytes
     config.world_size = 1
     config.rank_id = 0
-    offload.initialize(config)
-    print(f"[init] offload pool registered: "
-          f"{_OFFLOAD_POOL_BYTES / (1024 * 1024):.0f} MiB "
-          f"(device_id={config.device_id})")
+    print(
+        "OFFLOAD_INIT device_id={} size_gb={:.3f} world_size=1 rank_id=0".format(
+            config.device_id, size_bytes / _GIB,
+        ),
+        flush=True,
+    )
+    try:
+        offload.initialize(config)
+    except Exception as exc:
+        raise RuntimeError(
+            f"offload.initialize failed for {size_bytes / _GIB:.3f} GiB pool: "
+            f"{type(exc).__name__}: {exc}."
+        ) from exc
+
+
+def _alloc_host_kv_pair(backend: CpuKvBackend) -> tuple[torch.Tensor, torch.Tensor]:
+    """Allocate (k_cache, ckv_cache) for the op.
+
+    Returns (rope/k_pe cache, rms/k_nope cache) matching op argument order.
+    Prints planned shapes only (Python lists). Never print swapped tensor attrs.
+    """
+    print(
+        "CPU_KV_PLAN backend={} k_shape={} ckv_shape={} dtype={}".format(
+            backend, K_CACHE_SHAPE, CKV_CACHE_SHAPE, DTYPE,
+        ),
+        flush=True,
+    )
+    k_cache = _alloc_cpu_kv_tensor(backend, K_CACHE_SHAPE, DTYPE)
+    ckv_cache = _alloc_cpu_kv_tensor(backend, CKV_CACHE_SHAPE, DTYPE)
+
+    if backend == "offload":
+        # Safe for MemFabric host views; do NOT torch.randn (extra host malloc).
+        k_cache.zero_()
+        ckv_cache.zero_()
+        print(
+            "FULL_KV_HOST backend=offload shape={} ckv_shape={} dtype={} "
+            "device={} ptr_align={}".format(
+                tuple(k_cache.shape),
+                tuple(ckv_cache.shape),
+                DTYPE,
+                k_cache.device,
+                k_cache.data_ptr() % _CPU_CACHE_ALIGNMENT == 0,
+            ),
+            flush=True,
+        )
+    else:
+        # swap_memory: skip zero_/shape/device/data_ptr — known SIGSEGV.
+        # Leave allocation as-is; values are uninitialized.
+        print(
+            "FULL_KV_HOST backend=swap_memory requested_k_shape={} "
+            "requested_ckv_shape={} dtype={} "
+            "(skip tensor introspection to avoid SIGSEGV)".format(
+                K_CACHE_SHAPE, CKV_CACHE_SHAPE, DTYPE,
+            ),
+            flush=True,
+        )
+    return k_cache, ckv_cache
 
 
 def _make_inputs(batch_tokens: int, device: torch.device):
-    """Build kv / gamma / cos / sin / index on *device* for *batch_tokens* tokens."""
+    """Deterministic inputs so parent/child probes share a reference."""
+    torch.manual_seed(_SEED)
+    if device.type == "npu":
+        torch.npu.manual_seed(_SEED)
     kv = torch.randn(
         batch_tokens, NUM_KV_HEADS, 1, KV_LORA_RANK + QK_ROPE_HEAD_DIM,
         dtype=DTYPE, device=device,
@@ -107,7 +240,6 @@ def _make_inputs(batch_tokens: int, device: torch.device):
     gamma = torch.ones(KV_LORA_RANK, dtype=DTYPE, device=device)
     cos = torch.randn(batch_tokens, 1, 1, QK_ROPE_HEAD_DIM, dtype=DTYPE, device=device)
     sin = torch.randn(batch_tokens, 1, 1, QK_ROPE_HEAD_DIM, dtype=DTYPE, device=device)
-    # PA cache_mode expects a flat index of shape [batch_tokens].
     index = torch.arange(batch_tokens, dtype=torch.int64, device=device)
     return kv, gamma, cos, sin, index
 
@@ -128,15 +260,11 @@ def _run_op(kv, gamma, cos, sin, index, k_cache, ckv_cache, *, is_output_kv):
 
 
 def _reference_npu(batch_tokens: int):
-    """Run the op with NPU-resident caches; return (k_rows, ckv_rows) on host."""
+    """Run the op with normal NPU caches; return host rows for comparison."""
     npu = torch.device("npu")
     kv, gamma, cos, sin, index = _make_inputs(batch_tokens, npu)
-    k_cache_ref = torch.zeros(
-        NUM_BLOCKS, BLOCK_SIZE, NUM_KV_HEADS, QK_ROPE_HEAD_DIM, dtype=DTYPE, device=npu,
-    )
-    ckv_cache_ref = torch.zeros(
-        NUM_BLOCKS, BLOCK_SIZE, NUM_KV_HEADS, KV_LORA_RANK, dtype=DTYPE, device=npu,
-    )
+    k_cache_ref = torch.zeros(K_CACHE_SHAPE, dtype=DTYPE, device=npu)
+    ckv_cache_ref = torch.zeros(CKV_CACHE_SHAPE, dtype=DTYPE, device=npu)
     _run_op(kv, gamma, cos, sin, index, k_cache_ref, ckv_cache_ref, is_output_kv=False)
     torch.npu.synchronize()
     rows_k = k_cache_ref.reshape(-1, QK_ROPE_HEAD_DIM)[:batch_tokens].cpu()
@@ -144,231 +272,149 @@ def _reference_npu(batch_tokens: int):
     return rows_k.clone(), rows_ckv.clone()
 
 
-def _empty_aligned_int8_cpu_tensors(sizes: list[int]) -> list[torch.Tensor]:
-    """Replica of ``empty_aligned_int8_cpu_tensors`` in the offload manager.
+def _materialize_swapped(swapped: torch.Tensor, shape: list[int]) -> torch.Tensor:
+    """Copy swapped tensor into a normal NPU tensor via documented-safe mul_.
 
-    Allocates the CPU pools through ``memfabric_hybrid.offload.empty`` (pinned,
-    host-registered memory used by the real D2H path) with 2 MiB alignment, so
-    the tensors fed to the op are byte-identical to what the production
-    ``k_caches_cpu`` / ``v_caches_cpu`` pools look like.
-    """
-    chunk_nums = [cdiv(size, _CPU_CACHE_ALIGNMENT) for size in sizes]
-    total_chunk_num = 1 + sum(chunk_nums)
-    raw_tensor = offload.empty(
-        [total_chunk_num * _CPU_CACHE_ALIGNMENT], dtype=torch.int8, pin_memory=True,
-    )
-    base_addr = raw_tensor.data_ptr()
-    if base_addr % _CPU_CACHE_ALIGNMENT:
-        base_addr = (base_addr // _CPU_CACHE_ALIGNMENT + 1) * _CPU_CACHE_ALIGNMENT
-    base_offset = base_addr - raw_tensor.data_ptr()
-    allocate_tensors = []
-    for size, chunk_num in zip(sizes, chunk_nums):
-        allocate_tensors.append(raw_tensor[base_offset:base_offset + size])
-        base_offset += chunk_num * _CPU_CACHE_ALIGNMENT
-    return allocate_tensors
-
-
-def _paged_view(int8_tensor: torch.Tensor, dim: int) -> torch.Tensor:
-    """Reinterpret an int8 offload pool as a paged BF16 cache view.
-
-    Mirrors ``reshape_kv_cache_tensors_for_sparse_kv_offload``:
-    ``raw.view(dtype).view(num_blocks, block_size, num_kv_heads, dim)``.
-    """
-    return int8_tensor.view(DTYPE).view(
-        NUM_BLOCKS, BLOCK_SIZE, NUM_KV_HEADS, dim,
-    )
-
-
-def _offload_cpu_cache_pair() -> tuple[torch.Tensor, torch.Tensor]:
-    """Allocate the CPU KV pools exactly like the offload manager does.
-
-    Returns (k_cache_for_op, ckv_cache_for_op) where:
-      - k_cache_for_op  holds k_pe  (qk_rope_head_dim)  -> op's ``k_cache``
-      - ckv_cache_for_op holds k_nope (kv_lora_rank)    -> op's ``ckv_cache``
-    """
-    nope_bytes = NUM_BLOCKS * BLOCK_SIZE * NUM_KV_HEADS * KV_LORA_RANK * DTYPE.itemsize
-    pe_bytes = NUM_BLOCKS * BLOCK_SIZE * NUM_KV_HEADS * QK_ROPE_HEAD_DIM * DTYPE.itemsize
-    # Allocate k+nope and k_pe together so the per-layer delta-addr invariant
-    # from empty_aligned_int8_cpu_tensors is preserved.
-    nope_pool, pe_pool = _empty_aligned_int8_cpu_tensors([nope_bytes, pe_bytes])
-    k_cache_for_op = _paged_view(pe_pool, QK_ROPE_HEAD_DIM)     # rope part
-    ckv_cache_for_op = _paged_view(nope_pool, KV_LORA_RANK)     # rms  part
-    return k_cache_for_op, ckv_cache_for_op
-
-
-def _swap_cpu_cache_pair() -> tuple[torch.Tensor, torch.Tensor]:
-    """Allocate KV caches via ``torch_npu.empty_with_swapped_memory``.
-
-    This returns tensors whose ``device`` is reported as NPU but whose actual
-    storage lives in host memory (the NPU swap-memory allocator). The op sees
-    them as NPU tensors (so no cross-device rejection), while the written data
-    lands on host — which is exactly the property we want to probe for direct
-    CPU-side KV offload.
-
-    Constraints from the torch_npu docs:
-      - not supported in graph mode;
-      - only a limited op set officially supports swapped tensors
-        (fill_ / zero_ / mul_ / npu_apply_adam_w / ...). Whether
-        ``npu_kv_rmsnorm_rope_cache`` can scatter into one is precisely what
-        this probe tests.
-      - on A3 the swapped tensor can be read directly; on A2 it cannot and
-        must be converted to a normal NPU tensor via ``mul_`` before copying
-        to host (see ``_read_rows``, which handles both).
+    Never touch ``swapped.shape`` / reshape / print / .cpu on *swapped*.
+    Shape must be the planned Python list from allocate time.
     """
     npu = torch.device("npu")
-    k_cache = torch_npu.empty_with_swapped_memory(
-        [NUM_BLOCKS, BLOCK_SIZE, NUM_KV_HEADS, QK_ROPE_HEAD_DIM],
-        dtype=DTYPE, device=npu,
-    )
-    ckv_cache = torch_npu.empty_with_swapped_memory(
-        [NUM_BLOCKS, BLOCK_SIZE, NUM_KV_HEADS, KV_LORA_RANK],
-        dtype=DTYPE, device=npu,
-    )
-    return k_cache, ckv_cache
+    normal = torch.empty(shape, dtype=DTYPE, device=npu).fill_(1)
+    normal.mul_(swapped)
+    torch.npu.synchronize()
+    return normal
 
 
 def _read_rows(cache_tensor: torch.Tensor, dim: int, n: int,
-               allocator: str) -> torch.Tensor:
-    """Read back the first *n* token rows of *cache_tensor* to host.
-
-    For the ``swap`` allocator the tensor is NPU-marked but host-backed. On A3
-    such tensors can be read directly (``.cpu()`` is a no-op over host storage);
-    on A2 they cannot, and the documented conversion path is to materialize a
-    normal NPU tensor and copy through ``mul_`` before ``.cpu()``. We try the
-    direct read first and fall back to the ``mul_`` conversion on failure, so
-    the probe works on both A2 and A3.
-
-    For ``offload`` the tensor is already a host view, so ``.cpu()`` is a
-    no-op.
-    """
-    if allocator == "swap":
-        try:
-            return cache_tensor.reshape(-1, dim)[:n].cpu().clone()
-        except Exception:
-            # A2 path: swapped tensors are not directly readable; convert via
-            # mul_ into a normal NPU tensor first.
-            npu = torch.device("npu")
-            normal = torch.empty(
-                cache_tensor.shape, dtype=DTYPE, device=npu,
-            ).fill_(1)
-            normal.mul_(cache_tensor)
-            torch.npu.synchronize()
-            return normal.reshape(-1, dim)[:n].cpu().clone()
+               backend: CpuKvBackend) -> torch.Tensor:
+    """Read first *n* token rows to host without introspecting swapped tensors."""
+    if backend == "swap_memory":
+        shape = K_CACHE_SHAPE if dim == QK_ROPE_HEAD_DIM else CKV_CACHE_SHAPE
+        normal = _materialize_swapped(cache_tensor, shape)
+        return normal.reshape(-1, dim)[:n].cpu().clone()
     return cache_tensor.reshape(-1, dim)[:n].cpu().clone()
 
 
 def _check_written(rows_k: torch.Tensor, rows_ckv: torch.Tensor) -> None:
-    assert not torch.all(rows_k == 0), "k_cache (CPU) was not written by the op"
-    assert not torch.all(rows_ckv == 0), "ckv_cache (CPU) was not written by the op"
+    assert not torch.all(rows_k == 0), "k_cache was not written by the op"
+    assert not torch.all(rows_ckv == 0), "ckv_cache was not written by the op"
 
 
-def _check_close(rows_k: torch.Tensor, rows_ckv: torch.Tensor,
-                 ref_k: torch.Tensor, ref_ckv: torch.Tensor) -> None:
+def _check_close(rows_k, rows_ckv, ref_k, ref_ckv) -> None:
     torch.testing.assert_close(rows_k, ref_k, rtol=1e-2, atol=1e-2)
     torch.testing.assert_close(rows_ckv, ref_ckv, rtol=1e-2, atol=1e-2)
 
 
-def _resolve_cpu_cache_pair(allocator: str) -> tuple[torch.Tensor, torch.Tensor]:
-    if allocator == "offload":
-        return _offload_cpu_cache_pair()
-    if allocator == "swap":
-        return _swap_cpu_cache_pair()
-    raise ValueError(f"unknown allocator: {allocator}")
-
-
-def probe_writes_to_cpu(allocator: str, ref_k, ref_ckv) -> bool:
-    print(f"\n[case] writes_to_cpu / {allocator}")
+def probe_writes_to_cpu(backend: CpuKvBackend, ref_k, ref_ckv) -> bool:
+    print(f"\n[case] writes_to_cpu / {backend}", flush=True)
     npu = torch.device("npu")
     kv, gamma, cos, sin, index = _make_inputs(BATCH_TOKENS, npu)
-    k_cache_cpu, ckv_cache_cpu = _resolve_cpu_cache_pair(allocator)
+    k_cache, ckv_cache = _alloc_host_kv_pair(backend)
 
     try:
-        _run_op(kv, gamma, cos, sin, index, k_cache_cpu, ckv_cache_cpu, is_output_kv=False)
+        _run_op(kv, gamma, cos, sin, index, k_cache, ckv_cache, is_output_kv=False)
         torch.npu.synchronize()
     except Exception as exc:  # noqa: BLE001
-        print(f"  RAISED: {type(exc).__name__}: {exc}")
+        print(f"  RAISED: {type(exc).__name__}: {exc}", flush=True)
         return False
 
     try:
-        rows_k = _read_rows(k_cache_cpu, QK_ROPE_HEAD_DIM, BATCH_TOKENS, allocator)
-        rows_ckv = _read_rows(ckv_cache_cpu, KV_LORA_RANK, BATCH_TOKENS, allocator)
+        rows_k = _read_rows(k_cache, QK_ROPE_HEAD_DIM, BATCH_TOKENS, backend)
+        rows_ckv = _read_rows(ckv_cache, KV_LORA_RANK, BATCH_TOKENS, backend)
     except Exception as exc:  # noqa: BLE001
-        print(f"  READ-BACK FAILED: {type(exc).__name__}: {exc}")
+        print(f"  READ-BACK FAILED: {type(exc).__name__}: {exc}", flush=True)
         return False
 
     try:
         _check_written(rows_k, rows_ckv)
     except AssertionError as exc:
-        print(f"  NO-OP: {exc}")
+        print(f"  NO-OP: {exc}", flush=True)
         return False
 
     try:
         _check_close(rows_k, rows_ckv, ref_k, ref_ckv)
     except AssertionError as exc:
-        print(f"  WRITTEN but mismatch vs NPU reference: {exc}")
+        print(f"  WRITTEN but mismatch vs NPU reference: {exc}", flush=True)
         return False
 
-    print(f"  PASS: op wrote {BATCH_TOKENS} rows into {allocator} cache, "
-          f"matches NPU reference within tol.")
+    print(
+        f"  PASS: op wrote {BATCH_TOKENS} rows into {backend} cache, "
+        f"matches NPU reference within tol.",
+        flush=True,
+    )
     return True
 
 
-def probe_is_output_kv_with_cpu(allocator: str) -> bool:
-    print(f"\n[case] is_output_kv_with_cpu / {allocator}")
+def probe_is_output_kv_with_cpu(backend: CpuKvBackend) -> bool:
+    print(f"\n[case] is_output_kv_with_cpu / {backend}", flush=True)
     npu = torch.device("npu")
     kv, gamma, cos, sin, index = _make_inputs(BATCH_TOKENS, npu)
-    k_cache_cpu, ckv_cache_cpu = _resolve_cpu_cache_pair(allocator)
+    k_cache, ckv_cache = _alloc_host_kv_pair(backend)
 
     try:
-        k_out, ckv_out, k_rope, c_kv = _run_op(
-            kv, gamma, cos, sin, index, k_cache_cpu, ckv_cache_cpu, is_output_kv=True,
+        _k_out, _ckv_out, k_rope, c_kv = _run_op(
+            kv, gamma, cos, sin, index, k_cache, ckv_cache, is_output_kv=True,
         )
         torch.npu.synchronize()
     except Exception as exc:  # noqa: BLE001
-        print(f"  RAISED: {type(exc).__name__}: {exc}")
+        print(f"  RAISED: {type(exc).__name__}: {exc}", flush=True)
         return False
 
     ok = True
-    if k_rope is None:
-        print("  k_rope is None")
-        ok = False
-    else:
-        print(f"  k_rope.shape={tuple(k_rope.shape)} "
-              f"device={k_rope.device} dtype={k_rope.dtype}")
-        if k_rope.shape[-1] != QK_ROPE_HEAD_DIM:
-            print(f"  k_rope trailing dim != {QK_ROPE_HEAD_DIM}")
+    # Do not introspect returned tensors under swap_memory.
+    if backend == "swap_memory":
+        print(
+            f"  k_rope is None? {k_rope is None}; c_kv is None? {c_kv is None}",
+            flush=True,
+        )
+        if k_rope is None or c_kv is None:
             ok = False
-    if c_kv is None:
-        print("  c_kv is None")
-        ok = False
     else:
-        print(f"  c_kv.shape={tuple(c_kv.shape)} "
-              f"device={c_kv.device} dtype={c_kv.dtype}")
-        if c_kv.shape[-1] != KV_LORA_RANK:
-            print(f"  c_kv trailing dim != {KV_LORA_RANK}")
+        if k_rope is None:
+            print("  k_rope is None", flush=True)
             ok = False
+        else:
+            print(
+                f"  k_rope.shape={tuple(k_rope.shape)} "
+                f"device={k_rope.device} dtype={k_rope.dtype}",
+                flush=True,
+            )
+            if k_rope.shape[-1] != QK_ROPE_HEAD_DIM:
+                print(f"  k_rope trailing dim != {QK_ROPE_HEAD_DIM}", flush=True)
+                ok = False
+        if c_kv is None:
+            print("  c_kv is None", flush=True)
+            ok = False
+        else:
+            print(
+                f"  c_kv.shape={tuple(c_kv.shape)} "
+                f"device={c_kv.device} dtype={c_kv.dtype}",
+                flush=True,
+            )
+            if c_kv.shape[-1] != KV_LORA_RANK:
+                print(f"  c_kv trailing dim != {KV_LORA_RANK}", flush=True)
+                ok = False
 
     try:
-        rows_k = _read_rows(k_cache_cpu, QK_ROPE_HEAD_DIM, BATCH_TOKENS, allocator)
-        rows_ckv = _read_rows(ckv_cache_cpu, KV_LORA_RANK, BATCH_TOKENS, allocator)
+        rows_k = _read_rows(k_cache, QK_ROPE_HEAD_DIM, BATCH_TOKENS, backend)
+        rows_ckv = _read_rows(ckv_cache, KV_LORA_RANK, BATCH_TOKENS, backend)
     except Exception as exc:  # noqa: BLE001
-        print(f"  READ-BACK FAILED: {type(exc).__name__}: {exc}")
+        print(f"  READ-BACK FAILED: {type(exc).__name__}: {exc}", flush=True)
         return False
     try:
         _check_written(rows_k, rows_ckv)
-        print(f"  {allocator} caches were written by the op.")
+        print(f"  {backend} caches were written by the op.", flush=True)
     except AssertionError as exc:
-        print(f"  NO-OP on caches: {exc}")
+        print(f"  NO-OP on caches: {exc}", flush=True)
         ok = False
     return ok
 
 
-def probe_diagnostic(allocator: str) -> None:
-    """Just report whether the op raises or accepts the allocator's output."""
-    print(f"\n[case] diagnostic (raise vs accept) / {allocator}")
+def probe_diagnostic(backend: CpuKvBackend) -> None:
+    print(f"\n[case] diagnostic (raise vs accept) / {backend}", flush=True)
     npu = torch.device("npu")
     kv, gamma, cos, sin, index = _make_inputs(BATCH_TOKENS, npu)
-    k_cache, ckv_cache = _resolve_cpu_cache_pair(allocator)
+    k_cache, ckv_cache = _alloc_host_kv_pair(backend)
 
     raised: Exception | None = None
     try:
@@ -378,101 +424,167 @@ def probe_diagnostic(allocator: str) -> None:
         raised = exc
 
     if raised is not None:
-        print(f"  -> npu_kv_rmsnorm_rope_cache RAISED on {allocator} cache output: "
-              f"{type(raised).__name__}: {raised}")
+        print(
+            f"  -> RAISED on {backend} cache output: "
+            f"{type(raised).__name__}: {raised}",
+            flush=True,
+        )
         return
 
     try:
-        rows_k = _read_rows(k_cache, QK_ROPE_HEAD_DIM, BATCH_TOKENS, allocator)
-        rows_ckv = _read_rows(ckv_cache, KV_LORA_RANK, BATCH_TOKENS, allocator)
-        print(f"  -> accepted {allocator} cache output; "
-              f"k_written={not torch.all(rows_k == 0)}, "
-              f"ckv_written={not torch.all(rows_ckv == 0)}")
+        rows_k = _read_rows(k_cache, QK_ROPE_HEAD_DIM, BATCH_TOKENS, backend)
+        rows_ckv = _read_rows(ckv_cache, KV_LORA_RANK, BATCH_TOKENS, backend)
+        print(
+            f"  -> accepted {backend} cache output; "
+            f"k_written={not torch.all(rows_k == 0)}, "
+            f"ckv_written={not torch.all(rows_ckv == 0)}",
+            flush=True,
+        )
     except Exception as exc:  # noqa: BLE001
-        print(f"  -> accepted {allocator} cache output but READ-BACK FAILED: "
-              f"{type(exc).__name__}: {exc}")
+        print(
+            f"  -> accepted {backend} but READ-BACK FAILED: "
+            f"{type(exc).__name__}: {exc}",
+            flush=True,
+        )
+
+
+def _run_swap_in_subprocess(case_name: str) -> bool:
+    """Isolate swap_memory probes: segfault becomes FAIL, parent keeps running."""
+    script = os.path.abspath(__file__)
+    print(f"\n[case] {case_name}  (subprocess-isolated)", flush=True)
+    proc = subprocess.run(
+        [sys.executable, script, "--probe-swap", case_name],
+        capture_output=True,
+        text=True,
+    )
+    if proc.stdout:
+        print(proc.stdout, end="" if proc.stdout.endswith("\n") else "\n", flush=True)
+    if proc.stderr:
+        print(proc.stderr, end="" if proc.stderr.endswith("\n") else "\n", flush=True)
+
+    if proc.returncode == 0:
+        return True
+    if proc.returncode < 0:
+        sig = -proc.returncode
+        try:
+            signame = signal.Signals(sig).name
+        except ValueError:
+            signame = f"signal {sig}"
+        print(f"  [segfault] swap child killed by {signame}", flush=True)
+        return False
+    print(f"  [exit {proc.returncode}] swap child failed", flush=True)
+    return False
+
+
+def _run_single_swap_probe(case_name: str) -> int:
+    """Child entry: run one swap_memory probe and exit 0/1."""
+    try:
+        ref_k, ref_ckv = _reference_npu(BATCH_TOKENS)
+    except Exception:  # noqa: BLE001
+        print("[ref] failed in swap child:", flush=True)
+        traceback.print_exc()
+        return 1
+
+    if case_name == "writes_to_cpu/swap_memory":
+        ok = probe_writes_to_cpu("swap_memory", ref_k, ref_ckv)
+    elif case_name == "is_output_kv_with_cpu/swap_memory":
+        ok = probe_is_output_kv_with_cpu("swap_memory")
+    elif case_name == "diagnostic/swap_memory":
+        probe_diagnostic("swap_memory")
+        ok = True
+    else:
+        print(f"[swap child] unknown case: {case_name}", flush=True)
+        return 1
+    return 0 if ok else 1
 
 
 def main() -> int:
     if not _real_npu_available():
-        print("[skip] npu_kv_rmsnorm_rope_cache CPU-output probe needs real "
-              "NPU hardware (torch.version.cann is None or npu unavailable).")
+        print(
+            "[skip] needs real NPU (torch.version.cann is None or npu unavailable).",
+            flush=True,
+        )
         return 0
 
-    print(f"torch.version.cann = {torch.version.cann}")
-    print(f"dtype={DTYPE}, kv_lora_rank={KV_LORA_RANK}, "
-          f"qk_rope_head_dim={QK_ROPE_HEAD_DIM}, "
-          f"block_size={BLOCK_SIZE}, batch_tokens={BATCH_TOKENS}")
-    print(f"cpu pool allocators: "
-          f"offload=memfabric_hybrid.offload.empty "
-          f"(pinned, {_CPU_CACHE_ALIGNMENT // (1024 * 1024)} MiB aligned); "
-          f"swap=torch_npu.empty_with_swapped_memory (NPU-marked, host-backed)")
+    print(f"torch.version.cann = {torch.version.cann}", flush=True)
+    print(
+        f"dtype={DTYPE}, kv_lora_rank={KV_LORA_RANK}, "
+        f"qk_rope_head_dim={QK_ROPE_HEAD_DIM}, "
+        f"block_size={BLOCK_SIZE}, batch_tokens={BATCH_TOKENS}",
+        flush=True,
+    )
+    print(
+        "cpu-kv-backend: offload=MemFabric offload.empty; "
+        "swap_memory=torch_npu.empty_with_swapped_memory "
+        "(alloc path mirrors kv_offload_0717 op UT)",
+        flush=True,
+    )
 
-    # offload.empty draws from a pre-registered memfabric pool, so the pool
-    # must be initialized before any allocation (see SparseKVOffloadManager).
-    # The swap allocator (empty_with_swapped_memory) does not need this.
     try:
-        _init_offload_pool()
+        init_offload_pool()
     except Exception:  # noqa: BLE001
-        print("[init] failed to initialize memfabric offload pool:")
+        print("[init] failed to initialize memfabric offload pool:", flush=True)
         traceback.print_exc()
-        print("[init] offload allocator unavailable; offload cases will fail.")
+        print("[init] offload cases will fail; swap_memory cases still run.", flush=True)
 
     try:
         ref_k, ref_ckv = _reference_npu(BATCH_TOKENS)
-        print(f"[ref] NPU reference rows ready: k={tuple(ref_k.shape)} "
-              f"ckv={tuple(ref_ckv.shape)}")
+        print(
+            f"[ref] NPU reference rows ready: k={tuple(ref_k.shape)} "
+            f"ckv={tuple(ref_ckv.shape)}",
+            flush=True,
+        )
     except Exception:  # noqa: BLE001
-        print("[ref] failed to build NPU reference:")
+        print("[ref] failed to build NPU reference:", flush=True)
         traceback.print_exc()
         return 1
 
-    # Two CPU KV allocators to probe:
-    #   - offload: memfabric_hybrid.offload.empty pool (sparse KV offload path)
-    #   - swap:    torch_npu.empty_with_swapped_memory (NPU device, host storage)
-    allocators = ["offload", "swap"]
-
-    # Diagnostic first so it always prints even if later cases assert.
-    for allocator in allocators:
-        try:
-            probe_diagnostic(allocator)
-        except Exception:  # noqa: BLE001
-            print(f"[diagnostic/{allocator}] unexpected error:")
-            traceback.print_exc()
-
     results: dict[str, bool] = {}
 
-    for allocator in allocators:
-        name = f"writes_to_cpu/{allocator}"
+    # ---- offload (in-process) ----
+    try:
+        probe_diagnostic("offload")
+    except Exception:  # noqa: BLE001
+        print("[diagnostic/offload] unexpected error:", flush=True)
+        traceback.print_exc()
+
+    for name, fn in (
+        ("writes_to_cpu/offload",
+         lambda: probe_writes_to_cpu("offload", ref_k, ref_ckv)),
+        ("is_output_kv_with_cpu/offload",
+         lambda: probe_is_output_kv_with_cpu("offload")),
+    ):
         try:
-            results[name] = probe_writes_to_cpu(allocator, ref_k, ref_ckv)
+            results[name] = fn()
         except Exception:  # noqa: BLE001
-            print(f"[{name}] unexpected error:")
+            print(f"[{name}] unexpected error:", flush=True)
             traceback.print_exc()
             results[name] = False
 
-    for allocator in allocators:
-        name = f"is_output_kv_with_cpu/{allocator}"
-        try:
-            results[name] = probe_is_output_kv_with_cpu(allocator)
-        except Exception:  # noqa: BLE001
-            print(f"[{name}] unexpected error:")
-            traceback.print_exc()
-            results[name] = False
+    # ---- swap_memory (subprocess-isolated; segfault -> FAIL) ----
+    _run_swap_in_subprocess("diagnostic/swap_memory")
+    results["writes_to_cpu/swap_memory"] = _run_swap_in_subprocess(
+        "writes_to_cpu/swap_memory"
+    )
+    results["is_output_kv_with_cpu/swap_memory"] = _run_swap_in_subprocess(
+        "is_output_kv_with_cpu/swap_memory"
+    )
 
-    print("\n" + "=" * 60)
-    print("Summary")
-    print("=" * 60)
+    print("\n" + "=" * 60, flush=True)
+    print("Summary", flush=True)
+    print("=" * 60, flush=True)
     for name, ok in results.items():
-        print(f"  {'PASS' if ok else 'FAIL'}  {name}")
+        print(f"  {'PASS' if ok else 'FAIL'}  {name}", flush=True)
 
     failures = [name for name, ok in results.items() if not ok]
     if failures:
-        print(f"\n{len(failures)} case(s) failed: {failures}")
+        print(f"\n{len(failures)} case(s) failed: {failures}", flush=True)
         return 1
-    print("\nAll cases passed.")
+    print("\nAll cases passed.", flush=True)
     return 0
 
 
 if __name__ == "__main__":
+    if len(sys.argv) >= 3 and sys.argv[1] == "--probe-swap":
+        sys.exit(_run_single_swap_probe(sys.argv[2]))
     sys.exit(main())
