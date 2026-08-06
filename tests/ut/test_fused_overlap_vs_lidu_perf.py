@@ -361,12 +361,14 @@ def summarize_profile_csvs(profile_dir: str, top_n: int = 30) -> None:
     _print_lru_planner_summary(rows)
 
 
-def profile_pipeline(steps, warmup, iters, profile_dir=None, top_n: int = 30):
+def profile_pipeline(steps, warmup, iters, profile_dir=None, top_n: int = 30,
+                     reset=None):
     """Run the full pipeline under torch_npu.profiler (msprof backend).
 
     ``steps`` is a list of ``(name, callable)`` executed in order each iter.
-    Exports an msprof Text/CSV summary to ``profile_dir``, then auto-parses
-    ``op_statistic.csv`` / ``kernel_details.csv`` for average kernel times.
+    Prefer a single step that represents one production round so kernels are
+    not duplicated and stay on the intended streams.
+    ``reset`` runs outside the timed/profiled work each iteration.
     """
     import tempfile
     import torch_npu.profiler as prof
@@ -378,6 +380,9 @@ def profile_pipeline(steps, warmup, iters, profile_dir=None, top_n: int = 30):
     os.makedirs(profile_dir, exist_ok=True)
 
     for _ in range(max(0, warmup)):
+        if reset is not None:
+            reset()
+            torch.npu.synchronize()
         for _, fn in steps:
             fn()
         torch.npu.synchronize()
@@ -393,6 +398,9 @@ def profile_pipeline(steps, warmup, iters, profile_dir=None, top_n: int = 30):
     with prof.profile(activities=activities, experimental_config=exp,
                       on_trace_ready=trace_cb):
         for _ in range(iters):
+            if reset is not None:
+                reset()
+                torch.npu.synchronize()
             for name, fn in steps:
                 # Named ranges help correlate CSV rows with pipeline stages.
                 with torch.profiler.record_function(name):
@@ -671,10 +679,18 @@ def run_a(args) -> dict:
             layout_kv="PA_BSND",
             sparse_mode=3)
 
-    def _a_pipeline():
+    def _a_planner_plus_fused():
+        # Production order on the compute stream: wait for side-stream LRU,
+        # then fused. LI and fused both stay on the compute stream.
         _a_planner()
         torch_npu.npu.current_stream().wait_stream(plan_stream)
         _a_fused()
+
+    def _a_full_pipeline():
+        # One capture/replay unit for profiling: LI and fused share the
+        # compute stream; only LRU host-callback uses plan_stream.
+        _a_li()
+        _a_planner_plus_fused()
 
     # Eager functional smoke before capture/timing.
     _a_planner_sync()
@@ -682,22 +698,15 @@ def run_a(args) -> dict:
     torch.npu.synchronize()
     print(f"[A-cfg] timing_mode={'graph' if use_graph else 'eager'}", flush=True)
 
-    li_runner, li_mode = maybe_graph_runner(
-        _a_li, use_graph=use_graph, warmup=max(1, args.warmup // 2))
-    pipeline_runner, pipeline_mode = maybe_graph_runner(
-        _a_pipeline, use_graph=use_graph, warmup=max(1, args.warmup // 2))
-    fused_runner, fused_mode = maybe_graph_runner(
-        _a_fused, use_graph=use_graph, warmup=max(1, args.warmup // 2))
+    # Profile must capture ONE full pipeline. Capturing LI / fused as separate
+    # graphs previously made them look like different streams and caused fused
+    # to execute twice per profile iter (pipeline + isolated fused).
+    full_runner, full_mode = maybe_graph_runner(
+        _a_full_pipeline, use_graph=use_graph, warmup=max(1, args.warmup // 2))
 
     if getattr(args, "profile", False):
-        # Profile graph replays (or eager callables) so LRU is not inflated by
-        # Python/eager dispatch around host-callback launch.
         profile_pipeline(
-            [
-                ("li", li_runner),
-                ("planner_plus_fused", pipeline_runner),
-                ("fused_overlap", fused_runner),
-            ],
+            [("full_pipeline", full_runner)],
             args.warmup, args.profile_iters, args.profile_dir,
             top_n=args.profile_top_n)
         try:
@@ -706,12 +715,21 @@ def run_a(args) -> dict:
             print(f"OFFLOAD_UNINIT_WARN {type(exc).__name__}: {exc}", flush=True)
         return {
             "approach": "A", "profile": True,
-            "timing_mode": pipeline_mode,
+            "timing_mode": full_mode,
             "batch_size": batch, "q_heads": q_heads, "indexer_heads": idx_heads,
             "seq_len": seq_len, "topk_layout": topk_layout,
             "hit_ratio": args.hit_ratio,
             "warmup": args.warmup, "iters": args.profile_iters,
         }
+
+    # Event timing still breaks components out with separate graphs/runners.
+    li_runner, li_mode = maybe_graph_runner(
+        _a_li, use_graph=use_graph, warmup=max(1, args.warmup // 2))
+    pipeline_runner, pipeline_mode = maybe_graph_runner(
+        _a_planner_plus_fused, use_graph=use_graph,
+        warmup=max(1, args.warmup // 2))
+    fused_runner, fused_mode = maybe_graph_runner(
+        _a_fused, use_graph=use_graph, warmup=max(1, args.warmup // 2))
 
     li_ms = bench_events(li_runner, args.warmup, args.iters)
     pipeline_ms = bench_events(pipeline_runner, args.warmup, args.iters)
@@ -725,7 +743,7 @@ def run_a(args) -> dict:
 
     return {
         "approach": "A",
-        "timing_mode": pipeline_mode,
+        "timing_mode": full_mode,
         "batch_size": batch, "q_heads": q_heads, "indexer_heads": idx_heads,
         "seq_len": seq_len, "topk_layout": topk_layout,
         "hit_ratio": args.hit_ratio,
@@ -944,11 +962,36 @@ def run_b(args) -> dict:
     torch.npu.synchronize()
     print(f"[B-cfg] timing_mode={'graph' if use_graph else 'eager'}", flush=True)
 
+    def _b_pipeline():
+        # Nano production round: LI_MANAGE then scatter/SFA on the same stream.
+        _b_li_manage()
+        _b_scatter_sfa()
+
     # Capture after the functional smoke so graph replay measures steady-state
     # kernel time without eager launch/dispatch noise.
+    _b_reset()
+    torch.npu.synchronize()
+    full_runner, full_mode = maybe_graph_runner(
+        _b_pipeline, use_graph=use_graph, warmup=max(1, args.warmup // 2))
+
+    if getattr(args, "profile", False):
+        # One pipeline per iter. Reset stays outside the profiled work.
+        profile_pipeline(
+            [("full_pipeline", full_runner)],
+            args.warmup, args.profile_iters, args.profile_dir,
+            top_n=args.profile_top_n,
+            reset=_b_reset)
+        return {
+            "approach": "B", "profile": True,
+            "timing_mode": full_mode,
+            "batch_size": batch, "q_heads": q_heads, "indexer_heads": idx_heads,
+            "seq_len": seq_len, "topk_layout": topk_layout,
+            "cache_tokens": cache_tokens, "miss": miss,
+            "warmup": args.warmup, "iters": args.profile_iters,
+        }
+
     li_runner, li_mode = maybe_graph_runner(
         _b_lightning_indexer, use_graph=use_graph, warmup=max(1, args.warmup // 2))
-    # li_manage mutates cache_slots; restore before capture/bench.
     _b_reset()
     torch.npu.synchronize()
     li_manage_runner, li_manage_mode = maybe_graph_runner(
@@ -958,24 +1001,6 @@ def run_b(args) -> dict:
     torch.npu.synchronize()
     scatter_runner, scatter_mode = maybe_graph_runner(
         _b_scatter_sfa, use_graph=use_graph, warmup=max(1, args.warmup // 2))
-
-    if getattr(args, "profile", False):
-        profile_pipeline(
-            [
-                ("lightning_indexer", li_runner),
-                ("li_manage", li_manage_runner),
-                ("scatter_sfa", scatter_runner),
-            ],
-            args.warmup, args.profile_iters, args.profile_dir,
-            top_n=args.profile_top_n)
-        return {
-            "approach": "B", "profile": True,
-            "timing_mode": li_manage_mode,
-            "batch_size": batch, "q_heads": q_heads, "indexer_heads": idx_heads,
-            "seq_len": seq_len, "topk_layout": topk_layout,
-            "cache_tokens": cache_tokens, "miss": miss,
-            "warmup": args.warmup, "iters": args.profile_iters,
-        }
 
     lightning_indexer_ms = bench_events(li_runner, args.warmup, args.iters)
     li_manage_ms = bench_events(
@@ -990,7 +1015,7 @@ def run_b(args) -> dict:
 
     return {
         "approach": "B",
-        "timing_mode": li_manage_mode,
+        "timing_mode": full_mode,
         "batch_size": batch, "q_heads": q_heads, "indexer_heads": idx_heads,
         "seq_len": seq_len, "topk_layout": topk_layout,
         "cache_tokens": cache_tokens, "miss": miss,
