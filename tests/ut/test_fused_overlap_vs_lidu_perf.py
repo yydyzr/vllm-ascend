@@ -43,6 +43,9 @@ a freshly randomized hit/miss partition among the same topk set. Approach
 A wires production-like planner inputs: ``stable_prefix = ak - aq``,
 ``visible_seq = ak``, continuing ``req_ids``, and ``--cache-tokens`` as
 resident fill (capped by A physical capacity ``TOPK*2-1``).
+Approach A ``--cpu-kv-backend`` selects full_kv/full_rope allocation:
+``offload`` (MemFabric, default) or ``swap_memory``
+(``torch_npu.empty_with_swapped_memory``, same style as B DRAM).
 
 GLM-5.2 parameters (kv_lora_rank=512, qk_rope_head_dim=64, index_n_heads=32,
 index_head_dim=128, index_topk=2048, num_attention_heads=64).
@@ -974,7 +977,6 @@ def profile_pipeline(steps, warmup, iters, profile_dir=None, top_n: int = 30,
 # ===================== Approach A: vllm-ascend =====================
 def run_a(args) -> dict:
     import vllm_ascend.vllm_ascend_C  # noqa: F401
-    from memfabric_hybrid import offload
     from vllm_ascend.utils import enable_custom_op
     from vllm_ascend.distributed.kv_transfer.kv_offload_decode import (
         kv_offload_decode_manager,
@@ -985,16 +987,45 @@ def run_a(args) -> dict:
     torch.npu.set_option({"ACL_PRECISION_MODE": "must_keep_origin_dtype"})
     FUSED_OVERLAP = torch.ops._C_ascend.npu_fused_sparse_attention_overlap
 
+    cpu_kv_backend = str(getattr(args, "cpu_kv_backend", "offload"))
+    if cpu_kv_backend not in ("offload", "swap_memory"):
+        raise ValueError(
+            f"--cpu-kv-backend must be offload|swap_memory, got {cpu_kv_backend!r}")
+    use_offload = cpu_kv_backend == "offload"
+    empty_swapped = getattr(torch_npu, "empty_with_swapped_memory", None)
+    if cpu_kv_backend == "swap_memory" and empty_swapped is None:
+        raise RuntimeError(
+            "--cpu-kv-backend=swap_memory requires "
+            "torch_npu.empty_with_swapped_memory")
+
+    offload = None
+    if use_offload:
+        from memfabric_hybrid import offload as _offload_mod
+        offload = _offload_mod
+
     def _align(t, a):
         p = t.data_ptr()
         ap = (p + a - 1) // a * a
         return t[(ap - p) // t.element_size():]
 
-    def _empty_cpu(shape, dtype):
+    def _empty_offload_cpu(shape, dtype):
         n = int(np.prod(shape))
         nb = n * torch.empty((), dtype=dtype).element_size()
         raw = offload.empty([nb + _ALIGN], dtype=torch.int8, pin_memory=True)
         return _align(raw, _ALIGN)[:nb].view(dtype).view(shape)
+
+    def _empty_full_kv(shape, dtype):
+        """Host full KV seen by fused_overlap: MemFabric or swap memory."""
+        if use_offload:
+            return _empty_offload_cpu(shape, dtype)
+        # swap_memory: tensor lives on npu device type with swapped CPU backing.
+        # Avoid introspecting/printing the result on some torch_npu builds.
+        print(
+            f"[A-mem] SWAP_EMPTY request_shape={shape} dtype={dtype} "
+            f"(no tensor introspection)",
+            flush=True,
+        )
+        return empty_swapped(tuple(shape), dtype=dtype, device="npu")
 
     dt = torch.bfloat16
     batch = args.batch_size
@@ -1006,10 +1037,18 @@ def run_a(args) -> dict:
     hit_count = TOPK - miss
     hit_ratio = 1.0 - (miss / float(TOPK))
     cache_tokens_req = int(args.cache_tokens)
+    # Resident / selection HBM capacity matches production topk_buffer_size.
+    # selection_kv_block_table last dim = topk_buffer_size // BLOCK_SIZE
+    # (e.g. 4096/128=32), NOT TOPK//BLOCK_SIZE (2048/128=16).
+    topk_buffer_size = TOPK * 2
+    if topk_buffer_size % BLOCK_SIZE != 0:
+        raise ValueError(
+            f"topk_buffer_size={topk_buffer_size} must be divisible by "
+            f"BLOCK_SIZE={BLOCK_SIZE}")
     # Per-request CPU KV pool: batch independent sequences.
     blocks_per_seq = cdiv(seq_len, BLOCK_SIZE)
     fmbn = batch * blocks_per_seq
-    smbn = cdiv(TOPK, BLOCK_SIZE)
+    smbn = topk_buffer_size // BLOCK_SIZE
     scale = 1.0 / math.sqrt(KVD)
     elem = torch.empty((), dtype=dt).element_size()
     cpu_kv_bytes = fmbn * BLOCK_SIZE * (KVD + KRD) * elem
@@ -1017,35 +1056,52 @@ def run_a(args) -> dict:
     cpu_meta_bytes = batch * 16392 * 2 + 8 * _ALIGN
     needed_pool = cpu_kv_bytes + cpu_meta_bytes + 64 * 1024 * 1024
     pool_bytes = max(int(args.dram_size_gb * _GIB), int(needed_pool))
-    cfg = offload.OffloadConfig()
-    cfg.device_id = torch_npu.npu.current_device()
-    cfg.size = pool_bytes
-    cfg.world_size = 1
-    cfg.rank_id = 0
-    offload.initialize(cfg)
-    print(
-        f"[A-mem] CPU KV scaled by batch: blocks={fmbn} "
-        f"(batch={batch} x blocks_per_seq={blocks_per_seq})  "
-        f"full_kv+rope≈{cpu_kv_bytes / _GIB:.3f} GiB  "
-        f"offload_pool={pool_bytes / _GIB:.3f} GiB",
-        flush=True,
-    )
+    if use_offload:
+        cfg = offload.OffloadConfig()
+        cfg.device_id = torch_npu.npu.current_device()
+        cfg.size = pool_bytes
+        cfg.world_size = 1
+        cfg.rank_id = 0
+        offload.initialize(cfg)
+        print(
+            f"[A-mem] backend=offload CPU KV scaled by batch: blocks={fmbn} "
+            f"(batch={batch} x blocks_per_seq={blocks_per_seq})  "
+            f"full_kv+rope≈{cpu_kv_bytes / _GIB:.3f} GiB  "
+            f"offload_pool={pool_bytes / _GIB:.3f} GiB",
+            flush=True,
+        )
+    else:
+        print(
+            f"[A-mem] backend=swap_memory CPU KV scaled by batch: "
+            f"blocks={fmbn} (batch={batch} x blocks_per_seq={blocks_per_seq})  "
+            f"full_kv+rope≈{cpu_kv_bytes / _GIB:.3f} GiB  "
+            f"(torch_npu.empty_with_swapped_memory)",
+            flush=True,
+        )
     torch.manual_seed(910000 + batch + q_heads * 17 + seq_len)
 
     q = torch.randn(batch, q_heads, KVD, dtype=dt, device="npu")
     qr = torch.randn(batch, q_heads, KRD, dtype=dt, device="npu")
     q_fused = torch.cat([q, qr], dim=-1).contiguous()
-    full_kv = _empty_cpu([fmbn, BLOCK_SIZE, KVD], dt)
-    full_kv.zero_()
-    full_rope = _empty_cpu([fmbn, BLOCK_SIZE, KRD], dt)
-    full_rope.zero_()
+    full_kv = _empty_full_kv([fmbn, BLOCK_SIZE, KVD], dt)
+    full_rope = _empty_full_kv([fmbn, BLOCK_SIZE, KRD], dt)
+    if use_offload:
+        full_kv.zero_()
+        full_rope.zero_()
+    # swap_memory: skip zero_/shape/device introspection (known SIGSEGV risk).
     # Row r owns blocks [r*blocks_per_seq, (r+1)*blocks_per_seq).
     full_bt = (
         torch.arange(fmbn, dtype=torch.int32, device="npu")
         .view(batch, blocks_per_seq)
         .contiguous()
     )
-    aq = torch.tensor([1] * batch, dtype=torch.int32, device="npu")
+    # TND query: full_q_actual_seq MUST be cumulative token offsets
+    # [1, 2, ..., batch] (1 decode token / request). Kernel does
+    # actS1(b) = aq[b] - aq[b-1]; a flat [1]*batch zeros all rows
+    # after b=0, so sfa_copy latency would not scale with batch.
+    # Matches production / LI path (li_ql) / Approach B (actual_q).
+    aq = torch.arange(1, batch + 1, dtype=torch.int32, device="npu")
+    # PA_BSND KV: per-request absolute lengths (not cumulative).
     ak = torch.tensor([seq_len] * batch, dtype=torch.int32, device="npu")
 
     index_seed = 910000 + batch + q_heads * 17 + seq_len
@@ -1057,11 +1113,22 @@ def run_a(args) -> dict:
     non_topk_mask[topk_tokens_cpu.to(torch.long)] = False
     non_topk = torch.arange(seq_len, dtype=torch.int32)[non_topk_mask]
 
+    # Selection HBM sized by resident capacity (topk_buffer_size), same as
+    # production cache_blocks_per_row = lru_resident_capacity // block_size.
     total_sel = smbn * batch
     sel_kv = torch.zeros(total_sel, BLOCK_SIZE, KVD, dtype=dt, device="npu")
     sel_rope = torch.zeros(total_sel, BLOCK_SIZE, KRD, dtype=dt, device="npu")
     sel_bt = torch.arange(total_sel, dtype=torch.int32, device="npu").reshape(batch, smbn)
+    # status last dim tracks logical TOPK (+ actual_seq), not topk_buffer_size.
     sel_status = torch.full((batch, 1, 1, TOPK + 1), -1, dtype=torch.int32, device="npu")
+    print(
+        f"[A-mem] selection: topk_buffer_size={topk_buffer_size} "
+        f"blocks_per_row={smbn} (=buffer/BLOCK)  "
+        f"sel_bt.shape={tuple(sel_bt.shape)}  "
+        f"sel_status.shape={tuple(sel_status.shape)} "
+        f"(status last dim = TOPK+1, not buffer blocks)",
+        flush=True,
+    )
 
     li_q = torch.zeros((batch, idx_heads, INDEX_DIM), dtype=dt, device="npu")
     li_q[:, 0, 0] = 1
@@ -1127,15 +1194,22 @@ def run_a(args) -> dict:
         CONTROL_OFFSET_INT16 + MEMBERSHIP_CONTROL_INT16 + MEMBERSHIP_ALIGN_INT16
     ) // MEMBERSHIP_ALIGN_INT16 * MEMBERSHIP_ALIGN_INT16  # 16392
 
-    topk_buffer_size = TOPK * 2
     max_rows = batch
     threads = 8
     plan_start = CONTROL_OFFSET_INT16 - TOPK
     required_columns = CONTROL_OFFSET_INT16 + MEMBERSHIP_CONTROL_INT16
 
-    membership_map = offload.empty(
-        [max_rows * STORAGE_INT16], dtype=torch.int16, pin_memory=True,
-    ).view([max_rows, STORAGE_INT16])
+    # membership_map is host-writable by the LRU planner; keep pin_memory CPU
+    # even when full_kv/full_rope use swap_memory.
+    if use_offload:
+        membership_map = offload.empty(
+            [max_rows * STORAGE_INT16], dtype=torch.int16, pin_memory=True,
+        ).view([max_rows, STORAGE_INT16])
+    else:
+        membership_map = torch.empty(
+            [max_rows, STORAGE_INT16], dtype=torch.int16,
+            device="cpu", pin_memory=True,
+        )
     membership_map.fill_(-1)
     control = membership_map[
         :, CONTROL_OFFSET_INT16:CONTROL_OFFSET_INT16 + MEMBERSHIP_CONTROL_INT16]
@@ -1194,11 +1268,18 @@ def run_a(args) -> dict:
     topk_flat = topk.reshape(batch, TOPK).contiguous()
     req_ids_npu = torch.arange(batch, dtype=torch.int64, device="npu")
     # Production decode: stable_prefix = actual_seq_key - query_len.
-    # aq/ak are therefore wired into the planner (not decorative).
-    stable_prefix_npu = (ak - aq).clamp_min(0).to(torch.int32).contiguous()
+    # Do NOT subtract TND-cumulative aq here — that would make
+    # stable_prefix = [seq-1, seq-2, ...] and break uniform-batch checks.
+    # Per-request decode query length is 1; aq is only for fused TND.
+    q_lens = torch.ones(batch, dtype=torch.int32, device="npu")
+    stable_prefix_npu = (ak - q_lens).clamp_min(0).to(torch.int32).contiguous()
     visible_seq_npu = ak.to(torch.int32).contiguous()
     stable_prefix_len = int(stable_prefix_npu[0].item())
     visible_seq_len = int(visible_seq_npu[0].item())
+    if int(aq[-1].item()) != batch:
+        raise RuntimeError(
+            f"A TND full_q_actual_seq must end at batch={batch}, "
+            f"got aq[-1]={int(aq[-1].item())}")
     if not torch.all(stable_prefix_npu == stable_prefix_len):
         raise RuntimeError("A UT expects uniform stable_prefix across the batch")
     if not torch.all(visible_seq_npu == visible_seq_len):
@@ -1228,7 +1309,8 @@ def run_a(args) -> dict:
     )
     print(
         f"[A-lru] wired inputs: req_ids=arange({batch}) "
-        f"stable_prefix=ak-aq={stable_prefix_len} "
+        f"full_q_actual_seq=cumsum(1)→aq[-1]={batch} "
+        f"stable_prefix=ak-q_lens={stable_prefix_len} "
         f"visible_seq=ak={visible_seq_len} "
         f"topk_buffer={topk_buffer_size} resident_capacity={resident_capacity} "
         f"cache_tokens_req={cache_tokens_req} fill_count={fill_count} "
@@ -1505,14 +1587,16 @@ def run_a(args) -> dict:
         f"pipeline={pipeline_ms:.4f} ms",
         flush=True,
     )
-    try:
-        offload.uninitialize()
-    except Exception as exc:
-        print(f"OFFLOAD_UNINIT_WARN {type(exc).__name__}: {exc}", flush=True)
+    if use_offload:
+        try:
+            offload.uninitialize()
+        except Exception as exc:
+            print(f"OFFLOAD_UNINIT_WARN {type(exc).__name__}: {exc}", flush=True)
 
     result = {
         "approach": "A",
         "timing_mode": full_mode,
+        "cpu_kv_backend": cpu_kv_backend,
         "batch_size": batch, "q_heads": q_heads, "indexer_heads": idx_heads,
         "seq_len": seq_len, "topk_layout": topk_layout,
         "miss": miss, "hit_count": hit_count, "hit_ratio": hit_ratio,
@@ -2374,7 +2458,19 @@ def parse_args():
     )
     p.add_argument("--warmup", type=int, default=10)
     p.add_argument("--iters", type=int, default=50)
-    p.add_argument("--dram-size-gb", type=float, default=2.0)
+    p.add_argument(
+        "--cpu-kv-backend",
+        choices=("offload", "swap_memory"),
+        default="offload",
+        help="Approach A only: how to allocate full_kv/full_rope for fused. "
+             "offload=MemFabric pin_memory (default); "
+             "swap_memory=torch_npu.empty_with_swapped_memory (same as B DRAM).",
+    )
+    p.add_argument(
+        "--dram-size-gb", type=float, default=2.0,
+        help="Approach A MemFabric OffloadConfig.size lower bound in GiB "
+             "(only used with --cpu-kv-backend=offload).",
+    )
     p.add_argument(
         "--graph-mode",
         dest="graph_mode",
