@@ -1,37 +1,31 @@
 [cfg] tp=16  q_heads=4 (=64/16)
-INFO 08-05 20:40:43 [__init__.py:44] Available plugins for group vllm.platform_plugins:
-INFO 08-05 20:40:43 [__init__.py:46] - ascend -> vllm_ascend:register
-INFO 08-05 20:40:43 [__init__.py:49] All plugins in this group will be loaded. Set `VLLM_PLUGINS` to control which plugins to load.
-INFO 08-05 20:40:43 [__init__.py:237] Platform plugin ascend is activated
-INFO 08-05 20:40:43 [platform.py:61] Breakable cudagraph is force disabled on Ascend because DeepSeek V4 PIECEWISE cudagraph is not supported yet.
-/mnt/share_space/l00933205/code/mte_fused/vllm-ascend/tests/ut/test_fused_overlap_vs_lidu_perf.py:231: UserWarning: Cannot create tensor with interal format while allow_internel_format=False, tensor will be created with base format. (Triggered internally at ../torch_npu/csrc/aten/common/TensorFactories.cpp:340.)
+INFO 08-06 09:53:19 [__init__.py:44] Available plugins for group vllm.platform_plugins:
+INFO 08-06 09:53:19 [__init__.py:46] - ascend -> vllm_ascend:register
+INFO 08-06 09:53:19 [__init__.py:49] All plugins in this group will be loaded. Set `VLLM_PLUGINS` to control which plugins to load.
+INFO 08-06 09:53:19 [__init__.py:237] Platform plugin ascend is activated
+INFO 08-06 09:53:19 [platform.py:61] Breakable cudagraph is force disabled on Ascend because DeepSeek V4 PIECEWISE cudagraph is not supported yet.
+/mnt/share_space/l00933205/code/mte_fused/vllm-ascend/tests/ut/test_fused_overlap_vs_lidu_perf.py:482: UserWarning: Cannot create tensor with interal format while allow_internel_format=False, tensor will be created with base format. (Triggered internally at ../torch_npu/csrc/aten/common/TensorFactories.cpp:340.)
   kr[:, :, :, 0, 0] = (index_scores % 64).to(dt)
+[A-cfg] timing_mode=graph
 Traceback (most recent call last):
-  File "/mnt/share_space/l00933205/code/mte_fused/vllm-ascend/tests/ut/test_fused_overlap_vs_lidu_perf.py", line 807, in <module>
+  File "/mnt/share_space/l00933205/code/mte_fused/vllm-ascend/tests/ut/test_fused_overlap_vs_lidu_perf.py", line 1141, in <module>
     main()
-  File "/mnt/share_space/l00933205/code/mte_fused/vllm-ascend/tests/ut/test_fused_overlap_vs_lidu_perf.py", line 791, in main
+  File "/mnt/share_space/l00933205/code/mte_fused/vllm-ascend/tests/ut/test_fused_overlap_vs_lidu_perf.py", line 1125, in main
     result = run_a(args)
              ^^^^^^^^^^^
-  File "/mnt/share_space/l00933205/code/mte_fused/vllm-ascend/tests/ut/test_fused_overlap_vs_lidu_perf.py", line 437, in run_a
-    pipeline_ms = bench_events(_a_pipeline, args.warmup, args.iters)
-                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/mnt/share_space/l00933205/code/mte_fused/vllm-ascend/tests/ut/test_fused_overlap_vs_lidu_perf.py", line 97, in bench_events
+  File "/mnt/share_space/l00933205/code/mte_fused/vllm-ascend/tests/ut/test_fused_overlap_vs_lidu_perf.py", line 686, in run_a
+    pipeline_runner, pipeline_mode = maybe_graph_runner(
+                                     ^^^^^^^^^^^^^^^^^^^
+  File "/mnt/share_space/l00933205/code/mte_fused/vllm-ascend/tests/ut/test_fused_overlap_vs_lidu_perf.py", line 137, in maybe_graph_runner
+    graph = capture_npu_graph(runner, warmup=warmup)
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/mnt/share_space/l00933205/code/mte_fused/vllm-ascend/tests/ut/test_fused_overlap_vs_lidu_perf.py", line 124, in capture_npu_graph
     runner()
-  File "/mnt/share_space/l00933205/code/mte_fused/vllm-ascend/tests/ut/test_fused_overlap_vs_lidu_perf.py", line 435, in _a_pipeline
+  File "/mnt/share_space/l00933205/code/mte_fused/vllm-ascend/tests/ut/test_fused_overlap_vs_lidu_perf.py", line 674, in _a_pipeline
     _a_planner()
-  File "/mnt/share_space/l00933205/code/mte_fused/vllm-ascend/tests/ut/test_fused_overlap_vs_lidu_perf.py", line 378, in _a_planner
-    torch_npu.npu._launch_host_func(
-  File "/usr/local/python3.11.10/lib/python3.11/site-packages/torch_npu/npu/__init__.py", line 456, in _launch_host_func
-    torch_npu._C._launch_host_func(op_stream, fn, user_data)
-RuntimeError: launch_callback:../torch_npu/csrc/core/npu/NPUGraph.cpp:88 NPU function error: c10_npu::acl::AclrtLaunchCallback(func, fnData, type, stream), error code is 107015
-[ERROR] 2026-08-05-20:40:50 (PID:46520, Device:0, RankID:-1) ERR00100 PTA call acl api failed
-[Error]: The stream corresponding to the callback is not registered with the thread.
-        Check whether the stream has been registered with the thread and whether the acl.rt.subscribe_report interface is invoked.
-EE9999: Inner Error!
-EE9999[PID: 46520] 2026-08-05-20:40:50.852.223 (EE9999):  The stream used by this user's callback function is not registered to any thread, retCode=0x703000b[FUNC:CallbackLaunch][FILE:api_impl.cc][LINE:5169]
-        TraceBack (most recent call last):
-       rtCallbackLaunch execution failed, reason=stream not registered[FUNC:FuncErrorReason][FILE:error_message_manage.cc][LINE:65]
-       launch callback task failed, runtime errorCode = 107015[FUNC:ReportCallError][FILE:log_inner.cpp][LINE:148]
-
+  File "/mnt/share_space/l00933205/code/mte_fused/vllm-ascend/tests/ut/test_fused_overlap_vs_lidu_perf.py", line 641, in _a_planner
+    lru_cpp.enqueue_lru_resident_compact_with_plan_stable_rows(
+RuntimeError: aclrtLaunchHostFunc for stable-row external LRU plan failed, error code: 107011
+[ERROR] 2026-08-06-09:53:27 (PID:50862, Device:0, RankID:-1) ERR99999 UNKNOWN applicaiton exception
 double free or corruption (fasttop)
-compare_op.sh: line 22: 46520 Aborted                 (core dumped) python3 vllm-ascend/tests/ut/test_fused_overlap_vs_lidu_perf.py --approach A --out a.json --miss 100 --cache-tokens 12288 --batch-size 8 --topk-layout random
+compare_op.sh: line 24: 50862 Aborted                 (core dumped) python3 vllm-ascend/tests/ut/test_fused_overlap_vs_lidu_perf.py --approach A --out a.json --miss 100 --cache-tokens 12288 --batch-size 8 --topk-layout random --profile --profile-dir ./prof/a
