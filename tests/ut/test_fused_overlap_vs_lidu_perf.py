@@ -5,8 +5,14 @@ process (writes JSON), then --compare reads both.
 
 A: LI + host-side LRU planner + fused_overlap(copy+sfa in one kernel,
    consuming the host-encoded external plan).
-B: LightningIndexer baseline + LI_MANAGE(li+lru fused) +
-   scatter_copy_sfa(copy+sfa fused).
+B: LightningIndexer baseline (same LI inputs as li_manage) +
+   LI_MANAGE(li+lru fused) + scatter_copy_sfa(copy+sfa fused).
+   Reports ``li_manage_minus_li_ms`` = li_manage - lightning_indexer.
+
+Supports a scenario matrix via multi-value ``--batch-size`` / ``--miss`` /
+``--seq-len`` / ``--cache-tokens`` (cartesian product). Each approach writes
+a suite JSON; ``--compare`` matches scenarios by
+(batch_size, miss, seq_len, cache_tokens, topk_layout, q_heads).
 
 Timing defaults to NPUGraph capture/replay (``--graph-mode``). Use
 ``--eager`` only for debugging launch/dispatch overhead. Approach A's planner
@@ -37,6 +43,7 @@ import math
 import os
 import statistics
 import sys
+import tempfile
 import time
 from collections import defaultdict
 from pathlib import Path
@@ -518,8 +525,9 @@ def summarize_profile_csvs(
     top_n: int = 30,
     *,
     drop_first: int = 1,
+    include_lru_planner: bool = True,
 ) -> None:
-    """Print average kernel / op times and LRU timeline markers."""
+    """Print average kernel / op times; optionally Approach-A LRU markers."""
     found = _ensure_profile_artifacts(profile_dir)
     if not found:
         print("[profile] no profile artifacts found under "
@@ -592,21 +600,30 @@ def summarize_profile_csvs(
         )
     else:
         print(
-            "[profile] no op_statistic/kernel_details; still trying LRU "
-            "markers from timeline/runtime exports.",
+            "[profile] no op_statistic/kernel_details found under "
+            f"{profile_dir}.",
             flush=True,
         )
-    _print_lru_planner_summary(found, rows, drop_first=drop_first)
+    if include_lru_planner:
+        _print_lru_planner_summary(found, rows, drop_first=drop_first)
+    else:
+        print(
+            "[profile] skip LRU planner summary "
+            "(Approach B has no host LRU planner; LRU is inside li_manage).",
+            flush=True,
+        )
 
 
 def profile_pipeline(steps, warmup, iters, profile_dir=None, top_n: int = 30,
-                     reset=None, drop_first: int = 1):
+                     reset=None, drop_first: int = 1,
+                     include_lru_planner: bool = True):
     """Run the full pipeline under torch_npu.profiler (msprof backend).
 
     ``steps`` is a list of ``(name, callable)`` executed in order each iter.
     Prefer a single step that represents one production round so kernels are
     not duplicated and stay on the intended streams.
     ``reset`` runs outside the timed/profiled work each iteration.
+    ``include_lru_planner`` enables Approach-A HOSTFUNC/EVENT_WAIT summary.
 
     Each invocation writes into a fresh ``run_<timestamp>_<pid>/`` subdirectory
     under ``profile_dir``, so parsing never picks a stale ``op_statistic.csv``
@@ -657,7 +674,12 @@ def profile_pipeline(steps, warmup, iters, profile_dir=None, top_n: int = 30,
             torch.npu.synchronize()
 
     print(f"PROFILE_TRACE_DIR={run_dir}", flush=True)
-    summarize_profile_csvs(str(run_dir), top_n=top_n, drop_first=drop_first)
+    summarize_profile_csvs(
+        str(run_dir),
+        top_n=top_n,
+        drop_first=drop_first,
+        include_lru_planner=include_lru_planner,
+    )
 
 
 # ===================== Approach A: vllm-ascend =====================
@@ -1135,7 +1157,8 @@ def run_a(args) -> dict:
             args.warmup, args.profile_iters, args.profile_dir,
             top_n=args.profile_top_n,
             reset=_a_reset_lru_state,
-            drop_first=args.profile_drop_first)
+            drop_first=args.profile_drop_first,
+            include_lru_planner=True)
         try:
             offload.uninitialize()
         except Exception as exc:
@@ -1385,12 +1408,15 @@ def run_b(args) -> dict:
         sparse_slots[:, 0, :] = cache_slots[req_e_long][:, topk_long]
 
     def _b_li_manage():
+        # LI-part inputs match _b_lightning_indexer (query/key/weights/bt/lens);
+        # extra args are the fused LRU/cache-management operands.
         return torch.ops.ops_overlap.li_manage_out.default(
             li_query, idx_cache, weights, req_e_dev, cache_slots,
             cache_tokens_t, candidate_lens, idx_bt,
             li_src_ids, li_dst_slots, miss_counts)
 
     def _b_lightning_indexer():
+        # Same LI inputs as the indexer half of li_manage_out.
         return torch_npu.npu_lightning_indexer(
             query=li_query,
             key=idx_cache,
@@ -1411,6 +1437,12 @@ def run_b(args) -> dict:
             actual_q, actual_kv, qrope, hbm_kpe, dram_kpe, dram_ckv,
             dram_bt_dev, src_ids_t, miss_counts, scale)
 
+    print(
+        "[B-cfg] lightning_indexer shares LI inputs with li_manage_out: "
+        "query/key/weights/block_table/actual_seq_lengths_* "
+        "(delta = li_manage - lightning_indexer ≈ fused LRU cost)",
+        flush=True,
+    )
     _b_lightning_indexer()
     _b_reset()
     _b_li_manage()
@@ -1433,31 +1465,13 @@ def run_b(args) -> dict:
 
     # Capture after the functional smoke so graph replay measures steady-state
     # kernel time without eager launch/dispatch noise.
-    full_runner, full_mode = maybe_graph_runner(
-        _b_pipeline, use_graph=use_graph,
-        warmup=max(1, args.warmup // 2), reset=_b_reset)
-
-    if getattr(args, "profile", False):
-        # One pipeline per iter. Reset stays outside the profiled work.
-        profile_pipeline(
-            [("full_pipeline", full_runner)],
-            args.warmup, args.profile_iters, args.profile_dir,
-            top_n=args.profile_top_n,
-            reset=_b_reset,
-            drop_first=args.profile_drop_first)
-        return {
-            "approach": "B", "profile": True,
-            "timing_mode": full_mode,
-            "batch_size": batch, "q_heads": q_heads, "indexer_heads": idx_heads,
-            "seq_len": seq_len, "topk_layout": topk_layout,
-            "cache_tokens": cache_tokens, "miss": miss,
-            "warmup": args.warmup, "iters": args.profile_iters,
-        }
-
     li_runner, li_mode = maybe_graph_runner(
         _b_lightning_indexer, use_graph=use_graph, warmup=max(1, args.warmup // 2))
     li_manage_runner, li_manage_mode = maybe_graph_runner(
         _b_li_manage, use_graph=use_graph,
+        warmup=max(1, args.warmup // 2), reset=_b_reset)
+    full_runner, full_mode = maybe_graph_runner(
+        _b_pipeline, use_graph=use_graph,
         warmup=max(1, args.warmup // 2), reset=_b_reset)
 
     def _b_reset_then_manage():
@@ -1469,11 +1483,55 @@ def run_b(args) -> dict:
         _b_scatter_sfa, use_graph=use_graph,
         warmup=max(1, args.warmup // 2), reset=_b_reset_then_manage)
 
+    def _b_report_li_delta(lightning_indexer_ms: float, li_manage_ms: float) -> float:
+        delta_ms = li_manage_ms - lightning_indexer_ms
+        print(
+            f"[B-timing] lightning_indexer={lightning_indexer_ms:.4f} ms  "
+            f"li_manage={li_manage_ms:.4f} ms  "
+            f"delta(li_manage-LI)={delta_ms:+.4f} ms",
+            flush=True,
+        )
+        return delta_ms
+
+    if getattr(args, "profile", False):
+        # Profile LI and li_manage as separate named ranges (same LI inputs),
+        # then scatter. No host-LRU planner summary for B.
+        profile_pipeline(
+            [
+                ("lightning_indexer", li_runner),
+                ("li_manage", li_manage_runner),
+                ("scatter_sfa", scatter_runner),
+            ],
+            args.warmup, args.profile_iters, args.profile_dir,
+            top_n=args.profile_top_n,
+            reset=_b_reset,
+            drop_first=args.profile_drop_first,
+            include_lru_planner=False)
+        # Event delta is the explicit LI vs li_manage comparison metric.
+        lightning_indexer_ms = bench_events(
+            li_runner, args.warmup, args.iters)
+        li_manage_ms = bench_events(
+            li_manage_runner, args.warmup, args.iters, reset=_b_reset)
+        delta_ms = _b_report_li_delta(lightning_indexer_ms, li_manage_ms)
+        return {
+            "approach": "B", "profile": True,
+            "timing_mode": full_mode,
+            "batch_size": batch, "q_heads": q_heads, "indexer_heads": idx_heads,
+            "seq_len": seq_len, "topk_layout": topk_layout,
+            "cache_tokens": cache_tokens, "miss": miss,
+            "lightning_indexer_ms": lightning_indexer_ms,
+            "li_manage_ms": li_manage_ms,
+            "li_manage_minus_li_ms": delta_ms,
+            "warmup": args.warmup, "iters": args.profile_iters,
+            "li_mode": li_mode, "li_manage_mode": li_manage_mode,
+        }
+
     lightning_indexer_ms = bench_events(li_runner, args.warmup, args.iters)
     li_manage_ms = bench_events(
         li_manage_runner, args.warmup, args.iters, reset=_b_reset)
     sfa_ms = bench_events(
         scatter_runner, args.warmup, args.iters, reset=_b_reset_then_manage)
+    delta_ms = _b_report_li_delta(lightning_indexer_ms, li_manage_ms)
 
     return {
         "approach": "B",
@@ -1482,46 +1540,252 @@ def run_b(args) -> dict:
         "seq_len": seq_len, "topk_layout": topk_layout,
         "cache_tokens": cache_tokens, "miss": miss,
         "lightning_indexer_ms": lightning_indexer_ms,
-        "li_manage_ms": li_manage_ms, "scatter_sfa_ms": sfa_ms,
+        "li_manage_ms": li_manage_ms,
+        "li_manage_minus_li_ms": delta_ms,
+        "scatter_sfa_ms": sfa_ms,
         "total_ms": li_manage_ms + sfa_ms, "warmup": args.warmup, "iters": args.iters,
         "li_mode": li_mode, "li_manage_mode": li_manage_mode,
         "scatter_mode": scatter_mode,
     }
 
 
-# ===================== Compare =====================
-def compare(args) -> None:
-    with open(args.out_a) as f:
-        ra = json.load(f)
-    with open(args.out_b) as f:
-        rb = json.load(f)
-    print("----- TIMING SUMMARY (ms, mean over iters) -----", flush=True)
-    if ra["topk_layout"] != rb["topk_layout"]:
-        raise ValueError(
-            "Cannot compare runs with different top-k layouts: "
-            f"A={ra['topk_layout']}, B={rb['topk_layout']}.")
-    print(f"Top-k layout: {ra['topk_layout']}", flush=True)
-    if "miss" in ra or "miss" in rb:
-        print(
-            f"Miss: A={ra.get('miss', 'n/a')} B={rb.get('miss', 'n/a')}",
-            flush=True)
+# ===================== Multi-scenario suite / Compare =====================
+def scenario_key(result: dict) -> tuple:
+    """Identity used to align A/B scenarios for compare."""
+    cache_tokens = result.get("cache_tokens", result.get("cache_tokens_req", -1))
+    return (
+        int(result["batch_size"]),
+        int(result["miss"]),
+        int(result.get("seq_len", -1)),
+        int(cache_tokens),
+        str(result.get("topk_layout", "contiguous")),
+        int(result.get("q_heads", -1)),
+    )
+
+
+def load_scenarios(path: str) -> tuple[dict, list[dict]]:
+    with open(path) as f:
+        payload = json.load(f)
+    if isinstance(payload, dict) and isinstance(payload.get("scenarios"), list):
+        return payload, payload["scenarios"]
+    if isinstance(payload, dict):
+        return payload, [payload]
+    raise ValueError(f"Unsupported result JSON format in {path}")
+
+
+def run_scenario_suite(args, runner) -> dict:
+    """Run ``runner`` over the cartesian product of sweep knobs."""
+    batch_sizes = [int(x) for x in args.batch_size]
+    misses = [int(x) for x in args.miss]
+    seq_lens = [int(x) for x in args.seq_len]
+    cache_tokens_list = [int(x) for x in args.cache_tokens]
+    if not batch_sizes:
+        raise ValueError("--batch-size requires at least one value")
+    if not misses:
+        raise ValueError("--miss requires at least one value")
+    if not seq_lens:
+        raise ValueError("--seq-len requires at least one value")
+    if not cache_tokens_list:
+        raise ValueError("--cache-tokens requires at least one value")
+    for m in misses:
+        if m < 0 or m > TOPK:
+            raise ValueError(f"--miss values must be in [0, {TOPK}], got {m}")
+    for sl in seq_lens:
+        if sl <= 0:
+            raise ValueError(f"--seq-len values must be > 0, got {sl}")
+    for ct in cache_tokens_list:
+        if ct <= 0:
+            raise ValueError(f"--cache-tokens values must be > 0, got {ct}")
+
+    n_scenarios = (
+        len(batch_sizes) * len(misses) * len(seq_lens) * len(cache_tokens_list)
+    )
+    print(
+        f"[suite] approach={args.approach} batch_sizes={batch_sizes} "
+        f"misses={misses} seq_lens={seq_lens} "
+        f"cache_tokens={cache_tokens_list}  ({n_scenarios} scenarios)",
+        flush=True,
+    )
+    base_profile_dir = args.profile_dir
+    if getattr(args, "profile", False) and not base_profile_dir:
+        base_profile_dir = tempfile.mkdtemp(prefix="fused_overlap_suite_prof_")
+        print(f"[suite] no --profile-dir given, using {base_profile_dir}",
+              flush=True)
+    scenarios: list[dict] = []
+    for bs in batch_sizes:
+        for miss in misses:
+            for seq_len in seq_lens:
+                for cache_tokens in cache_tokens_list:
+                    print(
+                        f"\n===== scenario approach={args.approach} "
+                        f"batch_size={bs} miss={miss} "
+                        f"seq_len={seq_len} cache_tokens={cache_tokens} =====",
+                        flush=True,
+                    )
+                    args.batch_size = bs
+                    args.miss = miss
+                    args.seq_len = seq_len
+                    args.cache_tokens = cache_tokens
+                    if getattr(args, "profile", False):
+                        # Always isolate profiles by the full scenario key.
+                        args.profile_dir = os.path.join(
+                            base_profile_dir,
+                            f"bs{bs}_miss{miss}_seq{seq_len}_ct{cache_tokens}",
+                        )
+                    result = runner(args)
+                    # Normalize cache_tokens field so A/B compare keys align.
+                    if "cache_tokens" not in result and "cache_tokens_req" in result:
+                        result["cache_tokens"] = result["cache_tokens_req"]
+                    scenarios.append(result)
+                    gc.collect()
+                    try:
+                        torch.npu.empty_cache()
+                    except Exception:
+                        pass
+
+    args.batch_size = batch_sizes
+    args.miss = misses
+    args.seq_len = seq_lens
+    args.cache_tokens = cache_tokens_list
+    args.profile_dir = base_profile_dir
+    return {
+        "approach": args.approach,
+        "suite": True,
+        "batch_sizes": batch_sizes,
+        "misses": misses,
+        "seq_lens": seq_lens,
+        "cache_tokens_list": cache_tokens_list,
+        "topk_layout": args.topk_layout,
+        "q_heads": args.q_heads,
+        "scenarios": scenarios,
+    }
+
+
+def _fmt_ms(value, digits: int = 4) -> str:
+    if value is None:
+        return "n/a"
+    try:
+        return f"{float(value):.{digits}f}"
+    except (TypeError, ValueError):
+        return "n/a"
+
+
+def _print_scenario_compare(ra: dict, rb: dict) -> None:
+    key = scenario_key(ra)
+    print(
+        f"----- SCENARIO batch={key[0]} miss={key[1]} "
+        f"seq_len={key[2]} cache_tokens={key[3]} "
+        f"topk_layout={key[4]} q_heads={key[5]} -----",
+        flush=True,
+    )
     print(
         f"Timing mode: A={ra.get('timing_mode', 'unknown')} "
         f"B={rb.get('timing_mode', 'unknown')}",
-        flush=True)
-    print(f"Approach A (vllm-ascend):  LI={ra['li_ms']:.4f}  "
-          f"planner(launch_host)={ra.get('planner_ms', 0.0):.4f}  "
-          f"fused_overlap={ra['fused_overlap_ms']:.4f}  "
-          f"pipeline={ra.get('pipeline_ms', 0.0):.4f}  "
-          f"total={ra['total_ms']:.4f}",
-          flush=True)
-    print(f"Approach B (nano):        LI={rb['lightning_indexer_ms']:.4f}  "
-          f"LI_MANAGE={rb['li_manage_ms']:.4f}  "
-          f"scatter_sfa={rb['scatter_sfa_ms']:.4f}  total={rb['total_ms']:.4f}",
-          flush=True)
-    diff = ra["total_ms"] - rb["total_ms"]
+        flush=True,
+    )
+    if ra.get("profile") or rb.get("profile"):
+        print(
+            f"Approach A: profile={ra.get('profile', False)}  "
+            f"miss={ra.get('miss')} batch={ra.get('batch_size')}",
+            flush=True,
+        )
+        print(
+            f"Approach B: profile={rb.get('profile', False)}  "
+            f"LI={_fmt_ms(rb.get('lightning_indexer_ms'))}  "
+            f"LI_MANAGE={_fmt_ms(rb.get('li_manage_ms'))}  "
+            f"delta(LI_MANAGE-LI)={_fmt_ms(rb.get('li_manage_minus_li_ms'))}",
+            flush=True,
+        )
+        return
+
+    print(
+        f"Approach A (vllm-ascend):  LI={_fmt_ms(ra.get('li_ms'))}  "
+        f"planner(launch_host)={_fmt_ms(ra.get('planner_ms', 0.0))}  "
+        f"fused_overlap={_fmt_ms(ra.get('fused_overlap_ms'))}  "
+        f"pipeline={_fmt_ms(ra.get('pipeline_ms', 0.0))}  "
+        f"total={_fmt_ms(ra.get('total_ms'))}",
+        flush=True,
+    )
+    b_delta = rb.get("li_manage_minus_li_ms")
+    if b_delta is None and rb.get("li_manage_ms") is not None \
+            and rb.get("lightning_indexer_ms") is not None:
+        b_delta = float(rb["li_manage_ms"]) - float(rb["lightning_indexer_ms"])
+    print(
+        f"Approach B (nano):        LI={_fmt_ms(rb.get('lightning_indexer_ms'))}  "
+        f"LI_MANAGE={_fmt_ms(rb.get('li_manage_ms'))}  "
+        f"delta(LI_MANAGE-LI)={_fmt_ms(b_delta)}  "
+        f"scatter_sfa={_fmt_ms(rb.get('scatter_sfa_ms'))}  "
+        f"total={_fmt_ms(rb.get('total_ms'))}",
+        flush=True,
+    )
+    if ra.get("total_ms") is None or rb.get("total_ms") is None:
+        print("Delta (A-B): n/a (missing total_ms)", flush=True)
+        return
+    diff = float(ra["total_ms"]) - float(rb["total_ms"])
     who = "A faster" if diff < 0 else "B faster"
-    print(f"Delta (A-B): {diff:+.4f} ms  ({who} by {abs(diff):.4f} ms)", flush=True)
+    print(
+        f"Delta (A-B): {diff:+.4f} ms  ({who} by {abs(diff):.4f} ms)",
+        flush=True,
+    )
+
+
+def compare(args) -> None:
+    _, scenarios_a = load_scenarios(args.out_a)
+    _, scenarios_b = load_scenarios(args.out_b)
+    map_a = {scenario_key(s): s for s in scenarios_a}
+    map_b = {scenario_key(s): s for s in scenarios_b}
+    common = sorted(set(map_a) & set(map_b))
+    only_a = sorted(set(map_a) - set(map_b))
+    only_b = sorted(set(map_b) - set(map_a))
+
+    print("----- TIMING SUMMARY (ms, mean over iters) -----", flush=True)
+    print(
+        f"Scenarios: A={len(scenarios_a)} B={len(scenarios_b)} "
+        f"common={len(common)}",
+        flush=True,
+    )
+    if only_a:
+        print(f"[compare] only in A: {only_a}", flush=True)
+    if only_b:
+        print(f"[compare] only in B: {only_b}", flush=True)
+    if not common:
+        raise ValueError(
+            "No matching scenarios between --out-a and --out-b. "
+            "Match key is (batch_size, miss, seq_len, cache_tokens, "
+            "topk_layout, q_heads).")
+
+    summary_rows: list[tuple] = []
+    for key in common:
+        ra = map_a[key]
+        rb = map_b[key]
+        _print_scenario_compare(ra, rb)
+        a_total = ra.get("total_ms")
+        b_total = rb.get("total_ms")
+        diff = None
+        if a_total is not None and b_total is not None:
+            diff = float(a_total) - float(b_total)
+        summary_rows.append(
+            (key[0], key[1], key[2], key[3], a_total, b_total, diff))
+
+    print("\n----- COMPARE TABLE -----", flush=True)
+    print(
+        f"{'batch':>6} {'miss':>6} {'seq':>8} {'cache':>8} "
+        f"{'A_total':>10} {'B_total':>10} {'A-B':>10} {'winner':>8}",
+        flush=True,
+    )
+    for batch, miss, seq_len, cache_tokens, a_total, b_total, diff in summary_rows:
+        if diff is None:
+            winner = "n/a"
+            diff_s = "n/a"
+        else:
+            winner = "A" if diff < 0 else "B"
+            diff_s = f"{diff:+.4f}"
+        print(
+            f"{batch:6d} {miss:6d} {seq_len:8d} {cache_tokens:8d} "
+            f"{_fmt_ms(a_total):>10} {_fmt_ms(b_total):>10} "
+            f"{diff_s:>10} {winner:>8}",
+            flush=True,
+        )
     print("UT_OK", flush=True)
 
 
@@ -1531,14 +1795,18 @@ def parse_args():
     p.add_argument("--approach", choices=("A", "B"), default=None,
                    help="Run one approach in this process (writes --out).")
     p.add_argument("--compare", action="store_true",
-                   help="Compare --out-a and --out-b JSON results.")
+                   help="Compare --out-a and --out-b JSON results "
+                        "(matches all common batch×miss×seq×cache scenarios).")
     p.add_argument("--out", default=None, help="Output JSON path for --approach.")
     p.add_argument("--out-a", default="result_a.json")
     p.add_argument("--out-b", default="result_b.json")
     p.add_argument("--nano-path", default=_default_nano_path(),
                    help="Path to nano torch_extension dir (contains ops_overlap/). "
                         "Override via $NANO_PATH env or --nano-path.")
-    p.add_argument("--batch-size", type=int, default=24)
+    p.add_argument(
+        "--batch-size", type=int, nargs="+", default=[24],
+        help="One or more batch sizes to sweep, e.g. --batch-size 8 16 24.",
+    )
     p.add_argument("--tp", type=int, default=16,
                    help="Tensor parallel size. q_heads = NUM_ATTENTION_HEADS / tp "
                         "(GLM-5.2: 64 / 16 = 4).")
@@ -1547,12 +1815,15 @@ def parse_args():
                         "Default: 64 / tp.")
     p.add_argument("--indexer-heads", type=int, default=32,
                    help="Indexer heads (GLM-5.2 index_n_heads=32).")
-    p.add_argument("--seq-len", type=int, default=65536)
     p.add_argument(
-        "--cache-tokens", type=int, default=8192,
-        help="Resident tokens filled per row before each LRU round. "
-             "Used by both A and B. Approach A caps at resident_capacity="
-             "TOPK*2-1 because that is the physical host LRU buffer size.",
+        "--seq-len", type=int, nargs="+", default=[65536],
+        help="One or more sequence lengths to sweep, e.g. --seq-len 32768 65536.",
+    )
+    p.add_argument(
+        "--cache-tokens", type=int, nargs="+", default=[8192],
+        help="One or more resident-token counts to sweep, e.g. "
+             "--cache-tokens 4096 8192. Used by both A and B. Approach A caps "
+             "at resident_capacity=TOPK*2-1 (physical host LRU buffer size).",
     )
     p.add_argument(
         "--topk-layout",
@@ -1564,11 +1835,11 @@ def parse_args():
         ),
     )
     p.add_argument(
-        "--miss", type=int, default=300,
-        help="Miss count per row for both A and B (0..TOPK). "
-             "Each timed/profile iter rebuilds residents with a freshly "
-             "randomized hit/miss partition among the same topk set. "
-             "This is the only knob for hit/miss mix (no unused aliases).",
+        "--miss", type=int, nargs="+", default=[300],
+        help="One or more miss counts per row (0..TOPK), e.g. --miss 100 300 800. "
+             "Combined with --batch-size/--seq-len/--cache-tokens as a "
+             "cartesian scenario matrix. Each timed/profile iter rebuilds "
+             "residents with a freshly randomized hit/miss partition.",
     )
     p.add_argument("--warmup", type=int, default=10)
     p.add_argument("--iters", type=int, default=50)
@@ -1610,16 +1881,34 @@ def parse_args():
         help="Only parse an existing msprof/torch_npu profile directory and "
              "print average kernel times; do not run Approach A/B.",
     )
+    p.add_argument(
+        "--include-lru-planner",
+        dest="include_lru_planner",
+        action="store_true",
+        default=None,
+        help="When parsing a profile dir, also print Approach-A LRU planner "
+             "timeline markers (HOSTFUNC_CALLBACK + EVENT_WAIT).",
+    )
+    p.add_argument(
+        "--no-lru-planner",
+        dest="include_lru_planner",
+        action="store_false",
+        help="When parsing a profile dir, skip LRU planner timeline summary "
+             "(use for Approach B profiles).",
+    )
     return p.parse_args()
 
 
 def main():
     args = parse_args()
     if args.parse_profile_dir is not None:
+        # Default: include LRU planner markers unless explicitly disabled.
+        include_lru = True if args.include_lru_planner is None else args.include_lru_planner
         summarize_profile_csvs(
             args.parse_profile_dir,
             top_n=args.profile_top_n,
             drop_first=args.profile_drop_first,
+            include_lru_planner=include_lru,
         )
         return
     if args.q_heads is None:
@@ -1635,19 +1924,35 @@ def main():
         return
     if args.approach is None:
         raise SystemExit("Use --approach A|B or --compare. See --help.")
-    if args.approach == "A":
-        result = run_a(args)
-    else:
-        result = run_b(args)
+    runner = run_a if args.approach == "A" else run_b
+    result = run_scenario_suite(args, runner)
     out = args.out or f"result_{args.approach.lower()}.json"
     with open(out, "w") as f:
         json.dump(result, f, indent=2)
-    if result.get("profile"):
-        print(f"RESULT approach={args.approach} out={out} profile=True",
-              flush=True)
-    else:
-        print(f"RESULT approach={args.approach} out={out} total_ms={result['total_ms']:.4f}",
-              flush=True)
+    n = len(result["scenarios"])
+    print(
+        f"RESULT approach={args.approach} out={out} "
+        f"scenarios={n} batch_sizes={result['batch_sizes']} "
+        f"misses={result['misses']} seq_lens={result['seq_lens']} "
+        f"cache_tokens={result['cache_tokens_list']}",
+        flush=True,
+    )
+    for sc in result["scenarios"]:
+        cache_tokens = sc.get("cache_tokens", sc.get("cache_tokens_req"))
+        if sc.get("profile"):
+            print(
+                f"  - batch={sc['batch_size']} miss={sc['miss']} "
+                f"seq_len={sc['seq_len']} cache_tokens={cache_tokens} "
+                f"profile=True",
+                flush=True,
+            )
+        else:
+            print(
+                f"  - batch={sc['batch_size']} miss={sc['miss']} "
+                f"seq_len={sc['seq_len']} cache_tokens={cache_tokens} "
+                f"total_ms={_fmt_ms(sc.get('total_ms'))}",
+                flush=True,
+            )
     print("UT_OK", flush=True)
 
 
