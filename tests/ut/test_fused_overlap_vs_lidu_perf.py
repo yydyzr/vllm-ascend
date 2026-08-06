@@ -8,19 +8,21 @@ A: LI + host-side LRU planner + fused_overlap(copy+sfa in one kernel).
    ``selection_membership_map``. Fused reads that plan plus the same topk
    that was fed into the planner.
 B: LightningIndexer baseline (same LI inputs as li_manage) +
-   LI_MANAGE(li+lru fused) + scatter_copy_sfa(copy+sfa fused).
-   Reports ``li_manage_minus_li_ms`` = li_manage - lightning_indexer.
+   LI_MANAGE + scatter_copy_sfa(copy+sfa fused).
+   B has no separate host LRU; the manage increment is
+   ``manage_ms`` = li_manage - lightning_indexer.
 
-Common compare fields written into every scenario JSON (profile or not):
-  ``lru_ms``      — A: host planner cost; B: li_manage - LI   (event time)
-  ``sfa_copy_ms`` — A: fused_overlap (copy+sfa); B: scatter_sfa (event time)
+Common compare fields (profile or not):
+  A: ``lru_ms`` / ``sfa_copy_ms``
+  B: ``manage_ms`` / ``sfa_copy_ms``
+     (``manage_ms`` ↔ A's ``lru_ms`` in --compare)
 
-With ``--profile``, also emit kernel/timeline compare fields:
-  ``lru_kernel_ms``      — A: HOSTFUNC_CALLBACK + EVENT_WAIT (both parts, sum);
-                           B: NanovllmLiManage − LightningIndexer (kernel avg)
-  ``sfa_copy_kernel_ms`` — A: FusedSparseAttentionOverlap;
-                           B: NanovllmSparseAndTailAttentionAndScatterCopy
-``--compare`` prints both event and kernel pairs when present.
+With ``--profile``, also emit kernel/timeline fields:
+  A: ``lru_kernel_ms`` = HOSTFUNC_CALLBACK + EVENT_WAIT (both parts, sum)
+  B: ``manage_kernel_ms`` = NanovllmLiManage − LightningIndexer
+  Both: ``sfa_copy_kernel_ms``
+     (A FusedSparseAttentionOverlap ↔
+      B NanovllmSparseAndTailAttentionAndScatterCopy)
 
 NOTE: Approach-A ``lru_kernel_ms`` is NEVER hostfunc alone — it is always
 ``hostfunc_callback_avg_us + event_wait_avg_us`` over ALL captured samples
@@ -118,18 +120,30 @@ def resolve_miss_count(args) -> int:
     return miss
 
 
-def attach_compare_fields(
+def attach_compare_fields_a(
     result: dict,
     *,
     lru_ms: float,
     sfa_copy_ms: float,
 ) -> dict:
-    """Attach the A/B-comparable event-time metric pair every scenario exposes.
-
-    ``lru_ms``:      A host planner  ↔  B (li_manage - lightning_indexer)
-    ``sfa_copy_ms``: A fused_overlap ↔  B scatter_sfa (both copy+sfa)
-    """
+    """Attach Approach-A event compare fields (host LRU planner + fused)."""
     result["lru_ms"] = float(lru_ms)
+    result["sfa_copy_ms"] = float(sfa_copy_ms)
+    return result
+
+
+def attach_compare_fields_b(
+    result: dict,
+    *,
+    manage_ms: float,
+    sfa_copy_ms: float,
+) -> dict:
+    """Attach Approach-B event compare fields (manage increment + scatter).
+
+    B has no host LRU; ``manage_ms`` = li_manage - lightning_indexer.
+    """
+    result["manage_ms"] = float(manage_ms)
+    result["li_manage_minus_li_ms"] = float(manage_ms)  # legacy alias
     result["sfa_copy_ms"] = float(sfa_copy_ms)
     return result
 
@@ -221,12 +235,12 @@ def attach_kernel_compare_fields(
     *,
     quiet: bool = False,
 ) -> dict:
-    """Derive ``lru_kernel_ms`` / ``sfa_copy_kernel_ms`` from profile_summary.
+    """Derive kernel compare fields from profile_summary.
 
-    A ``lru_kernel_ms`` = HOSTFUNC_CALLBACK + EVENT_WAIT (both required parts).
-    A ``sfa_copy_kernel_ms`` = FusedSparseAttentionOverlap.
-    B ``lru_kernel_ms`` = NanovllmLiManage − LightningIndexer (kernel avg).
-    B ``sfa_copy_kernel_ms`` = NanovllmSparseAndTailAttentionAndScatterCopy.
+    A: ``lru_kernel_ms`` = HOSTFUNC_CALLBACK + EVENT_WAIT;
+       ``sfa_copy_kernel_ms`` = FusedSparseAttentionOverlap.
+    B: ``manage_kernel_ms`` = NanovllmLiManage − LightningIndexer;
+       ``sfa_copy_kernel_ms`` = NanovllmSparseAndTailAttentionAndScatterCopy.
     """
     summary = result.get("profile_summary")
     if not summary:
@@ -263,57 +277,60 @@ def attach_kernel_compare_fields(
         matched["lru"] = (
             "HOSTFUNC_CALLBACK+EVENT_WAIT" if lru_ms is not None else None
         )
-    else:
-        # Prefer the names that appear in nano msprof: LightningIndexer /
-        # NanovllmLiManage. lru_kernel_ms = manage - LI.
-        li_ms, li_name = _match_op_avg_ms(
-            ops, _KERNEL_NAME_PATTERNS["li"],
-            exclude=_KERNEL_NAME_PATTERNS["b_li_manage"],
-        )
-        manage_ms, manage_name = _match_op_avg_ms(
-            ops, _KERNEL_NAME_PATTERNS["b_li_manage"],
-            exclude=_KERNEL_NAME_PATTERNS["li"],
-        )
-        sfa_ms, sfa_name = _match_op_avg_ms(ops, _KERNEL_NAME_PATTERNS["b_sfa_copy"])
-        if manage_ms is not None and li_ms is not None:
-            lru_ms = manage_ms - li_ms
-        else:
-            lru_ms = None
-        matched["li"] = li_name
-        matched["li_manage"] = manage_name
-        matched["sfa_copy"] = sfa_name
-        matched["lru"] = (
-            f"{manage_name} - {li_name}"
-            if manage_name and li_name else None
-        )
+        result["lru_kernel_ms"] = lru_ms
         result["li_kernel_ms"] = li_ms
-        result["li_manage_kernel_ms"] = manage_ms
-        result["li_manage_minus_li_kernel_ms"] = lru_ms
-
-    result["lru_kernel_ms"] = lru_ms
-    result["sfa_copy_kernel_ms"] = sfa_ms
-    if approach == "A":
-        result["li_kernel_ms"] = li_ms
-    result["kernel_match_names"] = matched
-    if not quiet:
-        def _fmt(v):
-            return "n/a" if v is None else f"{float(v):.4f}"
-        if approach == "B":
-            print(
-                f"[B-kernel] LightningIndexer={_fmt(li_ms)}  "
-                f"NanovllmLiManage={_fmt(manage_ms)}  "
-                f"lru_kernel_ms(=NanovllmLiManage-LightningIndexer)={_fmt(lru_ms)}  "
-                f"NanovllmSparseAndTailAttentionAndScatterCopy="
-                f"{_fmt(sfa_ms)}  matched={matched}",
-                flush=True,
-            )
-        else:
+        result["sfa_copy_kernel_ms"] = sfa_ms
+        result["kernel_match_names"] = matched
+        if not quiet:
+            def _fmt(v):
+                return "n/a" if v is None else f"{float(v):.4f}"
             print(
                 f"[A-kernel] lru_kernel_ms(HOSTFUNC+EVENT_WAIT)={_fmt(lru_ms)}  "
                 f"FusedSparseAttentionOverlap={_fmt(sfa_ms)}  "
                 f"matched={matched}",
                 flush=True,
             )
+        return result
+
+    # Approach B: manage increment, not LRU.
+    li_ms, li_name = _match_op_avg_ms(
+        ops, _KERNEL_NAME_PATTERNS["li"],
+        exclude=_KERNEL_NAME_PATTERNS["b_li_manage"],
+    )
+    manage_ms, manage_name = _match_op_avg_ms(
+        ops, _KERNEL_NAME_PATTERNS["b_li_manage"],
+        exclude=_KERNEL_NAME_PATTERNS["li"],
+    )
+    sfa_ms, sfa_name = _match_op_avg_ms(ops, _KERNEL_NAME_PATTERNS["b_sfa_copy"])
+    if manage_ms is not None and li_ms is not None:
+        manage_delta_ms = manage_ms - li_ms
+    else:
+        manage_delta_ms = None
+    matched["li"] = li_name
+    matched["li_manage"] = manage_name
+    matched["sfa_copy"] = sfa_name
+    matched["manage"] = (
+        f"{manage_name} - {li_name}"
+        if manage_name and li_name else None
+    )
+    result["li_kernel_ms"] = li_ms
+    result["li_manage_kernel_ms"] = manage_ms
+    result["manage_kernel_ms"] = manage_delta_ms
+    result["li_manage_minus_li_kernel_ms"] = manage_delta_ms  # legacy alias
+    result["sfa_copy_kernel_ms"] = sfa_ms
+    result["kernel_match_names"] = matched
+    if not quiet:
+        def _fmt(v):
+            return "n/a" if v is None else f"{float(v):.4f}"
+        print(
+            f"[B-kernel] LightningIndexer={_fmt(li_ms)}  "
+            f"NanovllmLiManage={_fmt(manage_ms)}  "
+            f"manage_kernel_ms(=NanovllmLiManage-LightningIndexer)="
+            f"{_fmt(manage_delta_ms)}  "
+            f"NanovllmSparseAndTailAttentionAndScatterCopy="
+            f"{_fmt(sfa_ms)}  matched={matched}",
+            flush=True,
+        )
     return result
 
 
@@ -1455,7 +1472,7 @@ def run_a(args) -> dict:
 
     # Event timing breaks components out with separate graphs/runners.
     # Always measured (even under --profile) so --out has compare fields:
-    #   lru_ms      = planner_ms      ↔ B li_manage_minus_li_ms
+    #   lru_ms      = planner_ms      ↔ B manage_ms
     #   sfa_copy_ms = fused_overlap_ms ↔ B scatter_sfa_ms
     li_runner, li_mode = maybe_graph_runner(
         _a_li, use_graph=use_graph, warmup=max(1, args.warmup // 2))
@@ -1514,7 +1531,7 @@ def run_a(args) -> dict:
         "pipeline_mode": pipeline_mode,
         "fused_mode": fused_mode,
     }
-    attach_compare_fields(result, lru_ms=planner_ms, sfa_copy_ms=fused_ms)
+    attach_compare_fields_a(result, lru_ms=planner_ms, sfa_copy_ms=fused_ms)
     if profile_summary is not None:
         lru = profile_summary.get("lru_planner") or {}
         result["profile"] = True
@@ -1608,7 +1625,7 @@ def run_b(args) -> dict:
           f"cache_tokens={cache_tokens} miss={miss} hit_count={hit_count}",
           flush=True)
     print(
-        f"[B-lru] wired inputs: cache_slots prefilled each reset with "
+        f"[B-manage] wired inputs: cache_slots prefilled each reset with "
         f"exactly hit_count={hit_count} topk hits + "
         f"{cache_tokens - hit_count} non-topk; li_manage_out must report "
         f"miss_counts=={[miss]}*batch",
@@ -1811,20 +1828,21 @@ def run_b(args) -> dict:
     torch.npu.synchronize()
     print(f"[B-cfg] timing_mode={'graph' if use_graph else 'eager'}", flush=True)
 
-    def _b_pipeline():
-        # Nano production round: LI_MANAGE then scatter/SFA on the same stream.
+    def _b_profile_pipeline():
+        # One capture/replay unit for profiling so LI / li_manage / scatter
+        # stay on a single stream (separate graphs look like multi-stream).
+        # Event benches below still use per-op graphs for component times.
+        _b_lightning_indexer()
         _b_li_manage()
         _b_scatter_sfa()
 
     # Capture after the functional smoke so graph replay measures steady-state
     # kernel time without eager launch/dispatch noise.
+    # Event timing: separate per-op graphs. Profile: one joint same-stream graph.
     li_runner, li_mode = maybe_graph_runner(
         _b_lightning_indexer, use_graph=use_graph, warmup=max(1, args.warmup // 2))
     li_manage_runner, li_manage_mode = maybe_graph_runner(
         _b_li_manage, use_graph=use_graph,
-        warmup=max(1, args.warmup // 2), reset=_b_reset)
-    full_runner, full_mode = maybe_graph_runner(
-        _b_pipeline, use_graph=use_graph,
         warmup=max(1, args.warmup // 2), reset=_b_reset)
 
     def _b_reset_then_manage():
@@ -1835,6 +1853,7 @@ def run_b(args) -> dict:
     scatter_runner, scatter_mode = maybe_graph_runner(
         _b_scatter_sfa, use_graph=use_graph,
         warmup=max(1, args.warmup // 2), reset=_b_reset_then_manage)
+    full_mode = "graph" if use_graph else "eager"
 
     def _b_report_timing(
         lightning_indexer_ms: float,
@@ -1845,7 +1864,7 @@ def run_b(args) -> dict:
         print(
             f"[B-timing] lightning_indexer={lightning_indexer_ms:.4f} ms  "
             f"li_manage={li_manage_ms:.4f} ms  "
-            f"delta(li_manage-LI / lru)={delta_ms:+.4f} ms  "
+            f"manage_ms(li_manage-LI)={delta_ms:+.4f} ms  "
             f"scatter_sfa(sfa+copy)={sfa_ms:.4f} ms",
             flush=True,
         )
@@ -1853,14 +1872,11 @@ def run_b(args) -> dict:
 
     profile_summary = None
     if getattr(args, "profile", False):
-        # Profile LI and li_manage as separate named ranges (same LI inputs),
-        # then scatter. No host-LRU planner summary for B.
+        profile_runner, full_mode = maybe_graph_runner(
+            _b_profile_pipeline, use_graph=use_graph,
+            warmup=max(1, args.warmup // 2), reset=_b_reset)
         profile_summary = profile_pipeline(
-            [
-                ("lightning_indexer", li_runner),
-                ("li_manage", li_manage_runner),
-                ("scatter_sfa", scatter_runner),
-            ],
+            [("full_pipeline", profile_runner)],
             args.warmup, args.profile_iters, args.profile_dir,
             top_n=args.profile_top_n,
             reset=_b_reset,
@@ -1868,14 +1884,14 @@ def run_b(args) -> dict:
             include_lru_planner=False)
 
     # Always event-time comparable metrics for --out / --compare:
-    #   lru_ms      = li_manage - LI  ↔  A planner_ms
-    #   sfa_copy_ms = scatter_sfa    ↔  A fused_overlap_ms
+    #   manage_ms   = li_manage - LI  ↔  A lru_ms (planner)
+    #   sfa_copy_ms = scatter_sfa     ↔  A fused_overlap_ms
     lightning_indexer_ms = bench_events(li_runner, args.warmup, args.iters)
     li_manage_ms = bench_events(
         li_manage_runner, args.warmup, args.iters, reset=_b_reset)
     sfa_ms = bench_events(
         scatter_runner, args.warmup, args.iters, reset=_b_reset_then_manage)
-    delta_ms = _b_report_timing(lightning_indexer_ms, li_manage_ms, sfa_ms)
+    manage_ms = _b_report_timing(lightning_indexer_ms, li_manage_ms, sfa_ms)
 
     result = {
         "approach": "B",
@@ -1885,7 +1901,8 @@ def run_b(args) -> dict:
         "cache_tokens": cache_tokens, "miss": miss,
         "lightning_indexer_ms": lightning_indexer_ms,
         "li_manage_ms": li_manage_ms,
-        "li_manage_minus_li_ms": delta_ms,
+        "manage_ms": manage_ms,
+        "li_manage_minus_li_ms": manage_ms,  # legacy alias
         "scatter_sfa_ms": sfa_ms,
         "total_ms": li_manage_ms + sfa_ms,
         "warmup": args.warmup,
@@ -1894,7 +1911,7 @@ def run_b(args) -> dict:
         "li_manage_mode": li_manage_mode,
         "scatter_mode": scatter_mode,
     }
-    attach_compare_fields(result, lru_ms=delta_ms, sfa_copy_ms=sfa_ms)
+    attach_compare_fields_b(result, manage_ms=manage_ms, sfa_copy_ms=sfa_ms)
     if profile_summary is not None:
         result["profile"] = True
         result["profile_run_dir"] = profile_summary.get("run_dir")
@@ -2025,14 +2042,24 @@ def _fmt_ms(value, digits: int = 4) -> str:
         return "n/a"
 
 
-def _scenario_lru_ms(result: dict) -> float | None:
-    """A planner / B (li_manage - LI) — event time."""
+def _scenario_a_lru_ms(result: dict) -> float | None:
+    """Approach-A host planner event time."""
     if result.get("lru_ms") is not None:
         return float(result["lru_ms"])
-    if result.get("approach") == "A" and result.get("planner_ms") is not None:
+    if result.get("planner_ms") is not None:
         return float(result["planner_ms"])
+    return None
+
+
+def _scenario_b_manage_ms(result: dict) -> float | None:
+    """Approach-B manage increment event time (li_manage - LI)."""
+    if result.get("manage_ms") is not None:
+        return float(result["manage_ms"])
     if result.get("li_manage_minus_li_ms") is not None:
         return float(result["li_manage_minus_li_ms"])
+    # Legacy JSON that stored B under lru_ms.
+    if result.get("lru_ms") is not None and result.get("approach") == "B":
+        return float(result["lru_ms"])
     if result.get("li_manage_ms") is not None \
             and result.get("lightning_indexer_ms") is not None:
         return float(result["li_manage_ms"]) - float(result["lightning_indexer_ms"])
@@ -2052,20 +2079,44 @@ def _scenario_sfa_copy_ms(result: dict) -> float | None:
 
 def _ensure_kernel_compare_fields(result: dict) -> None:
     """Fill kernel compare fields in-place from profile_summary if missing."""
-    if result.get("lru_kernel_ms") is not None \
-            and result.get("sfa_copy_kernel_ms") is not None:
+    approach = str(result.get("approach", "")).upper()
+    if approach == "A":
+        if result.get("lru_kernel_ms") is not None \
+                and result.get("sfa_copy_kernel_ms") is not None:
+            return
+    elif approach == "B":
+        if result.get("manage_kernel_ms") is not None \
+                and result.get("sfa_copy_kernel_ms") is not None:
+            return
+        # Legacy JSON used lru_kernel_ms for B manage delta.
+        if result.get("lru_kernel_ms") is not None \
+                and result.get("sfa_copy_kernel_ms") is not None:
+            result.setdefault("manage_kernel_ms", result["lru_kernel_ms"])
+            return
+    else:
         return
     if not result.get("profile_summary"):
         return
-    approach = str(result.get("approach", "")).upper()
-    if approach in ("A", "B"):
-        attach_kernel_compare_fields(result, approach, quiet=True)
+    attach_kernel_compare_fields(result, approach, quiet=True)
 
 
-def _scenario_lru_kernel_ms(result: dict) -> float | None:
-    """A: HOSTFUNC_CALLBACK + EVENT_WAIT (sum). B: li_manage_k - LI_k."""
+def _scenario_a_lru_kernel_ms(result: dict) -> float | None:
+    """A: HOSTFUNC_CALLBACK + EVENT_WAIT (sum)."""
     _ensure_kernel_compare_fields(result)
     if result.get("lru_kernel_ms") is not None:
+        return float(result["lru_kernel_ms"])
+    return None
+
+
+def _scenario_b_manage_kernel_ms(result: dict) -> float | None:
+    """B: NanovllmLiManage − LightningIndexer."""
+    _ensure_kernel_compare_fields(result)
+    if result.get("manage_kernel_ms") is not None:
+        return float(result["manage_kernel_ms"])
+    if result.get("li_manage_minus_li_kernel_ms") is not None:
+        return float(result["li_manage_minus_li_kernel_ms"])
+    # Legacy JSON that stored B under lru_kernel_ms.
+    if result.get("lru_kernel_ms") is not None and result.get("approach") == "B":
         return float(result["lru_kernel_ms"])
     return None
 
@@ -2107,30 +2158,33 @@ def _print_scenario_compare(ra: dict, rb: dict) -> None:
         flush=True,
     )
 
-    a_lru = _scenario_lru_ms(ra)
-    b_lru = _scenario_lru_ms(rb)
+    a_lru = _scenario_a_lru_ms(ra)
+    b_manage = _scenario_b_manage_ms(rb)
     a_sfa = _scenario_sfa_copy_ms(ra)
     b_sfa = _scenario_sfa_copy_ms(rb)
     print("--- EVENT TIME ---", flush=True)
-    _print_pair_delta("lru_ms      (A planner ↔ B LI_MANAGE-LI)", a_lru, b_lru)
-    _print_pair_delta("sfa_copy_ms (A fused  ↔ B scatter_sfa)", a_sfa, b_sfa)
+    _print_pair_delta(
+        "A lru_ms ↔ B manage_ms (planner ↔ li_manage-LI)",
+        a_lru, b_manage,
+    )
+    _print_pair_delta("sfa_copy_ms (A fused ↔ B scatter_sfa)", a_sfa, b_sfa)
 
-    a_lru_k = _scenario_lru_kernel_ms(ra)
-    b_lru_k = _scenario_lru_kernel_ms(rb)
+    a_lru_k = _scenario_a_lru_kernel_ms(ra)
+    b_manage_k = _scenario_b_manage_kernel_ms(rb)
     a_sfa_k = _scenario_sfa_copy_kernel_ms(ra)
     b_sfa_k = _scenario_sfa_copy_kernel_ms(rb)
     print("--- KERNEL / PROFILE TIME ---", flush=True)
-    if all(v is None for v in (a_lru_k, b_lru_k, a_sfa_k, b_sfa_k)):
+    if all(v is None for v in (a_lru_k, b_manage_k, a_sfa_k, b_sfa_k)):
         print(
             "kernel times n/a (re-run A/B with --profile so out JSON "
-            "contains profile_summary / lru_kernel_ms / sfa_copy_kernel_ms)",
+            "contains lru_kernel_ms / manage_kernel_ms / sfa_copy_kernel_ms)",
             flush=True,
         )
     else:
         _print_pair_delta(
-            "lru_kernel_ms (A HOSTFUNC_CALLBACK+EVENT_WAIT ↔ "
-            "B NanovllmLiManage-LightningIndexer)",
-            a_lru_k, b_lru_k,
+            "A lru_kernel_ms ↔ B manage_kernel_ms "
+            "(HOSTFUNC_CALLBACK+EVENT_WAIT ↔ NanovllmLiManage-LightningIndexer)",
+            a_lru_k, b_manage_k,
         )
         if ra.get("hostfunc_callback_kernel_ms") is not None \
                 or ra.get("event_wait_kernel_ms") is not None:
@@ -2144,10 +2198,10 @@ def _print_scenario_compare(ra: dict, rb: dict) -> None:
         if rb.get("li_manage_kernel_ms") is not None \
                 or rb.get("li_kernel_ms") is not None:
             print(
-                f"  B lru parts: NanovllmLiManage="
+                f"  B manage parts: NanovllmLiManage="
                 f"{_fmt_ms(rb.get('li_manage_kernel_ms'))} - "
                 f"LightningIndexer={_fmt_ms(rb.get('li_kernel_ms'))} = "
-                f"{_fmt_ms(b_lru_k)}",
+                f"{_fmt_ms(b_manage_k)}",
                 flush=True,
             )
         _print_pair_delta(
@@ -2172,7 +2226,7 @@ def _print_scenario_compare(ra: dict, rb: dict) -> None:
     print(
         f"Approach B detail: LI={_fmt_ms(rb.get('lightning_indexer_ms'))}  "
         f"LI_MANAGE={_fmt_ms(rb.get('li_manage_ms'))}  "
-        f"delta(LI_MANAGE-LI)={_fmt_ms(b_lru)}  "
+        f"manage_ms(LI_MANAGE-LI)={_fmt_ms(b_manage)}  "
         f"scatter_sfa={_fmt_ms(rb.get('scatter_sfa_ms', b_sfa))}  "
         f"total={_fmt_ms(rb.get('total_ms'))}",
         flush=True,
@@ -2221,9 +2275,9 @@ def compare(args) -> None:
         _print_scenario_compare(ra, rb)
         summary_rows.append((
             key[0], key[1], key[2], key[3],
-            _scenario_lru_ms(ra), _scenario_lru_ms(rb),
+            _scenario_a_lru_ms(ra), _scenario_b_manage_ms(rb),
             _scenario_sfa_copy_ms(ra), _scenario_sfa_copy_ms(rb),
-            _scenario_lru_kernel_ms(ra), _scenario_lru_kernel_ms(rb),
+            _scenario_a_lru_kernel_ms(ra), _scenario_b_manage_kernel_ms(rb),
             _scenario_sfa_copy_kernel_ms(ra), _scenario_sfa_copy_kernel_ms(rb),
             ra.get("total_ms"), rb.get("total_ms"),
         ))
@@ -2231,17 +2285,17 @@ def compare(args) -> None:
     print("\n----- COMPARE TABLE (EVENT ms) -----", flush=True)
     print(
         f"{'batch':>6} {'miss':>6} {'seq':>8} {'cache':>8} "
-        f"{'A_lru':>8} {'B_lru':>8} {'A_sfa':>8} {'B_sfa':>8} "
+        f"{'A_lru':>8} {'B_mgmt':>8} {'A_sfa':>8} {'B_sfa':>8} "
         f"{'A_tot':>8} {'B_tot':>8}",
         flush=True,
     )
     for row in summary_rows:
         (batch, miss, seq_len, cache_tokens,
-         a_lru, b_lru, a_sfa, b_sfa, *_rest) = row
+         a_lru, b_manage, a_sfa, b_sfa, *_rest) = row
         a_total, b_total = row[-2], row[-1]
         print(
             f"{batch:6d} {miss:6d} {seq_len:8d} {cache_tokens:8d} "
-            f"{_fmt_ms(a_lru):>8} {_fmt_ms(b_lru):>8} "
+            f"{_fmt_ms(a_lru):>8} {_fmt_ms(b_manage):>8} "
             f"{_fmt_ms(a_sfa):>8} {_fmt_ms(b_sfa):>8} "
             f"{_fmt_ms(a_total):>8} {_fmt_ms(b_total):>8}",
             flush=True,
@@ -2250,16 +2304,16 @@ def compare(args) -> None:
     print("\n----- COMPARE TABLE (KERNEL ms) -----", flush=True)
     print(
         f"{'batch':>6} {'miss':>6} {'seq':>8} {'cache':>8} "
-        f"{'A_lru_k':>8} {'B_lru_k':>8} {'A_sfa_k':>8} {'B_sfa_k':>8}",
+        f"{'A_lru_k':>8} {'B_mgmt_k':>8} {'A_sfa_k':>8} {'B_sfa_k':>8}",
         flush=True,
     )
     for row in summary_rows:
         (batch, miss, seq_len, cache_tokens,
-         _a_lru, _b_lru, _a_sfa, _b_sfa,
-         a_lru_k, b_lru_k, a_sfa_k, b_sfa_k, _a_tot, _b_tot) = row
+         _a_lru, _b_manage, _a_sfa, _b_sfa,
+         a_lru_k, b_manage_k, a_sfa_k, b_sfa_k, _a_tot, _b_tot) = row
         print(
             f"{batch:6d} {miss:6d} {seq_len:8d} {cache_tokens:8d} "
-            f"{_fmt_ms(a_lru_k):>8} {_fmt_ms(b_lru_k):>8} "
+            f"{_fmt_ms(a_lru_k):>8} {_fmt_ms(b_manage_k):>8} "
             f"{_fmt_ms(a_sfa_k):>8} {_fmt_ms(b_sfa_k):>8}",
             flush=True,
         )
@@ -2414,12 +2468,21 @@ def main():
     )
     for sc in result["scenarios"]:
         cache_tokens = sc.get("cache_tokens", sc.get("cache_tokens_req"))
+        if args.approach == "A":
+            primary = (
+                f"lru_ms={_fmt_ms(sc.get('lru_ms'))} "
+                f"lru_kernel_ms={_fmt_ms(sc.get('lru_kernel_ms'))}"
+            )
+        else:
+            primary = (
+                f"manage_ms={_fmt_ms(sc.get('manage_ms'))} "
+                f"manage_kernel_ms={_fmt_ms(sc.get('manage_kernel_ms'))}"
+            )
         print(
             f"  - batch={sc['batch_size']} miss={sc['miss']} "
             f"seq_len={sc['seq_len']} cache_tokens={cache_tokens} "
-            f"lru_ms={_fmt_ms(sc.get('lru_ms'))} "
+            f"{primary} "
             f"sfa_copy_ms={_fmt_ms(sc.get('sfa_copy_ms'))} "
-            f"lru_kernel_ms={_fmt_ms(sc.get('lru_kernel_ms'))} "
             f"sfa_copy_kernel_ms={_fmt_ms(sc.get('sfa_copy_kernel_ms'))} "
             f"total_ms={_fmt_ms(sc.get('total_ms'))}"
             f"{' profile=True' if sc.get('profile') else ''}",
