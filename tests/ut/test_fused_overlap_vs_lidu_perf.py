@@ -12,10 +12,12 @@ Timing defaults to NPUGraph capture/replay (``--graph-mode``). Use
 ``--eager`` only for debugging launch/dispatch overhead. Approach A's planner
 follows the production side-stream + C++ ``enqueue_lru_*`` host-callback path.
 
-``--miss`` fixes the per-row miss count for both A and B. Each warmup /
-timed / profile iteration rebuilds residents with a freshly randomized
-hit/miss partition among the same topk set, so miss stays fixed but the
-concrete hit/miss tokens change every round.
+``--miss`` is the only hit/miss control for both A and B (no unused
+aliases). Each warmup / timed / profile iteration rebuilds residents with
+a freshly randomized hit/miss partition among the same topk set. Approach
+A wires production-like planner inputs: ``stable_prefix = ak - aq``,
+``visible_seq = ak``, continuing ``req_ids``, and ``--cache-tokens`` as
+resident fill (capped by A physical capacity ``TOPK*2-1``).
 
 GLM-5.2 parameters (kv_lora_rank=512, qk_rope_head_dim=64, index_n_heads=32,
 index_head_dim=128, index_topk=2048, num_attention_heads=64).
@@ -85,18 +87,20 @@ def cdiv(a: int, b: int) -> int:
 
 
 def resolve_miss_count(args) -> int:
-    """Return the controlled per-row miss count from CLI.
-
-    ``--miss`` is the source of truth. Deprecated ``--hit-ratio`` still
-    overrides when explicitly provided.
-    """
-    if getattr(args, "hit_ratio", None) is not None:
-        miss = int(round(TOPK * (1.0 - float(args.hit_ratio))))
-    else:
-        miss = int(args.miss)
+    """Return the controlled per-row miss count from ``--miss``."""
+    miss = int(args.miss)
     if miss < 0 or miss > TOPK:
         raise ValueError(f"--miss must be in [0, {TOPK}], got {miss}")
     return miss
+
+
+def _assert_tensor_eq(name: str, actual: torch.Tensor, expected: torch.Tensor) -> None:
+    if actual.shape != expected.shape:
+        raise RuntimeError(
+            f"{name} shape mismatch: actual={tuple(actual.shape)} "
+            f"expected={tuple(expected.shape)}")
+    if not torch.equal(actual.cpu(), expected.cpu()):
+        raise RuntimeError(f"{name} value mismatch versus expected wired input")
 
 
 def build_index_scores_and_topk(
@@ -697,16 +701,11 @@ def run_a(args) -> dict:
     miss = resolve_miss_count(args)
     hit_count = TOPK - miss
     hit_ratio = 1.0 - (miss / float(TOPK))
+    cache_tokens_req = int(args.cache_tokens)
     fmbn = cdiv(seq_len, BLOCK_SIZE)
     smbn = cdiv(TOPK, BLOCK_SIZE)
     scale = 1.0 / math.sqrt(KVD)
     torch.manual_seed(910000 + batch + q_heads * 17 + seq_len)
-    print(
-        f"[A-cfg] batch={batch} q_heads={q_heads} idx_heads={idx_heads} "
-        f"seq_len={seq_len} topk_layout={topk_layout} miss={miss} "
-        f"hit_count={hit_count} hit_ratio={hit_ratio:.4f}",
-        flush=True,
-    )
 
     q = torch.randn(batch, q_heads, KVD, dtype=dt, device="npu")
     qr = torch.randn(batch, q_heads, KRD, dtype=dt, device="npu")
@@ -840,12 +839,12 @@ def run_a(args) -> dict:
     # Stable-row planner reserves one slot for the current token, so only
     # capacity-1 slots are usable residents (see kv_offload_decode.cpp).
     resident_capacity = topk_buffer_size - 1
-    fill_count = min(int(args.cache_tokens), resident_capacity)
+    fill_count = min(cache_tokens_req, resident_capacity)
     if fill_count < hit_count:
         raise ValueError(
             f"Need at least hit_count={hit_count} resident slots to honor "
             f"--miss={miss}, but fill_count={fill_count} "
-            f"(cache_tokens={args.cache_tokens}, "
+            f"(cache_tokens={cache_tokens_req}, "
             f"resident_capacity={resident_capacity}).")
 
     # Each reset rebuilds residents so miss count stays fixed, but which
@@ -864,10 +863,57 @@ def run_a(args) -> dict:
     use_graph = bool(getattr(args, "graph_mode", True))
     topk_flat = topk.reshape(batch, TOPK).contiguous()
     req_ids_npu = torch.arange(batch, dtype=torch.int64, device="npu")
-    # Production decode uses ~seq_len-1; use seq_len so no resident is wiped
-    # as a speculative suffix while we measure controlled miss counts.
-    stable_prefix_npu = torch.full((batch,), seq_len, dtype=torch.int32, device="npu")
-    visible_seq_npu = torch.full((batch,), seq_len, dtype=torch.int32, device="npu")
+    # Production decode: stable_prefix = actual_seq_key - query_len.
+    # aq/ak are therefore wired into the planner (not decorative).
+    stable_prefix_npu = (ak - aq).clamp_min(0).to(torch.int32).contiguous()
+    visible_seq_npu = ak.to(torch.int32).contiguous()
+    stable_prefix_len = int(stable_prefix_npu[0].item())
+    visible_seq_len = int(visible_seq_npu[0].item())
+    if not torch.all(stable_prefix_npu == stable_prefix_len):
+        raise RuntimeError("A UT expects uniform stable_prefix across the batch")
+    if not torch.all(visible_seq_npu == visible_seq_len):
+        raise RuntimeError("A UT expects uniform visible_seq across the batch")
+
+    # Tokens >= stable_prefix are wiped as speculative suffix each plan call.
+    # Hit prefill must therefore only use tokens in [0, stable_prefix).
+    eligible_topk = topk_tokens_cpu[topk_tokens_cpu < stable_prefix_len]
+    forced_suffix_miss = int((topk_tokens_cpu >= stable_prefix_len).sum().item())
+    if eligible_topk.numel() < hit_count:
+        raise ValueError(
+            f"Only {eligible_topk.numel()} topk tokens are < stable_prefix="
+            f"{stable_prefix_len}, but hit_count={hit_count} is required for "
+            f"--miss={miss} (forced_suffix_miss={forced_suffix_miss}).")
+    eligible_non_topk = non_topk[non_topk < stable_prefix_len]
+    if eligible_non_topk.numel() < fill_count - hit_count:
+        raise ValueError(
+            f"Not enough non-topk tokens < stable_prefix={stable_prefix_len} "
+            f"to fill residents: need {fill_count - hit_count}, "
+            f"have {eligible_non_topk.numel()}.")
+
+    print(
+        f"[A-cfg] batch={batch} q_heads={q_heads} idx_heads={idx_heads} "
+        f"seq_len={seq_len} topk_layout={topk_layout} miss={miss} "
+        f"hit_count={hit_count} hit_ratio={hit_ratio:.4f}",
+        flush=True,
+    )
+    print(
+        f"[A-lru] wired inputs: req_ids=arange({batch}) "
+        f"stable_prefix=ak-aq={stable_prefix_len} "
+        f"visible_seq=ak={visible_seq_len} "
+        f"topk_buffer={topk_buffer_size} resident_capacity={resident_capacity} "
+        f"cache_tokens_req={cache_tokens_req} fill_count={fill_count} "
+        f"forced_suffix_miss={forced_suffix_miss} "
+        f"eligible_topk={eligible_topk.numel()}",
+        flush=True,
+    )
+    if cache_tokens_req > resident_capacity:
+        print(
+            f"[A-lru] NOTE: --cache-tokens={cache_tokens_req} exceeds A "
+            f"resident_capacity={resident_capacity}; fill_count capped to "
+            f"{fill_count} (A physical buffer is TOPK*2-1).",
+            flush=True,
+        )
+
     plan_stream = torch_npu.npu.Stream()
     # Do NOT call _subscribe_report on this stream. Production enqueue uses
     # aclrtLaunchHostFunc, which creates/subscribes its own callback thread.
@@ -904,29 +950,45 @@ def run_a(args) -> dict:
             lru_visible_seq_lens.data_ptr(),
         )
 
-    def _copy_planner_inputs_d2h():
+    def _copy_planner_inputs_d2h(*, non_blocking: bool = True):
         # Match production: D2H from NPU tensors on the current stream.
-        lru_topk_indices.copy_(topk_flat, non_blocking=True)
-        lru_req_ids.copy_(req_ids_npu, non_blocking=True)
-        lru_stable_prefix_lens.copy_(stable_prefix_npu, non_blocking=True)
-        lru_visible_seq_lens.copy_(visible_seq_npu, non_blocking=True)
+        lru_topk_indices.copy_(topk_flat, non_blocking=non_blocking)
+        lru_req_ids.copy_(req_ids_npu, non_blocking=non_blocking)
+        lru_stable_prefix_lens.copy_(stable_prefix_npu, non_blocking=non_blocking)
+        lru_visible_seq_lens.copy_(visible_seq_npu, non_blocking=non_blocking)
 
     def _a_reset_lru_state():
         """Rebuild residents for one round: fixed miss count, fresh hit/miss set."""
         round_id = _a_reset_round[0]
         _a_reset_round[0] = round_id + 1
         lru_slot_to_token.fill_(-1)
+        other_count = fill_count - hit_count
         for r in range(batch):
             gen = torch.Generator().manual_seed(1000 + round_id * 10007 + r)
-            hit_perm = torch.randperm(TOPK, generator=gen)
-            hit_tokens = topk_tokens_cpu[hit_perm[:hit_count]]
-            other_count = fill_count - hit_count
-            others = non_topk[
-                torch.randperm(non_topk.numel(), generator=gen)[:other_count]
+            hit_perm = torch.randperm(eligible_topk.numel(), generator=gen)
+            hit_tokens = eligible_topk[hit_perm[:hit_count]]
+            others = eligible_non_topk[
+                torch.randperm(eligible_non_topk.numel(), generator=gen)[:other_count]
             ]
             cached = torch.cat((hit_tokens, others))
+            # Reject any token that production would wipe as speculative suffix.
+            if torch.any(cached >= stable_prefix_len):
+                raise RuntimeError(
+                    "resident prefill produced token >= stable_prefix; "
+                    "LRU would discard it and break --miss control")
             slots = torch.randperm(resident_capacity, generator=gen)[:fill_count]
             lru_slot_to_token[r, slots] = cached
+            valid = lru_slot_to_token[r, :resident_capacity]
+            valid = valid[valid >= 0]
+            if int(valid.numel()) != fill_count:
+                raise RuntimeError(
+                    f"A row {r} resident fill={valid.numel()} != "
+                    f"fill_count={fill_count} from --cache-tokens")
+            hits_in_row = int(torch.isin(valid, topk_tokens_cpu).sum().item())
+            if hits_in_row != hit_count:
+                raise RuntimeError(
+                    f"A row {r} topk hits in residents={hits_in_row}, "
+                    f"expected hit_count={hit_count} from --miss={miss}")
         lru_slots.copy_(lru_slots_init)
         lru_last_req_ids.copy_(lru_last_req_ids_init)
         lru_epochs.zero_()
@@ -937,12 +999,58 @@ def run_a(args) -> dict:
         control[:, 7] = PAIRED_SELECTION_COPY_MARKER
         sel_status.fill_(-1)
 
+    def _a_validate_lru_inputs_and_outputs():
+        """Fail hard if any planner input is unwired or miss control broke."""
+        _assert_tensor_eq("lru_topk_indices", lru_topk_indices[:batch], topk_flat.cpu())
+        _assert_tensor_eq("lru_req_ids", lru_req_ids[:batch], req_ids_npu.cpu())
+        _assert_tensor_eq(
+            "lru_stable_prefix_lens",
+            lru_stable_prefix_lens[:batch],
+            stable_prefix_npu.cpu(),
+        )
+        _assert_tensor_eq(
+            "lru_visible_seq_lens",
+            lru_visible_seq_lens[:batch],
+            visible_seq_npu.cpu(),
+        )
+        # Continuing-request path: last_req_ids must stay equal to req_ids.
+        _assert_tensor_eq(
+            "lru_last_req_ids",
+            lru_last_req_ids[:batch],
+            req_ids_npu.cpu(),
+        )
+        if int(control[0, 1].item()) != EXTERNAL_PLAN_READY_MARKER:
+            raise RuntimeError("membership control EXTERNAL_PLAN_READY_MARKER not set")
+        if int(control[0, 2].item()) != TOPK:
+            raise RuntimeError("membership control topk field not set to TOPK")
+        actual_miss = lru_miss_count[:batch].tolist()
+        expected_miss = [miss] * batch
+        if actual_miss != expected_miss:
+            raise RuntimeError(
+                f"[A] controlled miss mismatch: got {actual_miss}, "
+                f"expected {expected_miss}. Check resident prefill / "
+                f"stable_prefix/visible_seq wiring.")
+        # Encoded plan must be populated for every topk position (hit>0 or miss<0).
+        plan = plan_storage[:batch, :TOPK]
+        if torch.any(plan == 0):
+            raise RuntimeError(
+                "encoded plan has zero entries; planner did not write a full plan")
+        # Resident occupancy after plan still uses the continuing-req row mapping.
+        occupied = (lru_slot_to_token[:batch, :resident_capacity] >= 0).sum(dim=1)
+        if torch.any(occupied < hit_count):
+            raise RuntimeError(
+                f"post-plan resident occupancy {occupied.tolist()} "
+                f"fell below hit_count={hit_count}")
+        print(
+            f"[A-lru] validated: miss_counts={actual_miss} "
+            f"stable_prefix={stable_prefix_len} visible_seq={visible_seq_len} "
+            f"fill_count={fill_count} occupied_after_plan={occupied.tolist()}",
+            flush=True,
+        )
+
     def _a_planner_sync():
         """Synchronous planner — used for miss verification / fused prep."""
-        lru_topk_indices.copy_(topk_flat)
-        lru_req_ids.copy_(req_ids_npu)
-        lru_stable_prefix_lens.copy_(stable_prefix_npu)
-        lru_visible_seq_lens.copy_(visible_seq_npu)
+        _copy_planner_inputs_d2h(non_blocking=False)
         lru_cpp.lru_resident_compact_with_plan_stable_rows(*_planner_kwargs_ptrs())
 
     def _a_reset_then_plan():
@@ -1006,17 +1114,10 @@ def run_a(args) -> dict:
         _a_li()
         _a_planner_plus_fused()
 
-    # Eager functional smoke + verify controlled miss before capture/timing.
+    # Eager functional smoke + fail-hard validation of every wired LRU input.
     _a_reset_lru_state()
     _a_planner_sync()
-    actual_miss = lru_miss_count[:batch].tolist()
-    expected_miss = [miss] * batch
-    if actual_miss != expected_miss:
-        raise RuntimeError(
-            f"[A] controlled miss mismatch: got {actual_miss}, "
-            f"expected {expected_miss}. Check resident prefill / "
-            f"stable_prefix_lens.")
-    print(f"[A-cfg] verified miss_counts={actual_miss}", flush=True)
+    _a_validate_lru_inputs_and_outputs()
     _a_fused()
     torch.npu.synchronize()
     print(f"[A-cfg] timing_mode={'graph' if use_graph else 'eager'}", flush=True)
@@ -1044,7 +1145,11 @@ def run_a(args) -> dict:
             "timing_mode": full_mode,
             "batch_size": batch, "q_heads": q_heads, "indexer_heads": idx_heads,
             "seq_len": seq_len, "topk_layout": topk_layout,
-            "miss": miss, "hit_ratio": hit_ratio,
+            "miss": miss, "hit_count": hit_count, "hit_ratio": hit_ratio,
+            "cache_tokens_req": cache_tokens_req, "fill_count": fill_count,
+            "stable_prefix": stable_prefix_len, "visible_seq": visible_seq_len,
+            "topk_buffer_size": topk_buffer_size,
+            "resident_capacity": resident_capacity,
             "warmup": args.warmup, "iters": args.profile_iters,
         }
 
@@ -1074,7 +1179,11 @@ def run_a(args) -> dict:
         "timing_mode": full_mode,
         "batch_size": batch, "q_heads": q_heads, "indexer_heads": idx_heads,
         "seq_len": seq_len, "topk_layout": topk_layout,
-        "miss": miss, "hit_ratio": hit_ratio,
+        "miss": miss, "hit_count": hit_count, "hit_ratio": hit_ratio,
+        "cache_tokens_req": cache_tokens_req, "fill_count": fill_count,
+        "stable_prefix": stable_prefix_len, "visible_seq": visible_seq_len,
+        "topk_buffer_size": topk_buffer_size,
+        "resident_capacity": resident_capacity,
         "li_ms": li_ms, "planner_ms": planner_ms, "fused_overlap_ms": fused_ms,
         "pipeline_ms": pipeline_ms,
         "total_ms": li_ms + pipeline_ms,
@@ -1150,10 +1259,18 @@ def run_b(args) -> dict:
         raise RuntimeError(
             f"li_manage_out requires indexer_heads in (32, 64), got {idx_heads}. "
             f"Use --indexer-heads 32 or --indexer-heads 64.")
+    hit_count = TOPK - miss
     print(f"[B-cfg] batch={batch} q_heads={q_heads} idx_heads={idx_heads} "
           f"seq_len={seq_len} topk_layout={topk_layout} "
-          f"cache_tokens={cache_tokens} miss={miss}",
+          f"cache_tokens={cache_tokens} miss={miss} hit_count={hit_count}",
           flush=True)
+    print(
+        f"[B-lru] wired inputs: cache_slots prefilled each reset with "
+        f"exactly hit_count={hit_count} topk hits + "
+        f"{cache_tokens - hit_count} non-topk; li_manage_out must report "
+        f"miss_counts=={[miss]}*batch",
+        flush=True,
+    )
     torch.manual_seed(910000 + batch + q_heads * 17 + seq_len + 1)
     cb = math.ceil(cache_tokens / BLOCK_SIZE)
     sb = seq_len // BLOCK_SIZE
@@ -1176,7 +1293,6 @@ def run_b(args) -> dict:
     index_seed = 910000 + batch + q_heads * 17 + seq_len
     index_scores_cpu, topk_tokens = build_index_scores_and_topk(
         seq_len, topk_layout, index_seed)
-    hit_count = TOPK - miss
     idx_cache_cpu = torch.zeros((tib, BLOCK_SIZE, 1, INDEX_DIM), dtype=dt)
     index_scores = index_scores_cpu.view(1, sb, BLOCK_SIZE)
     idx_cache_rows = idx_cache_cpu.view(batch, sb, BLOCK_SIZE, 1, INDEX_DIM)
@@ -1250,8 +1366,17 @@ def run_b(args) -> dict:
                 torch.randperm(non_topk.numel(), generator=gen)[:other_count]
             ]
             cached = torch.cat((hit_tokens_r, others))
+            if cached.numel() != cache_tokens:
+                raise RuntimeError(
+                    f"B cache prefill size {cached.numel()} != "
+                    f"--cache-tokens={cache_tokens}")
             slots = torch.randperm(cache_tokens, generator=gen, dtype=torch.int32)
             cs_cpu[pr, cached] = slots
+            # Sanity: exactly hit_count topk tokens are present for this req.
+            present = (cs_cpu[pr, topk_tokens.to(torch.long)] >= 0).sum().item()
+            if present != hit_count:
+                raise RuntimeError(
+                    f"B row {r} cached topk hits={present}, expected {hit_count}")
         cache_slots.copy_(cs_cpu.to(dev))
         src_ids_t.fill_(-1)
 
@@ -1423,7 +1548,12 @@ def parse_args():
     p.add_argument("--indexer-heads", type=int, default=32,
                    help="Indexer heads (GLM-5.2 index_n_heads=32).")
     p.add_argument("--seq-len", type=int, default=65536)
-    p.add_argument("--cache-tokens", type=int, default=8192)
+    p.add_argument(
+        "--cache-tokens", type=int, default=8192,
+        help="Resident tokens filled per row before each LRU round. "
+             "Used by both A and B. Approach A caps at resident_capacity="
+             "TOPK*2-1 because that is the physical host LRU buffer size.",
+    )
     p.add_argument(
         "--topk-layout",
         choices=TOPK_LAYOUTS,
@@ -1437,12 +1567,8 @@ def parse_args():
         "--miss", type=int, default=300,
         help="Miss count per row for both A and B (0..TOPK). "
              "Each timed/profile iter rebuilds residents with a freshly "
-             "randomized hit/miss partition among the same topk set.",
-    )
-    p.add_argument(
-        "--hit-ratio", type=float, default=None,
-        help="Deprecated. If set, overrides --miss as "
-             "miss = round(TOPK * (1 - hit_ratio)). Prefer --miss.",
+             "randomized hit/miss partition among the same topk set. "
+             "This is the only knob for hit/miss mix (no unused aliases).",
     )
     p.add_argument("--warmup", type=int, default=10)
     p.add_argument("--iters", type=int, default=50)
