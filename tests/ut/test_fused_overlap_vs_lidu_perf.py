@@ -8,6 +8,10 @@ A: LI + host-side LRU planner + fused_overlap(copy+sfa in one kernel,
 B: LightningIndexer baseline + LI_MANAGE(li+lru fused) +
    scatter_copy_sfa(copy+sfa fused).
 
+Timing defaults to NPUGraph capture/replay (``--graph-mode``). Use
+``--eager`` only for debugging launch/dispatch overhead. Approach A's planner
+follows the production side-stream + C++ ``enqueue_lru_*`` host-callback path.
+
 GLM-5.2 parameters (kv_lora_rank=512, qk_rope_head_dim=64, index_n_heads=32,
 index_head_dim=128, index_topk=2048, num_attention_heads=64).
 Both sides use the projected MLA formulation: query_nope dim = kv_lora_rank
@@ -19,12 +23,15 @@ is on kv_lora_rank, so GLM-5.2 is fully supported.
 from __future__ import annotations
 
 import argparse
+import csv
 import gc
 import json
 import math
 import os
 import statistics
 import sys
+from collections import defaultdict
+from pathlib import Path
 from typing import Callable
 
 import numpy as np
@@ -111,13 +118,255 @@ def bench_events(runner, warmup, iters, reset=None):
     return statistics.mean(times)
 
 
-def profile_pipeline(steps, warmup, iters, profile_dir=None):
+def capture_npu_graph(runner, *, warmup: int = 3):
+    """Warm up then capture ``runner`` into an NPUGraph for replay timing."""
+    for _ in range(max(0, warmup)):
+        runner()
+    torch.npu.synchronize()
+    graph = torch.npu.NPUGraph()
+    with torch.npu.graph(graph):
+        runner()
+    torch.npu.synchronize()
+    return graph
+
+
+def maybe_graph_runner(runner, *, use_graph: bool, warmup: int = 3):
+    """Return ``(callable, mode_name)``; graph mode wraps ``runner`` in replay."""
+    if not use_graph:
+        return runner, "eager"
+    graph = capture_npu_graph(runner, warmup=warmup)
+    return graph.replay, "graph"
+
+
+def _find_profile_csvs(profile_dir: str) -> dict[str, Path]:
+    """Locate common msprof/torch_npu summary CSVs under ``profile_dir``."""
+    root = Path(profile_dir)
+    wanted = ("op_statistic.csv", "kernel_details.csv", "operator_details.csv")
+    found: dict[str, Path] = {}
+    for path in root.rglob("*.csv"):
+        name = path.name
+        if name in wanted and name not in found:
+            found[name] = path
+    return found
+
+
+def _ensure_profile_csvs(profile_dir: str) -> dict[str, Path]:
+    """Return parsed CSVs, calling offline analyse() once if needed."""
+    found = _find_profile_csvs(profile_dir)
+    if "op_statistic.csv" in found or "kernel_details.csv" in found:
+        return found
+    try:
+        from torch_npu.profiler.profiler import analyse
+    except Exception as exc:
+        print(f"[profile] offline analyse unavailable: {exc}", flush=True)
+        return found
+    print("[profile] summary CSV not ready; running offline analyse()...",
+          flush=True)
+    try:
+        analyse(profile_dir)
+    except TypeError:
+        # Some torch_npu versions expect an ascend_pt directory, not the root.
+        for ascend_pt in Path(profile_dir).rglob("*_ascend_pt"):
+            analyse(str(ascend_pt))
+    except Exception as exc:
+        print(f"[profile] offline analyse failed: {exc}", flush=True)
+        return found
+    return _find_profile_csvs(profile_dir)
+
+
+def _pick_csv_field(row: dict, *candidates: str) -> str | None:
+    for name in candidates:
+        if name in row and row[name] not in ("", None):
+            return name
+    lower = {k.lower(): k for k in row}
+    for name in candidates:
+        key = lower.get(name.lower())
+        if key is not None and row[key] not in ("", None):
+            return key
+    return None
+
+
+def _as_float(value) -> float | None:
+    if value is None:
+        return None
+    text = str(value).strip().replace(",", "")
+    if not text or text.upper() in ("N/A", "NA", "NONE"):
+        return None
+    try:
+        return float(text)
+    except ValueError:
+        return None
+
+
+# Approach A: after LightningIndexer, host-side LRU shows up as these msprof
+# markers. Their avg sum is the planner/LRU proxy used in this UT.
+_LRU_PROFILE_MARKERS = (
+    "HOSTFUNC_CALLBACK",
+    "EVENT_WAIT",
+)
+
+
+def _normalize_op_name(name: str) -> str:
+    return "".join(ch for ch in name.upper() if ch.isalnum() or ch == "_")
+
+
+def _match_lru_marker(name: str) -> str | None:
+    norm = _normalize_op_name(name)
+    for marker in _LRU_PROFILE_MARKERS:
+        if marker in norm:
+            return marker
+    return None
+
+
+def _print_rows(title: str, rows: list[tuple[str, int, float, float]], top_n: int):
+    print(title, flush=True)
+    print(f"{'name':<48} {'count':>8} {'avg_us':>12} {'total_us':>14}",
+          flush=True)
+    for name, count, avg_us, total_us in rows[:top_n]:
+        print(f"{name:<48} {count:8d} {avg_us:12.3f} {total_us:14.3f}",
+              flush=True)
+
+
+def _print_lru_planner_summary(rows: list[tuple[str, int, float, float]]) -> None:
+    """Average HOSTFUNC_CALLBACK + EVENT_WAIT as Approach-A LRU planner time."""
+    by_marker: dict[str, list[tuple[str, int, float, float]]] = defaultdict(list)
+    for row in rows:
+        marker = _match_lru_marker(row[0])
+        if marker is not None:
+            by_marker[marker].append(row)
+
+    print("----- PROFILE LRU PLANNER (Approach A proxy) -----", flush=True)
+    print(
+        "After LightningIndexer, HOSTFUNC_CALLBACK + EVENT_WAIT is treated "
+        "as the host-side LRU planner cost.",
+        flush=True,
+    )
+    if not by_marker:
+        print(
+            "[profile] LRU markers not found "
+            f"(looked for {_LRU_PROFILE_MARKERS}).",
+            flush=True,
+        )
+        return
+
+    marker_avg: dict[str, float] = {}
+    marker_count: dict[str, int] = {}
+    marker_total: dict[str, float] = {}
+    for marker in _LRU_PROFILE_MARKERS:
+        matched = by_marker.get(marker, [])
+        if not matched:
+            print(f"{marker:<48} {'MISSING':>8}", flush=True)
+            continue
+        # Prefer the dominant row for this marker (highest total time).
+        name, count, avg_us, total_us = max(matched, key=lambda x: x[3])
+        marker_avg[marker] = avg_us
+        marker_count[marker] = count
+        marker_total[marker] = total_us
+        print(
+            f"{name:<48} {count:8d} {avg_us:12.3f} {total_us:14.3f}",
+            flush=True,
+        )
+
+    if len(marker_avg) == len(_LRU_PROFILE_MARKERS):
+        lru_avg = sum(marker_avg.values())
+        lru_total = sum(marker_total.values())
+        # Counts should be close; report the min as a sanity check.
+        lru_count = min(marker_count.values())
+        print(
+            f"{'LRU_PLANNER(=HOSTFUNC_CALLBACK+EVENT_WAIT)':<48} "
+            f"{lru_count:8d} {lru_avg:12.3f} {lru_total:14.3f}",
+            flush=True,
+        )
+        print(
+            f"[profile] LRU planner avg = "
+            f"{marker_avg['HOSTFUNC_CALLBACK']:.3f} + "
+            f"{marker_avg['EVENT_WAIT']:.3f} = {lru_avg:.3f} us",
+            flush=True,
+        )
+
+
+def summarize_profile_csvs(profile_dir: str, top_n: int = 30) -> None:
+    """Print average kernel / op times from exported msprof CSVs."""
+    found = _ensure_profile_csvs(profile_dir)
+    if not found:
+        print("[profile] no op_statistic.csv / kernel_details.csv found under "
+              f"{profile_dir}", flush=True)
+        return
+
+    rows: list[tuple[str, int, float, float]] = []
+    source = None
+    if "op_statistic.csv" in found:
+        path = found["op_statistic.csv"]
+        source = "op_statistic"
+        print(f"[profile] parsing {path}", flush=True)
+        with path.open(newline="") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                name_key = _pick_csv_field(
+                    row, "OP Type", "Op Type", "OP Name", "Op Name", "Name")
+                count_key = _pick_csv_field(
+                    row, "Count", "Calls", "Call Count", "Total Count")
+                total_key = _pick_csv_field(
+                    row, "Total Time(us)", "Total Duration(us)",
+                    "Total Time (us)", "Total Duration (us)", "Total Time")
+                avg_key = _pick_csv_field(
+                    row, "Avg Time(us)", "Avg Duration(us)",
+                    "Avg Time (us)", "Avg Duration (us)", "Average Time(us)")
+                if name_key is None:
+                    continue
+                name = str(row[name_key]).strip()
+                count = _as_float(row[count_key]) if count_key else None
+                total_us = _as_float(row[total_key]) if total_key else None
+                avg_us = _as_float(row[avg_key]) if avg_key else None
+                if avg_us is None and total_us is not None and count:
+                    avg_us = total_us / count
+                if avg_us is None:
+                    continue
+                rows.append((name, int(count or 0), avg_us, total_us or 0.0))
+    else:
+        path = found["kernel_details.csv"]
+        source = "kernel_details"
+        print(f"[profile] parsing {path}", flush=True)
+        groups: dict[str, list[float]] = defaultdict(list)
+        with path.open(newline="") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                name_key = _pick_csv_field(
+                    row, "OP Name", "Op Name", "OP Type", "Op Type", "Name")
+                dur_key = _pick_csv_field(
+                    row, "Duration(us)", "Task Duration(us)",
+                    "Task Duration (us)", "Duration (us)", "Duration")
+                if name_key is None or dur_key is None:
+                    continue
+                duration = _as_float(row[dur_key])
+                if duration is None:
+                    continue
+                groups[str(row[name_key]).strip()].append(duration)
+        for name, durs in groups.items():
+            rows.append((name, len(durs), statistics.mean(durs), sum(durs)))
+
+    rows.sort(key=lambda x: x[3], reverse=True)
+    if source == "op_statistic":
+        _print_rows(
+            "----- PROFILE OP STATISTIC (avg kernel time) -----", rows, top_n)
+    else:
+        _print_rows(
+            "----- PROFILE KERNEL DETAILS (avg over captured iters) -----",
+            rows, top_n)
+        print(
+            "[profile] note: avg_us = mean Duration(us) across all captured "
+            "kernel launches in this profile window.",
+            flush=True,
+        )
+    _print_lru_planner_summary(rows)
+
+
+def profile_pipeline(steps, warmup, iters, profile_dir=None, top_n: int = 30):
     """Run the full pipeline under torch_npu.profiler (msprof backend).
 
     ``steps`` is a list of ``(name, callable)`` executed in order each iter.
-    Exports an msprof trace to ``profile_dir`` for offline analysis.
-    ``torch_npu.profiler`` (msprof) does not support ``key_averages()``,
-    so a trace directory is required.
+    Exports an msprof Text/CSV summary to ``profile_dir``, then auto-parses
+    ``op_statistic.csv`` / ``kernel_details.csv`` for average kernel times.
     """
     import tempfile
     import torch_npu.profiler as prof
@@ -126,6 +375,7 @@ def profile_pipeline(steps, warmup, iters, profile_dir=None):
         profile_dir = tempfile.mkdtemp(prefix="fused_overlap_prof_")
         print(f"[profile] no --profile-dir given, using temp dir: {profile_dir}",
               flush=True)
+    os.makedirs(profile_dir, exist_ok=True)
 
     for _ in range(max(0, warmup)):
         for _, fn in steps:
@@ -141,15 +391,16 @@ def profile_pipeline(steps, warmup, iters, profile_dir=None):
     activities = [prof.ProfilerActivity.CPU, prof.ProfilerActivity.NPU]
     trace_cb = prof.tensorboard_trace_handler(profile_dir)
     with prof.profile(activities=activities, experimental_config=exp,
-                      on_trace_ready=trace_cb) as p:
+                      on_trace_ready=trace_cb):
         for _ in range(iters):
-            for _, fn in steps:
-                fn()
+            for name, fn in steps:
+                # Named ranges help correlate CSV rows with pipeline stages.
+                with torch.profiler.record_function(name):
+                    fn()
             torch.npu.synchronize()
 
     print(f"PROFILE_TRACE_DIR={profile_dir}", flush=True)
-    print("Use msprof or tensorboard to open the trace for kernel-level analysis.",
-          flush=True)
+    summarize_profile_csvs(profile_dir, top_n=top_n)
 
 
 # ===================== Approach A: vllm-ascend =====================
@@ -321,11 +572,18 @@ def run_a(args) -> dict:
 
     lru_cpp.warmup_lru_resident_threads(threads)
 
-    topk_cpu = torch.empty([batch, TOPK], dtype=torch.int32, device="cpu", pin_memory=True)
-    req_ids_cpu = torch.arange(batch, dtype=torch.int64, device="cpu")
+    use_graph = bool(getattr(args, "graph_mode", True))
+    topk_flat = topk.reshape(batch, TOPK).contiguous()
+    req_ids_npu = torch.arange(batch, dtype=torch.int64, device="npu")
+    stable_prefix_npu = torch.zeros((batch,), dtype=torch.int32, device="npu")
+    visible_seq_npu = torch.full((batch,), seq_len, dtype=torch.int32, device="npu")
+    plan_stream = torch_npu.npu.Stream()
+    # Register the plan stream before any capture/replay so host callbacks are
+    # valid both in eager enqueue and inside NPUGraph.
+    torch_npu.npu._subscribe_report(plan_stream)
 
-    def _run_planner_host(_args):
-        lru_cpp.lru_resident_compact_with_plan_stable_rows(
+    def _planner_kwargs_ptrs():
+        return (
             lru_req_ids.data_ptr(),
             lru_last_req_ids.data_ptr(),
             lru_topk_indices.data_ptr(),
@@ -354,38 +612,34 @@ def run_a(args) -> dict:
             lru_visible_seq_lens.data_ptr(),
         )
 
+    def _copy_planner_inputs_d2h():
+        # Match production: D2H from NPU tensors on the current stream.
+        lru_topk_indices.copy_(topk_flat, non_blocking=True)
+        lru_req_ids.copy_(req_ids_npu, non_blocking=True)
+        lru_stable_prefix_lens.copy_(stable_prefix_npu, non_blocking=True)
+        lru_visible_seq_lens.copy_(visible_seq_npu, non_blocking=True)
+
     def _a_planner_sync():
         """Synchronous planner — used as reset for isolated fused timing."""
-        topk_cpu.copy_(topk.reshape(batch, TOPK).to(torch.int32))
-        lru_req_ids.copy_(req_ids_cpu)
-        lru_topk_indices.copy_(topk_cpu)
-        lru_stable_prefix_lens.fill_(0)
-        lru_visible_seq_lens.fill_(seq_len)
-        _run_planner_host(None)
-
-    subscribed_compute_streams = set()
+        lru_topk_indices.copy_(topk_flat)
+        lru_req_ids.copy_(req_ids_npu)
+        lru_stable_prefix_lens.copy_(stable_prefix_npu)
+        lru_visible_seq_lens.copy_(visible_seq_npu)
+        lru_cpp.lru_resident_compact_with_plan_stable_rows(*_planner_kwargs_ptrs())
 
     def _a_planner():
-        """Launch planner via launch_host on the NPU stream (production path).
+        """Production-like planner: side-stream D2H + C++ enqueue host func.
 
-        D2H copies execute on the NPU stream, then the planner runs as a
-        host callback (aclrtLaunchHostFunc).  The fused op on the same
-        stream will wait for the callback to finish before executing.
+        Graph capture records the side-stream work and the main-stream wait,
+        so replay no longer pays eager Python dispatch around the LRU callback.
         """
-        topk_cpu.copy_(topk.reshape(batch, TOPK).to(torch.int32), non_blocking=True)
-        lru_req_ids.copy_(req_ids_cpu, non_blocking=True)
-        lru_topk_indices.copy_(topk_cpu, non_blocking=True)
-        lru_stable_prefix_lens.fill_(0)
-        lru_visible_seq_lens.fill_(seq_len)
-        current_compute_stream = torch_npu.npu.current_stream()
-        if current_compute_stream not in subscribed_compute_streams:
-            torch_npu.npu._subscribe_report(current_compute_stream)
-            subscribed_compute_streams.add(current_compute_stream)
-        torch_npu.npu._launch_host_func(
-            current_compute_stream,
-            _run_planner_host,
-            None,
-        )
+        compute = torch_npu.npu.current_stream()
+        ready = compute.record_event()
+        with torch_npu.npu.stream(plan_stream):
+            plan_stream.wait_event(ready)
+            _copy_planner_inputs_d2h()
+            lru_cpp.enqueue_lru_resident_compact_with_plan_stable_rows(
+                *_planner_kwargs_ptrs())
 
     def _a_li():
         o = torch_npu.npu_lightning_indexer(
@@ -416,35 +670,52 @@ def run_a(args) -> dict:
             layout_kv="PA_BSND",
             sparse_mode=3)
 
-    # warmup: planner then fused (production order)
+    def _a_pipeline():
+        _a_planner()
+        torch_npu.npu.current_stream().wait_stream(plan_stream)
+        _a_fused()
+
+    # Eager functional smoke before capture/timing.
     _a_planner_sync()
     _a_fused()
     torch.npu.synchronize()
+    print(f"[A-cfg] timing_mode={'graph' if use_graph else 'eager'}", flush=True)
+
+    li_runner, li_mode = maybe_graph_runner(
+        _a_li, use_graph=use_graph, warmup=max(1, args.warmup // 2))
+    pipeline_runner, pipeline_mode = maybe_graph_runner(
+        _a_pipeline, use_graph=use_graph, warmup=max(1, args.warmup // 2))
+    fused_runner, fused_mode = maybe_graph_runner(
+        _a_fused, use_graph=use_graph, warmup=max(1, args.warmup // 2))
+
     if getattr(args, "profile", False):
+        # Profile graph replays (or eager callables) so LRU is not inflated by
+        # Python/eager dispatch around host-callback launch.
         profile_pipeline(
-            [("li", _a_li), ("planner", _a_planner), ("fused_overlap", _a_fused)],
-            args.warmup, args.profile_iters, args.profile_dir)
+            [
+                ("li", li_runner),
+                ("planner_plus_fused", pipeline_runner),
+                ("fused_overlap", fused_runner),
+            ],
+            args.warmup, args.profile_iters, args.profile_dir,
+            top_n=args.profile_top_n)
         try:
             offload.uninitialize()
         except Exception as exc:
             print(f"OFFLOAD_UNINIT_WARN {type(exc).__name__}: {exc}", flush=True)
         return {
             "approach": "A", "profile": True,
+            "timing_mode": pipeline_mode,
             "batch_size": batch, "q_heads": q_heads, "indexer_heads": idx_heads,
             "seq_len": seq_len, "topk_layout": topk_layout,
             "hit_ratio": args.hit_ratio,
             "warmup": args.warmup, "iters": args.profile_iters,
         }
-    li_ms = bench_events(_a_li, args.warmup, args.iters)
-    # pipeline: launch_host planner + fused (same stream, fused waits for planner)
-    def _a_pipeline():
-        _a_planner()
-        _a_fused()
-    pipeline_ms = bench_events(_a_pipeline, args.warmup, args.iters)
-    # isolated fused (reset with sync planner to ensure membership map is ready)
-    fused_ms = bench_events(_a_fused, args.warmup, args.iters,
-                           reset=_a_planner_sync)
-    # planner cost = pipeline - fused (launch_host overhead included)
+
+    li_ms = bench_events(li_runner, args.warmup, args.iters)
+    pipeline_ms = bench_events(pipeline_runner, args.warmup, args.iters)
+    fused_ms = bench_events(
+        fused_runner, args.warmup, args.iters, reset=_a_planner_sync)
     planner_ms = max(0.0, pipeline_ms - fused_ms)
     try:
         offload.uninitialize()
@@ -453,6 +724,7 @@ def run_a(args) -> dict:
 
     return {
         "approach": "A",
+        "timing_mode": pipeline_mode,
         "batch_size": batch, "q_heads": q_heads, "indexer_heads": idx_heads,
         "seq_len": seq_len, "topk_layout": topk_layout,
         "hit_ratio": args.hit_ratio,
@@ -460,6 +732,7 @@ def run_a(args) -> dict:
         "pipeline_ms": pipeline_ms,
         "total_ms": li_ms + pipeline_ms,
         "warmup": args.warmup, "iters": args.iters,
+        "li_mode": li_mode, "pipeline_mode": pipeline_mode, "fused_mode": fused_mode,
     }
 
 
@@ -611,11 +884,16 @@ def run_b(args) -> dict:
     miss_counts = torch.empty((batch,), dtype=torch.int32, device=dev)
     # sparse_slots: physical slot positions for top-k tokens, extracted
     # from cache_slots AFTER li_manage updates it with miss destinations
+    use_graph = bool(getattr(args, "graph_mode", True))
     topk_tokens_dev = topk_tokens.to(dev)
     req_e_dev = req_e.to(dev)
+    req_e_long = req_e_dev.to(torch.long)
+    topk_long = topk_tokens_dev.to(torch.long)
     sparse_slots = torch.empty((batch, 1, TOPK), dtype=torch.int32, device=dev)
     actual_q = torch.arange(1, batch + 1, dtype=torch.int32, device=dev)
     actual_kv = torch.full((batch,), cache_tokens, dtype=torch.int32, device=dev)
+    hbm_bt_dev = hbm_bt.to(dev)
+    dram_bt_dev = dram_bt.to(dev)
     scale = 1.0 / math.sqrt(KVD + KRD)
 
     def _b_reset():
@@ -623,9 +901,8 @@ def run_b(args) -> dict:
         src_ids_t.fill_(-1)
 
     def _b_extract_slots():
-        for r in range(batch):
-            pr = int(req_e[r])
-            sparse_slots[r, 0] = cache_slots[pr, topk_tokens_dev]
+        # Device-only gather so scatter can be captured into an NPUGraph.
+        sparse_slots[:, 0, :] = cache_slots[req_e_long][:, topk_long]
 
     def _b_li_manage():
         return torch.ops.ops_overlap.li_manage_out.default(
@@ -650,9 +927,9 @@ def run_b(args) -> dict:
     def _b_scatter_sfa():
         _b_extract_slots()
         return torch.ops.ops_overlap.sparse_and_tail_attention_and_scatter_copy.default(
-            query, hbm_ckv, sparse_slots, cache_tokens_t, hbm_bt.to(dev),
+            query, hbm_ckv, sparse_slots, cache_tokens_t, hbm_bt_dev,
             actual_q, actual_kv, qrope, hbm_kpe, dram_kpe, dram_ckv,
-            dram_bt.to(dev), src_ids_t, miss_counts, scale)
+            dram_bt_dev, src_ids_t, miss_counts, scale)
 
     _b_lightning_indexer()
     _b_li_manage()
@@ -664,41 +941,63 @@ def run_b(args) -> dict:
               f"check idx_cache/cache_slots construction", flush=True)
     _b_scatter_sfa()
     torch.npu.synchronize()
+    print(f"[B-cfg] timing_mode={'graph' if use_graph else 'eager'}", flush=True)
+
+    # Capture after the functional smoke so graph replay measures steady-state
+    # kernel time without eager launch/dispatch noise.
+    li_runner, li_mode = maybe_graph_runner(
+        _b_lightning_indexer, use_graph=use_graph, warmup=max(1, args.warmup // 2))
+    # li_manage mutates cache_slots; restore before capture/bench.
+    _b_reset()
+    torch.npu.synchronize()
+    li_manage_runner, li_manage_mode = maybe_graph_runner(
+        _b_li_manage, use_graph=use_graph, warmup=max(1, args.warmup // 2))
+    _b_reset()
+    _b_li_manage()
+    torch.npu.synchronize()
+    scatter_runner, scatter_mode = maybe_graph_runner(
+        _b_scatter_sfa, use_graph=use_graph, warmup=max(1, args.warmup // 2))
+
     if getattr(args, "profile", False):
         profile_pipeline(
             [
-                ("lightning_indexer", _b_lightning_indexer),
-                ("li_manage", _b_li_manage),
-                ("scatter_sfa", _b_scatter_sfa),
+                ("lightning_indexer", li_runner),
+                ("li_manage", li_manage_runner),
+                ("scatter_sfa", scatter_runner),
             ],
-            args.warmup, args.profile_iters, args.profile_dir)
+            args.warmup, args.profile_iters, args.profile_dir,
+            top_n=args.profile_top_n)
         return {
             "approach": "B", "profile": True,
+            "timing_mode": li_manage_mode,
             "batch_size": batch, "q_heads": q_heads, "indexer_heads": idx_heads,
             "seq_len": seq_len, "topk_layout": topk_layout,
             "cache_tokens": cache_tokens, "miss": miss,
             "warmup": args.warmup, "iters": args.profile_iters,
         }
-    lightning_indexer_ms = bench_events(
-        _b_lightning_indexer, args.warmup, args.iters)
+
+    lightning_indexer_ms = bench_events(li_runner, args.warmup, args.iters)
     li_manage_ms = bench_events(
-        _b_li_manage, args.warmup, args.iters, reset=_b_reset)
+        li_manage_runner, args.warmup, args.iters, reset=_b_reset)
 
     def reset_b():
         _b_reset()
         _b_li_manage()
         torch.npu.synchronize()
 
-    sfa_ms = bench_events(_b_scatter_sfa, args.warmup, args.iters, reset=reset_b)
+    sfa_ms = bench_events(scatter_runner, args.warmup, args.iters, reset=reset_b)
 
     return {
         "approach": "B",
+        "timing_mode": li_manage_mode,
         "batch_size": batch, "q_heads": q_heads, "indexer_heads": idx_heads,
         "seq_len": seq_len, "topk_layout": topk_layout,
         "cache_tokens": cache_tokens, "miss": miss,
         "lightning_indexer_ms": lightning_indexer_ms,
         "li_manage_ms": li_manage_ms, "scatter_sfa_ms": sfa_ms,
         "total_ms": li_manage_ms + sfa_ms, "warmup": args.warmup, "iters": args.iters,
+        "li_mode": li_mode, "li_manage_mode": li_manage_mode,
+        "scatter_mode": scatter_mode,
     }
 
 
@@ -714,6 +1013,10 @@ def compare(args) -> None:
             "Cannot compare runs with different top-k layouts: "
             f"A={ra['topk_layout']}, B={rb['topk_layout']}.")
     print(f"Top-k layout: {ra['topk_layout']}", flush=True)
+    print(
+        f"Timing mode: A={ra.get('timing_mode', 'unknown')} "
+        f"B={rb.get('timing_mode', 'unknown')}",
+        flush=True)
     print(f"Approach A (vllm-ascend):  LI={ra['li_ms']:.4f}  "
           f"planner(launch_host)={ra.get('planner_ms', 0.0):.4f}  "
           f"fused_overlap={ra['fused_overlap_ms']:.4f}  "
@@ -768,6 +1071,20 @@ def parse_args():
     p.add_argument("--warmup", type=int, default=10)
     p.add_argument("--iters", type=int, default=50)
     p.add_argument("--dram-size-gb", type=float, default=2.0)
+    p.add_argument(
+        "--graph-mode",
+        dest="graph_mode",
+        action="store_true",
+        default=True,
+        help="Measure NPUGraph capture/replay times (default). Avoids eager "
+             "dispatch inflating host-callback / LRU planner latency.",
+    )
+    p.add_argument(
+        "--eager",
+        dest="graph_mode",
+        action="store_false",
+        help="Disable NPUGraph and measure eager launch times instead.",
+    )
     p.add_argument("--profile", action="store_true",
                    help="Profile the full pipeline with torch_npu.profiler (msprof) "
                         "and print a kernel-level op table instead of Event timing.")
@@ -775,11 +1092,22 @@ def parse_args():
                    help="Iterations to capture under --profile.")
     p.add_argument("--profile-dir", default=None,
                    help="Directory to export the full msprof trace to (optional).")
+    p.add_argument("--profile-top-n", type=int, default=30,
+                   help="How many top kernels/ops to print after --profile.")
+    p.add_argument(
+        "--parse-profile-dir",
+        default=None,
+        help="Only parse an existing msprof/torch_npu profile directory and "
+             "print average kernel times; do not run Approach A/B.",
+    )
     return p.parse_args()
 
 
 def main():
     args = parse_args()
+    if args.parse_profile_dir is not None:
+        summarize_profile_csvs(args.parse_profile_dir, top_n=args.profile_top_n)
+        return
     if args.q_heads is None:
         if NUM_ATTENTION_HEADS % args.tp != 0:
             raise SystemExit(
