@@ -12,6 +12,11 @@ Timing defaults to NPUGraph capture/replay (``--graph-mode``). Use
 ``--eager`` only for debugging launch/dispatch overhead. Approach A's planner
 follows the production side-stream + C++ ``enqueue_lru_*`` host-callback path.
 
+``--miss`` fixes the per-row miss count for both A and B. Each warmup /
+timed / profile iteration rebuilds residents with a freshly randomized
+hit/miss partition among the same topk set, so miss stays fixed but the
+concrete hit/miss tokens change every round.
+
 GLM-5.2 parameters (kv_lora_rank=512, qk_rope_head_dim=64, index_n_heads=32,
 index_head_dim=128, index_topk=2048, num_attention_heads=64).
 Both sides use the projected MLA formulation: query_nope dim = kv_lora_rank
@@ -79,6 +84,21 @@ def cdiv(a: int, b: int) -> int:
     return -(a // -b)
 
 
+def resolve_miss_count(args) -> int:
+    """Return the controlled per-row miss count from CLI.
+
+    ``--miss`` is the source of truth. Deprecated ``--hit-ratio`` still
+    overrides when explicitly provided.
+    """
+    if getattr(args, "hit_ratio", None) is not None:
+        miss = int(round(TOPK * (1.0 - float(args.hit_ratio))))
+    else:
+        miss = int(args.miss)
+    if miss < 0 or miss > TOPK:
+        raise ValueError(f"--miss must be in [0, {TOPK}], got {miss}")
+    return miss
+
+
 def build_index_scores_and_topk(
     seq_len: int,
     topk_layout: str,
@@ -119,23 +139,35 @@ def bench_events(runner, warmup, iters, reset=None):
     return statistics.mean(times)
 
 
-def capture_npu_graph(runner, *, warmup: int = 3):
-    """Warm up then capture ``runner`` into an NPUGraph for replay timing."""
+def capture_npu_graph(runner, *, warmup: int = 3, reset=None):
+    """Warm up then capture ``runner`` into an NPUGraph for replay timing.
+
+    ``reset`` (if provided) restores miss/hit state outside the graph so each
+    warmup/capture sees the same controlled miss count.
+    """
     for _ in range(max(0, warmup)):
+        if reset is not None:
+            reset()
+            torch.npu.synchronize()
         runner()
-    torch.npu.synchronize()
+    if reset is not None:
+        reset()
+        torch.npu.synchronize()
     graph = torch.npu.NPUGraph()
     with torch.npu.graph(graph):
         runner()
     torch.npu.synchronize()
+    if reset is not None:
+        reset()
+        torch.npu.synchronize()
     return graph
 
 
-def maybe_graph_runner(runner, *, use_graph: bool, warmup: int = 3):
+def maybe_graph_runner(runner, *, use_graph: bool, warmup: int = 3, reset=None):
     """Return ``(callable, mode_name)``; graph mode wraps ``runner`` in replay."""
     if not use_graph:
         return runner, "eager"
-    graph = capture_npu_graph(runner, warmup=warmup)
+    graph = capture_npu_graph(runner, warmup=warmup, reset=reset)
     return graph.replay, "graph"
 
 
@@ -298,27 +330,29 @@ def _rows_from_duration_groups(
     return rows
 
 
-def _parse_trace_view_lru_rows(trace_path: Path) -> list[tuple[str, int, float, float]]:
-    """Parse HOSTFUNC_CALLBACK / EVENT_WAIT from timeline JSON.
+def _parse_trace_view_lru_samples(
+    trace_path: Path,
+) -> dict[str, list[tuple[float, float]]]:
+    """Parse LRU timeline samples as ``marker -> [(timestamp_us, dur_us), ...]``.
 
     These Runtime/Task-Scheduler markers appear in MindStudio timeline
     (``trace_view.json``), not in AI-Core ``op_statistic`` / ``kernel_details``.
-    Chrome-trace complete events use ``dur`` in microseconds.
+    Chrome-trace complete events use ``dur`` / ``ts`` in microseconds.
     """
     try:
         payload = json.loads(trace_path.read_text())
     except Exception as exc:
         print(f"[profile] failed to read {trace_path}: {exc}", flush=True)
-        return []
+        return {}
 
     if isinstance(payload, dict):
         events = payload.get("traceEvents") or payload.get("events") or []
     elif isinstance(payload, list):
         events = payload
     else:
-        return []
+        return {}
 
-    groups: dict[str, list[float]] = defaultdict(list)
+    samples: dict[str, list[tuple[float, float]]] = defaultdict(list)
     for event in events:
         if not isinstance(event, dict):
             continue
@@ -328,136 +362,159 @@ def _parse_trace_view_lru_rows(trace_path: Path) -> list[tuple[str, int, float, 
             continue
         dur = _as_float(event.get("dur"))
         if dur is None:
-            # Some exports use begin/end pairs instead of complete events.
             continue
-        # Keep the original timeline name; marker matching is fuzzy.
-        groups[name].append(dur)
-    return _rows_from_duration_groups(groups)
+        ts = _as_float(event.get("ts"))
+        if ts is None:
+            ts = float(len(samples[marker]))
+        samples[marker].append((ts, dur))
+
+    for marker in samples:
+        samples[marker].sort(key=lambda item: item[0])
+    return samples
 
 
-def _parse_csv_lru_rows(csv_path: Path) -> list[tuple[str, int, float, float]]:
-    """Best-effort LRU marker parse from api_statistic / task_time CSVs."""
-    rows: list[tuple[str, int, float, float]] = []
-    with csv_path.open(newline="") as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            name_key = _pick_csv_field(
-                row, "API Name", "Name", "OP Name", "Op Name", "OP Type",
-                "Task Type", "Type")
-            if name_key is None:
-                continue
-            name = str(row[name_key]).strip()
-            if _match_lru_marker(name) is None:
-                continue
-            count_key = _pick_csv_field(
-                row, "Count", "Calls", "Call Count", "Total Count")
-            total_key = _pick_csv_field(
-                row, "Time(us)", "Total Time(us)", "Total Duration(us)",
-                "Total Time (us)", "Duration(us)")
-            avg_key = _pick_csv_field(
-                row, "Avg(us)", "Avg Time(us)", "Avg Duration(us)",
-                "Avg Time (us)", "Average Time(us)")
-            count = _as_float(row[count_key]) if count_key else None
-            total_us = _as_float(row[total_key]) if total_key else None
-            avg_us = _as_float(row[avg_key]) if avg_key else None
-            if avg_us is None and total_us is not None and count:
-                avg_us = total_us / count
-            if avg_us is None and total_us is not None and not count:
-                # task_time rows are often one duration per line.
-                avg_us = total_us
-                count = 1
-                total_us = total_us
-            if avg_us is None:
-                continue
-            rows.append((name, int(count or 0), avg_us, total_us or 0.0))
-    rows.sort(key=lambda x: x[3], reverse=True)
-    return rows
+def _summarize_duration_samples(
+    durs: list[float],
+    *,
+    drop_first: int = 1,
+) -> dict[str, float | int | None]:
+    """Return raw and steady-state stats for one marker's durations."""
+    if not durs:
+        return {
+            "count": 0,
+            "avg_us": None,
+            "total_us": None,
+            "min_us": None,
+            "max_us": None,
+            "median_us": None,
+            "steady_count": 0,
+            "steady_avg_us": None,
+            "first_us": None,
+        }
+    steady = durs[drop_first:] if len(durs) > drop_first else list(durs)
+    return {
+        "count": len(durs),
+        "avg_us": statistics.mean(durs),
+        "total_us": sum(durs),
+        "min_us": min(durs),
+        "max_us": max(durs),
+        "median_us": statistics.median(durs),
+        "steady_count": len(steady),
+        "steady_avg_us": statistics.mean(steady),
+        "first_us": durs[0],
+    }
 
 
-def _collect_lru_marker_rows(
+def _collect_lru_marker_samples(
     artifacts: dict[str, Path],
-    fallback_rows: list[tuple[str, int, float, float]],
-) -> tuple[list[tuple[str, int, float, float]], str]:
-    """Return LRU marker rows and the source used to obtain them."""
+) -> tuple[dict[str, list[float]], str]:
+    """Return per-marker duration samples in timeline order when possible."""
     if "trace_view.json" in artifacts:
-        rows = _parse_trace_view_lru_rows(artifacts["trace_view.json"])
-        if rows:
-            return rows, f"trace_view.json:{artifacts['trace_view.json']}"
-    for key in ("task_time.csv", "api_statistic.csv"):
-        if key in artifacts:
-            rows = _parse_csv_lru_rows(artifacts[key])
-            if rows:
-                return rows, f"{key}:{artifacts[key]}"
-    rows = [row for row in fallback_rows if _match_lru_marker(row[0])]
-    if rows:
-        return rows, "op_statistic/kernel_details"
-    return [], "none"
+        ordered = _parse_trace_view_lru_samples(artifacts["trace_view.json"])
+        if ordered:
+            samples = {
+                marker: [dur for _, dur in items]
+                for marker, items in ordered.items()
+            }
+            return samples, f"trace_view.json:{artifacts['trace_view.json']}"
+    return {}, "none"
 
 
 def _print_lru_planner_summary(
     artifacts: dict[str, Path],
     fallback_rows: list[tuple[str, int, float, float]],
+    *,
+    drop_first: int = 1,
 ) -> None:
     """Average HOSTFUNC_CALLBACK + EVENT_WAIT as Approach-A LRU planner time."""
-    rows, source = _collect_lru_marker_rows(artifacts, fallback_rows)
-    by_marker: dict[str, list[tuple[str, int, float, float]]] = defaultdict(list)
-    for row in rows:
-        marker = _match_lru_marker(row[0])
-        if marker is not None:
-            by_marker[marker].append(row)
+    samples, source = _collect_lru_marker_samples(artifacts)
 
     print("----- PROFILE LRU PLANNER (Approach A proxy) -----", flush=True)
     print(
         "HOSTFUNC_CALLBACK / EVENT_WAIT are Runtime timeline markers "
-        "(not AI-Core ops). Prefer trace_view.json, then task_time/api_statistic.",
+        "(not AI-Core ops). Prefer trace_view.json.",
         flush=True,
     )
     print(f"[profile] LRU marker source: {source}", flush=True)
-    if not by_marker:
+    if source == "none":
+        # CSV aggregates cannot drop the cold first sample reliably.
+        by_marker: dict[str, list[tuple[str, int, float, float]]] = defaultdict(list)
+        for row in fallback_rows:
+            marker = _match_lru_marker(row[0])
+            if marker is not None:
+                by_marker[marker].append(row)
+        if not by_marker:
+            print(
+                "[profile] LRU markers not found "
+                f"(looked for {_LRU_PROFILE_MARKERS} in trace_view.json).",
+                flush=True,
+            )
+            return
         print(
-            "[profile] LRU markers not found "
-            f"(looked for {_LRU_PROFILE_MARKERS} in "
-            "trace_view.json / task_time.csv / api_statistic.csv).",
+            "[profile] warning: only aggregated CSV rows available; "
+            "cannot drop the cold first sample.",
             flush=True,
         )
+        for marker in _LRU_PROFILE_MARKERS:
+            matched = by_marker.get(marker, [])
+            if not matched:
+                print(f"{marker:<48} {'MISSING':>8}", flush=True)
+                continue
+            name, count, avg_us, total_us = max(matched, key=lambda x: x[3])
+            print(
+                f"{name:<48} {count:8d} {avg_us:12.3f} {total_us:14.3f}",
+                flush=True,
+            )
         return
 
-    marker_avg: dict[str, float] = {}
-    marker_count: dict[str, int] = {}
-    marker_total: dict[str, float] = {}
+    print(
+        f"[profile] steady-state avg drops the first {drop_first} sample(s) "
+        "per marker (first profile iter is often cold for EVENT_WAIT).",
+        flush=True,
+    )
+    print(
+        f"{'marker':<24} {'n':>4} {'first':>10} {'avg_all':>10} "
+        f"{'avg_steady':>12} {'median':>10} {'min':>10} {'max':>10}",
+        flush=True,
+    )
+
+    steady_avg: dict[str, float] = {}
     for marker in _LRU_PROFILE_MARKERS:
-        matched = by_marker.get(marker, [])
-        if not matched:
-            print(f"{marker:<48} {'MISSING':>8}", flush=True)
+        durs = samples.get(marker, [])
+        stats = _summarize_duration_samples(durs, drop_first=drop_first)
+        if not durs:
+            print(f"{marker:<24} {'MISS':>4}", flush=True)
             continue
-        # Prefer the dominant row for this marker (highest total time).
-        name, count, avg_us, total_us = max(matched, key=lambda x: x[3])
-        marker_avg[marker] = avg_us
-        marker_count[marker] = count
-        marker_total[marker] = total_us
+        steady_avg[marker] = float(stats["steady_avg_us"])
         print(
-            f"{name:<48} {count:8d} {avg_us:12.3f} {total_us:14.3f}",
+            f"{marker:<24} {stats['count']:4d} "
+            f"{stats['first_us']:10.3f} {stats['avg_us']:10.3f} "
+            f"{stats['steady_avg_us']:12.3f} {stats['median_us']:10.3f} "
+            f"{stats['min_us']:10.3f} {stats['max_us']:10.3f}",
             flush=True,
         )
 
-    if len(marker_avg) == len(_LRU_PROFILE_MARKERS):
-        lru_avg = sum(marker_avg.values())
-        lru_total = sum(marker_total.values())
-        lru_count = min(marker_count.values())
+    if len(steady_avg) == len(_LRU_PROFILE_MARKERS):
+        lru_steady = sum(steady_avg.values())
         print(
-            f"{'LRU_PLANNER(=HOSTFUNC_CALLBACK+EVENT_WAIT)':<48} "
-            f"{lru_count:8d} {lru_avg:12.3f} {lru_total:14.3f}",
+            f"{'LRU_PLANNER_STEADY':<24} "
+            f"{'':>4} {'':>10} {'':>10} {lru_steady:12.3f}",
             flush=True,
         )
         print(
-            f"[profile] LRU planner avg = "
-            f"{marker_avg['HOSTFUNC_CALLBACK']:.3f} + "
-            f"{marker_avg['EVENT_WAIT']:.3f} = {lru_avg:.3f} us",
+            "[profile] LRU planner steady avg = "
+            f"{steady_avg['HOSTFUNC_CALLBACK']:.3f} + "
+            f"{steady_avg['EVENT_WAIT']:.3f} = {lru_steady:.3f} us",
             flush=True,
         )
 
 
-def summarize_profile_csvs(profile_dir: str, top_n: int = 30) -> None:
+def summarize_profile_csvs(
+    profile_dir: str,
+    top_n: int = 30,
+    *,
+    drop_first: int = 1,
+) -> None:
     """Print average kernel / op times and LRU timeline markers."""
     found = _ensure_profile_artifacts(profile_dir)
     if not found:
@@ -535,11 +592,11 @@ def summarize_profile_csvs(profile_dir: str, top_n: int = 30) -> None:
             "markers from timeline/runtime exports.",
             flush=True,
         )
-    _print_lru_planner_summary(found, rows)
+    _print_lru_planner_summary(found, rows, drop_first=drop_first)
 
 
 def profile_pipeline(steps, warmup, iters, profile_dir=None, top_n: int = 30,
-                     reset=None):
+                     reset=None, drop_first: int = 1):
     """Run the full pipeline under torch_npu.profiler (msprof backend).
 
     ``steps`` is a list of ``(name, callable)`` executed in order each iter.
@@ -596,7 +653,7 @@ def profile_pipeline(steps, warmup, iters, profile_dir=None, top_n: int = 30,
             torch.npu.synchronize()
 
     print(f"PROFILE_TRACE_DIR={run_dir}", flush=True)
-    summarize_profile_csvs(str(run_dir), top_n=top_n)
+    summarize_profile_csvs(str(run_dir), top_n=top_n, drop_first=drop_first)
 
 
 # ===================== Approach A: vllm-ascend =====================
@@ -637,10 +694,19 @@ def run_a(args) -> dict:
     idx_heads = args.indexer_heads
     seq_len = args.seq_len
     topk_layout = args.topk_layout
+    miss = resolve_miss_count(args)
+    hit_count = TOPK - miss
+    hit_ratio = 1.0 - (miss / float(TOPK))
     fmbn = cdiv(seq_len, BLOCK_SIZE)
     smbn = cdiv(TOPK, BLOCK_SIZE)
     scale = 1.0 / math.sqrt(KVD)
     torch.manual_seed(910000 + batch + q_heads * 17 + seq_len)
+    print(
+        f"[A-cfg] batch={batch} q_heads={q_heads} idx_heads={idx_heads} "
+        f"seq_len={seq_len} topk_layout={topk_layout} miss={miss} "
+        f"hit_count={hit_count} hit_ratio={hit_ratio:.4f}",
+        flush=True,
+    )
 
     q = torch.randn(batch, q_heads, KVD, dtype=dt, device="npu")
     qr = torch.randn(batch, q_heads, KRD, dtype=dt, device="npu")
@@ -658,6 +724,9 @@ def run_a(args) -> dict:
         seq_len, topk_layout, index_seed)
     topk = topk_tokens_cpu.to("npu").view(1, 1, 1, TOPK).expand(
         batch, 1, 1, TOPK).contiguous()
+    non_topk_mask = torch.ones(seq_len, dtype=torch.bool)
+    non_topk_mask[topk_tokens_cpu.to(torch.long)] = False
+    non_topk = torch.arange(seq_len, dtype=torch.int32)[non_topk_mask]
 
     total_sel = smbn * batch
     sel_kv = torch.zeros(total_sel, BLOCK_SIZE, KVD, dtype=dt, device="npu")
@@ -749,12 +818,14 @@ def run_a(args) -> dict:
     encoded_plan_stride = membership_map.stride(0)
 
     lru_req_ids = torch.empty([max_rows], dtype=torch.int64, device="cpu", pin_memory=True)
-    lru_last_req_ids = torch.full([max_rows], -1, dtype=torch.int64, device="cpu", pin_memory=True)
+    lru_last_req_ids = torch.empty([max_rows], dtype=torch.int64, device="cpu", pin_memory=True)
     lru_topk_indices = torch.empty([max_rows, TOPK], dtype=torch.int32, device="cpu", pin_memory=True)
     lru_stable_prefix_lens = torch.empty([max_rows], dtype=torch.int32, device="cpu", pin_memory=True)
     lru_visible_seq_lens = torch.empty([max_rows], dtype=torch.int32, device="cpu", pin_memory=True)
-    lru_slot_to_token = torch.full([max_rows, topk_buffer_size], -1, dtype=torch.int32, device="cpu", pin_memory=True)
-    lru_slots = torch.arange(topk_buffer_size, dtype=torch.int32, device="cpu").view(1, -1).repeat(max_rows, 1).pin_memory()
+    lru_slot_to_token = torch.empty(
+        [max_rows, topk_buffer_size], dtype=torch.int32, device="cpu", pin_memory=True)
+    lru_slots = torch.empty(
+        [max_rows, topk_buffer_size], dtype=torch.int32, device="cpu", pin_memory=True)
     lru_current_slots = torch.empty([max_rows, TOPK], dtype=torch.int32, device="cpu", pin_memory=True)
     lru_miss_count = torch.empty([max_rows], dtype=torch.int32, device="cpu", pin_memory=True)
     lru_miss_tokens = torch.empty([max_rows, TOPK], dtype=torch.int32, device="cpu", pin_memory=True)
@@ -766,12 +837,36 @@ def run_a(args) -> dict:
     lru_epochs = torch.zeros([threads], dtype=torch.int32, device="cpu", pin_memory=True)
     lru_physical_row_ws = torch.empty([max_rows * 3], dtype=torch.int32, device="cpu", pin_memory=True)
 
+    # Stable-row planner reserves one slot for the current token, so only
+    # capacity-1 slots are usable residents (see kv_offload_decode.cpp).
+    resident_capacity = topk_buffer_size - 1
+    fill_count = min(int(args.cache_tokens), resident_capacity)
+    if fill_count < hit_count:
+        raise ValueError(
+            f"Need at least hit_count={hit_count} resident slots to honor "
+            f"--miss={miss}, but fill_count={fill_count} "
+            f"(cache_tokens={args.cache_tokens}, "
+            f"resident_capacity={resident_capacity}).")
+
+    # Each reset rebuilds residents so miss count stays fixed, but which
+    # topk tokens are hits vs misses is freshly randomized every round.
+    lru_slots_init = (
+        torch.arange(topk_buffer_size, dtype=torch.int32)
+        .view(1, -1).repeat(max_rows, 1).contiguous()
+    )
+    lru_last_req_ids_init = torch.full(
+        [max_rows], -1, dtype=torch.int64)
+    lru_last_req_ids_init[:batch] = torch.arange(batch, dtype=torch.int64)
+    _a_reset_round = [0]
+
     lru_cpp.warmup_lru_resident_threads(threads)
 
     use_graph = bool(getattr(args, "graph_mode", True))
     topk_flat = topk.reshape(batch, TOPK).contiguous()
     req_ids_npu = torch.arange(batch, dtype=torch.int64, device="npu")
-    stable_prefix_npu = torch.zeros((batch,), dtype=torch.int32, device="npu")
+    # Production decode uses ~seq_len-1; use seq_len so no resident is wiped
+    # as a speculative suffix while we measure controlled miss counts.
+    stable_prefix_npu = torch.full((batch,), seq_len, dtype=torch.int32, device="npu")
     visible_seq_npu = torch.full((batch,), seq_len, dtype=torch.int32, device="npu")
     plan_stream = torch_npu.npu.Stream()
     # Do NOT call _subscribe_report on this stream. Production enqueue uses
@@ -816,13 +911,44 @@ def run_a(args) -> dict:
         lru_stable_prefix_lens.copy_(stable_prefix_npu, non_blocking=True)
         lru_visible_seq_lens.copy_(visible_seq_npu, non_blocking=True)
 
+    def _a_reset_lru_state():
+        """Rebuild residents for one round: fixed miss count, fresh hit/miss set."""
+        round_id = _a_reset_round[0]
+        _a_reset_round[0] = round_id + 1
+        lru_slot_to_token.fill_(-1)
+        for r in range(batch):
+            gen = torch.Generator().manual_seed(1000 + round_id * 10007 + r)
+            hit_perm = torch.randperm(TOPK, generator=gen)
+            hit_tokens = topk_tokens_cpu[hit_perm[:hit_count]]
+            other_count = fill_count - hit_count
+            others = non_topk[
+                torch.randperm(non_topk.numel(), generator=gen)[:other_count]
+            ]
+            cached = torch.cat((hit_tokens, others))
+            slots = torch.randperm(resident_capacity, generator=gen)[:fill_count]
+            lru_slot_to_token[r, slots] = cached
+        lru_slots.copy_(lru_slots_init)
+        lru_last_req_ids.copy_(lru_last_req_ids_init)
+        lru_epochs.zero_()
+        membership_map.fill_(-1)
+        control[:, 1] = EXTERNAL_PLAN_READY_MARKER
+        control[:, 2] = TOPK
+        control[:, 3] = CONTROL_OFFSET_INT16 - TOPK
+        control[:, 7] = PAIRED_SELECTION_COPY_MARKER
+        sel_status.fill_(-1)
+
     def _a_planner_sync():
-        """Synchronous planner — used as reset for isolated fused timing."""
+        """Synchronous planner — used for miss verification / fused prep."""
         lru_topk_indices.copy_(topk_flat)
         lru_req_ids.copy_(req_ids_npu)
         lru_stable_prefix_lens.copy_(stable_prefix_npu)
         lru_visible_seq_lens.copy_(visible_seq_npu)
         lru_cpp.lru_resident_compact_with_plan_stable_rows(*_planner_kwargs_ptrs())
+
+    def _a_reset_then_plan():
+        """Reset residents then build a fresh plan (isolated fused timing)."""
+        _a_reset_lru_state()
+        _a_planner_sync()
 
     def _a_planner():
         """Production-like planner: side-stream D2H + C++ enqueue host func.
@@ -880,8 +1006,17 @@ def run_a(args) -> dict:
         _a_li()
         _a_planner_plus_fused()
 
-    # Eager functional smoke before capture/timing.
+    # Eager functional smoke + verify controlled miss before capture/timing.
+    _a_reset_lru_state()
     _a_planner_sync()
+    actual_miss = lru_miss_count[:batch].tolist()
+    expected_miss = [miss] * batch
+    if actual_miss != expected_miss:
+        raise RuntimeError(
+            f"[A] controlled miss mismatch: got {actual_miss}, "
+            f"expected {expected_miss}. Check resident prefill / "
+            f"stable_prefix_lens.")
+    print(f"[A-cfg] verified miss_counts={actual_miss}", flush=True)
     _a_fused()
     torch.npu.synchronize()
     print(f"[A-cfg] timing_mode={'graph' if use_graph else 'eager'}", flush=True)
@@ -890,13 +1025,16 @@ def run_a(args) -> dict:
     # graphs previously made them look like different streams and caused fused
     # to execute twice per profile iter (pipeline + isolated fused).
     full_runner, full_mode = maybe_graph_runner(
-        _a_full_pipeline, use_graph=use_graph, warmup=max(1, args.warmup // 2))
+        _a_full_pipeline, use_graph=use_graph,
+        warmup=max(1, args.warmup // 2), reset=_a_reset_lru_state)
 
     if getattr(args, "profile", False):
         profile_pipeline(
             [("full_pipeline", full_runner)],
             args.warmup, args.profile_iters, args.profile_dir,
-            top_n=args.profile_top_n)
+            top_n=args.profile_top_n,
+            reset=_a_reset_lru_state,
+            drop_first=args.profile_drop_first)
         try:
             offload.uninitialize()
         except Exception as exc:
@@ -906,7 +1044,7 @@ def run_a(args) -> dict:
             "timing_mode": full_mode,
             "batch_size": batch, "q_heads": q_heads, "indexer_heads": idx_heads,
             "seq_len": seq_len, "topk_layout": topk_layout,
-            "hit_ratio": args.hit_ratio,
+            "miss": miss, "hit_ratio": hit_ratio,
             "warmup": args.warmup, "iters": args.profile_iters,
         }
 
@@ -915,14 +1053,16 @@ def run_a(args) -> dict:
         _a_li, use_graph=use_graph, warmup=max(1, args.warmup // 2))
     pipeline_runner, pipeline_mode = maybe_graph_runner(
         _a_planner_plus_fused, use_graph=use_graph,
-        warmup=max(1, args.warmup // 2))
+        warmup=max(1, args.warmup // 2), reset=_a_reset_lru_state)
     fused_runner, fused_mode = maybe_graph_runner(
-        _a_fused, use_graph=use_graph, warmup=max(1, args.warmup // 2))
+        _a_fused, use_graph=use_graph, warmup=max(1, args.warmup // 2),
+        reset=_a_reset_then_plan)
 
     li_ms = bench_events(li_runner, args.warmup, args.iters)
-    pipeline_ms = bench_events(pipeline_runner, args.warmup, args.iters)
+    pipeline_ms = bench_events(
+        pipeline_runner, args.warmup, args.iters, reset=_a_reset_lru_state)
     fused_ms = bench_events(
-        fused_runner, args.warmup, args.iters, reset=_a_planner_sync)
+        fused_runner, args.warmup, args.iters, reset=_a_reset_then_plan)
     planner_ms = max(0.0, pipeline_ms - fused_ms)
     try:
         offload.uninitialize()
@@ -934,7 +1074,7 @@ def run_a(args) -> dict:
         "timing_mode": full_mode,
         "batch_size": batch, "q_heads": q_heads, "indexer_heads": idx_heads,
         "seq_len": seq_len, "topk_layout": topk_layout,
-        "hit_ratio": args.hit_ratio,
+        "miss": miss, "hit_ratio": hit_ratio,
         "li_ms": li_ms, "planner_ms": planner_ms, "fused_overlap_ms": fused_ms,
         "pipeline_ms": pipeline_ms,
         "total_ms": li_ms + pipeline_ms,
@@ -1004,7 +1144,7 @@ def run_b(args) -> dict:
     idx_heads = args.indexer_heads
     seq_len = args.seq_len
     cache_tokens = args.cache_tokens
-    miss = args.miss
+    miss = resolve_miss_count(args)
     topk_layout = args.topk_layout
     if idx_heads not in (32, 64):
         raise RuntimeError(
@@ -1037,7 +1177,6 @@ def run_b(args) -> dict:
     index_scores_cpu, topk_tokens = build_index_scores_and_topk(
         seq_len, topk_layout, index_seed)
     hit_count = TOPK - miss
-    hit_tokens = topk_tokens[:hit_count]
     idx_cache_cpu = torch.zeros((tib, BLOCK_SIZE, 1, INDEX_DIM), dtype=dt)
     index_scores = index_scores_cpu.view(1, sb, BLOCK_SIZE)
     idx_cache_rows = idx_cache_cpu.view(batch, sb, BLOCK_SIZE, 1, INDEX_DIM)
@@ -1059,26 +1198,19 @@ def run_b(args) -> dict:
     dram_ckv = _swap(dc, dev)
     torch.npu.synchronize()
 
-    # ---- pre-fill cache_slots: hits + other tokens (match nano test) ----
+    # ---- cache_slots rebuilt each reset: fixed miss, random hit/miss set ----
     pool = batch + 7
     pg = torch.Generator().manual_seed(99)
     req_e = torch.randperm(pool, generator=pg)[:batch].to(torch.int32)
-    cs_cpu = torch.full((pool, seq_len), -1, dtype=torch.int32)
     non_topk_mask = torch.ones(seq_len, dtype=torch.bool)
     non_topk_mask[topk_tokens] = False
     non_topk = torch.arange(seq_len, dtype=torch.int32)[non_topk_mask]
-    for r in range(batch):
-        pr = int(req_e[r])
-        gen = torch.Generator().manual_seed(r)
-        other_count = cache_tokens - hit_count
-        others = non_topk[
-            torch.randperm(seq_len - TOPK, generator=gen)[:other_count]
-        ]
-        cached = torch.cat((hit_tokens, others))
-        slots = torch.randperm(cache_tokens, generator=gen, dtype=torch.int32)
-        cs_cpu[pr, cached] = slots
-    cache_slots = cs_cpu.to(dev)
-    cache_slots_init = cache_slots.clone()
+    if cache_tokens < hit_count:
+        raise ValueError(
+            f"Need cache_tokens >= hit_count to honor --miss={miss}, "
+            f"got cache_tokens={cache_tokens}, hit_count={hit_count}.")
+    cache_slots = torch.full((pool, seq_len), -1, dtype=torch.int32, device=dev)
+    _b_reset_round = [0]
 
     weights = torch.zeros((batch, idx_heads), dtype=dt, device=dev)
     weights[:, 0] = 1
@@ -1104,7 +1236,23 @@ def run_b(args) -> dict:
     scale = 1.0 / math.sqrt(KVD + KRD)
 
     def _b_reset():
-        cache_slots.copy_(cache_slots_init)
+        """Rebuild cache_slots: fixed miss count, freshly randomized hit/miss set."""
+        round_id = _b_reset_round[0]
+        _b_reset_round[0] = round_id + 1
+        cs_cpu = torch.full((pool, seq_len), -1, dtype=torch.int32)
+        other_count = cache_tokens - hit_count
+        for r in range(batch):
+            pr = int(req_e[r])
+            gen = torch.Generator().manual_seed(2000 + round_id * 10007 + r)
+            hit_perm = torch.randperm(TOPK, generator=gen)
+            hit_tokens_r = topk_tokens[hit_perm[:hit_count]]
+            others = non_topk[
+                torch.randperm(non_topk.numel(), generator=gen)[:other_count]
+            ]
+            cached = torch.cat((hit_tokens_r, others))
+            slots = torch.randperm(cache_tokens, generator=gen, dtype=torch.int32)
+            cs_cpu[pr, cached] = slots
+        cache_slots.copy_(cs_cpu.to(dev))
         src_ids_t.fill_(-1)
 
     def _b_extract_slots():
@@ -1139,13 +1287,16 @@ def run_b(args) -> dict:
             dram_bt_dev, src_ids_t, miss_counts, scale)
 
     _b_lightning_indexer()
+    _b_reset()
     _b_li_manage()
     torch.npu.synchronize()
     actual_miss = miss_counts.cpu().tolist()
     expected_miss = [miss] * batch
     if actual_miss != expected_miss:
-        print(f"[B-WARN] miss_counts={actual_miss} expected={expected_miss}, "
-              f"check idx_cache/cache_slots construction", flush=True)
+        raise RuntimeError(
+            f"[B] controlled miss mismatch: got {actual_miss}, "
+            f"expected {expected_miss}. Check cache_slots prefill.")
+    print(f"[B-cfg] verified miss_counts={actual_miss}", flush=True)
     _b_scatter_sfa()
     torch.npu.synchronize()
     print(f"[B-cfg] timing_mode={'graph' if use_graph else 'eager'}", flush=True)
@@ -1157,10 +1308,9 @@ def run_b(args) -> dict:
 
     # Capture after the functional smoke so graph replay measures steady-state
     # kernel time without eager launch/dispatch noise.
-    _b_reset()
-    torch.npu.synchronize()
     full_runner, full_mode = maybe_graph_runner(
-        _b_pipeline, use_graph=use_graph, warmup=max(1, args.warmup // 2))
+        _b_pipeline, use_graph=use_graph,
+        warmup=max(1, args.warmup // 2), reset=_b_reset)
 
     if getattr(args, "profile", False):
         # One pipeline per iter. Reset stays outside the profiled work.
@@ -1168,7 +1318,8 @@ def run_b(args) -> dict:
             [("full_pipeline", full_runner)],
             args.warmup, args.profile_iters, args.profile_dir,
             top_n=args.profile_top_n,
-            reset=_b_reset)
+            reset=_b_reset,
+            drop_first=args.profile_drop_first)
         return {
             "approach": "B", "profile": True,
             "timing_mode": full_mode,
@@ -1180,26 +1331,24 @@ def run_b(args) -> dict:
 
     li_runner, li_mode = maybe_graph_runner(
         _b_lightning_indexer, use_graph=use_graph, warmup=max(1, args.warmup // 2))
-    _b_reset()
-    torch.npu.synchronize()
     li_manage_runner, li_manage_mode = maybe_graph_runner(
-        _b_li_manage, use_graph=use_graph, warmup=max(1, args.warmup // 2))
-    _b_reset()
-    _b_li_manage()
-    torch.npu.synchronize()
-    scatter_runner, scatter_mode = maybe_graph_runner(
-        _b_scatter_sfa, use_graph=use_graph, warmup=max(1, args.warmup // 2))
+        _b_li_manage, use_graph=use_graph,
+        warmup=max(1, args.warmup // 2), reset=_b_reset)
 
-    lightning_indexer_ms = bench_events(li_runner, args.warmup, args.iters)
-    li_manage_ms = bench_events(
-        li_manage_runner, args.warmup, args.iters, reset=_b_reset)
-
-    def reset_b():
+    def _b_reset_then_manage():
         _b_reset()
         _b_li_manage()
         torch.npu.synchronize()
 
-    sfa_ms = bench_events(scatter_runner, args.warmup, args.iters, reset=reset_b)
+    scatter_runner, scatter_mode = maybe_graph_runner(
+        _b_scatter_sfa, use_graph=use_graph,
+        warmup=max(1, args.warmup // 2), reset=_b_reset_then_manage)
+
+    lightning_indexer_ms = bench_events(li_runner, args.warmup, args.iters)
+    li_manage_ms = bench_events(
+        li_manage_runner, args.warmup, args.iters, reset=_b_reset)
+    sfa_ms = bench_events(
+        scatter_runner, args.warmup, args.iters, reset=_b_reset_then_manage)
 
     return {
         "approach": "B",
@@ -1227,6 +1376,10 @@ def compare(args) -> None:
             "Cannot compare runs with different top-k layouts: "
             f"A={ra['topk_layout']}, B={rb['topk_layout']}.")
     print(f"Top-k layout: {ra['topk_layout']}", flush=True)
+    if "miss" in ra or "miss" in rb:
+        print(
+            f"Miss: A={ra.get('miss', 'n/a')} B={rb.get('miss', 'n/a')}",
+            flush=True)
     print(
         f"Timing mode: A={ra.get('timing_mode', 'unknown')} "
         f"B={rb.get('timing_mode', 'unknown')}",
@@ -1280,8 +1433,17 @@ def parse_args():
             "tokens; random scatters them with a deterministic permutation."
         ),
     )
-    p.add_argument("--miss", type=int, default=300, help="Miss count per row (approach B).")
-    p.add_argument("--hit-ratio", type=float, default=0.85, help="Approach A hit ratio.")
+    p.add_argument(
+        "--miss", type=int, default=300,
+        help="Miss count per row for both A and B (0..TOPK). "
+             "Each timed/profile iter rebuilds residents with a freshly "
+             "randomized hit/miss partition among the same topk set.",
+    )
+    p.add_argument(
+        "--hit-ratio", type=float, default=None,
+        help="Deprecated. If set, overrides --miss as "
+             "miss = round(TOPK * (1 - hit_ratio)). Prefer --miss.",
+    )
     p.add_argument("--warmup", type=int, default=10)
     p.add_argument("--iters", type=int, default=50)
     p.add_argument("--dram-size-gb", type=float, default=2.0)
@@ -1309,6 +1471,14 @@ def parse_args():
     p.add_argument("--profile-top-n", type=int, default=30,
                    help="How many top kernels/ops to print after --profile.")
     p.add_argument(
+        "--profile-drop-first",
+        type=int,
+        default=1,
+        help="When averaging LRU timeline markers from trace_view.json, drop "
+             "this many leading samples per marker (default 1). The first "
+             "profiled EVENT_WAIT is often a cold outlier.",
+    )
+    p.add_argument(
         "--parse-profile-dir",
         default=None,
         help="Only parse an existing msprof/torch_npu profile directory and "
@@ -1320,7 +1490,11 @@ def parse_args():
 def main():
     args = parse_args()
     if args.parse_profile_dir is not None:
-        summarize_profile_csvs(args.parse_profile_dir, top_n=args.profile_top_n)
+        summarize_profile_csvs(
+            args.parse_profile_dir,
+            top_n=args.profile_top_n,
+            drop_first=args.profile_drop_first,
+        )
         return
     if args.q_heads is None:
         if NUM_ATTENTION_HEADS % args.tp != 0:
