@@ -11,6 +11,19 @@ B: LightningIndexer baseline (same LI inputs as li_manage) +
    LI_MANAGE(li+lru fused) + scatter_copy_sfa(copy+sfa fused).
    Reports ``li_manage_minus_li_ms`` = li_manage - lightning_indexer.
 
+Common compare fields written into every scenario JSON (profile or not):
+  ``lru_ms``      — A: host planner cost; B: li_manage - LI   (event time)
+  ``sfa_copy_ms`` — A: fused_overlap (copy+sfa); B: scatter_sfa (event time)
+
+With ``--profile``, also emit kernel/timeline compare fields:
+  ``lru_kernel_ms``      — A: HOSTFUNC_CALLBACK + EVENT_WAIT (both parts, sum);
+                           B: li_manage_kernel - LI_kernel
+  ``sfa_copy_kernel_ms`` — A: fused_overlap kernel; B: scatter_sfa kernel
+``--compare`` prints both event and kernel pairs when present.
+
+NOTE: Approach-A ``lru_kernel_ms`` is NEVER hostfunc alone — it is always
+``hostfunc_callback_steady_us + event_wait_steady_us`` (converted to ms).
+
 Supports a scenario matrix via multi-value ``--batch-size`` / ``--miss`` /
 ``--seq-len`` / ``--cache-tokens`` (cartesian product). Each approach writes
 a suite JSON; ``--compare`` matches scenarios by
@@ -101,6 +114,164 @@ def resolve_miss_count(args) -> int:
     if miss < 0 or miss > TOPK:
         raise ValueError(f"--miss must be in [0, {TOPK}], got {miss}")
     return miss
+
+
+def attach_compare_fields(
+    result: dict,
+    *,
+    lru_ms: float,
+    sfa_copy_ms: float,
+) -> dict:
+    """Attach the A/B-comparable event-time metric pair every scenario exposes.
+
+    ``lru_ms``:      A host planner  ↔  B (li_manage - lightning_indexer)
+    ``sfa_copy_ms``: A fused_overlap ↔  B scatter_sfa (both copy+sfa)
+    """
+    result["lru_ms"] = float(lru_ms)
+    result["sfa_copy_ms"] = float(sfa_copy_ms)
+    return result
+
+
+# Substring patterns (lowercased) used to pick msprof rows for kernel compare.
+_KERNEL_NAME_PATTERNS = {
+    "li": (
+        "npu_lightning_indexer",
+        "lightning_indexer",
+        "lightningindexer",
+    ),
+    "a_sfa_copy": (
+        "npu_fused_sparse_attention_overlap",
+        "fused_sparse_attention_overlap",
+        "fused_sparse_attention",
+    ),
+    "b_li_manage": (
+        "li_manage_out",
+        "li_manage",
+    ),
+    "b_sfa_copy": (
+        "sparse_and_tail_attention_and_scatter_copy",
+        "sparse_and_tail_attention",
+        "scatter_copy",
+    ),
+}
+
+
+def _ops_from_profile_summary(profile_summary: dict | None) -> list[dict]:
+    if not profile_summary:
+        return []
+    ops = profile_summary.get("ops")
+    if isinstance(ops, list) and ops:
+        return ops
+    top = profile_summary.get("top_ops")
+    return top if isinstance(top, list) else []
+
+
+def _match_op_avg_ms(
+    ops: list[dict],
+    patterns: tuple[str, ...],
+    *,
+    exclude: tuple[str, ...] = (),
+) -> tuple[float | None, str | None]:
+    """Return (avg_ms, matched_name) for the best-matching op by total_us."""
+    best: dict | None = None
+    for op in ops:
+        name = str(op.get("name", ""))
+        lower = name.lower()
+        if exclude and any(tok in lower for tok in exclude):
+            continue
+        if not any(tok in lower for tok in patterns):
+            continue
+        if best is None or float(op.get("total_us", 0.0)) > float(
+                best.get("total_us", 0.0)):
+            best = op
+    if best is None or best.get("avg_us") is None:
+        return None, None
+    return float(best["avg_us"]) / 1000.0, str(best["name"])
+
+
+def attach_kernel_compare_fields(
+    result: dict,
+    approach: str,
+    *,
+    quiet: bool = False,
+) -> dict:
+    """Derive ``lru_kernel_ms`` / ``sfa_copy_kernel_ms`` from profile_summary.
+
+    A ``lru_kernel_ms`` = HOSTFUNC_CALLBACK + EVENT_WAIT (both required parts).
+    A ``sfa_copy_kernel_ms`` = fused_overlap AI-Core kernel.
+    B ``lru_kernel_ms`` = li_manage kernel - LI kernel.
+    B ``sfa_copy_kernel_ms`` = scatter_sfa AI-Core kernel.
+    """
+    summary = result.get("profile_summary")
+    if not summary:
+        return result
+    ops = _ops_from_profile_summary(summary)
+    matched: dict[str, str | None] = {}
+
+    if approach == "A":
+        sfa_ms, sfa_name = _match_op_avg_ms(ops, _KERNEL_NAME_PATTERNS["a_sfa_copy"])
+        li_ms, li_name = _match_op_avg_ms(
+            ops, _KERNEL_NAME_PATTERNS["li"],
+            exclude=_KERNEL_NAME_PATTERNS["b_li_manage"],
+        )
+        lru = summary.get("lru_planner") or {}
+        # Sum of BOTH timeline markers — do not drop EVENT_WAIT.
+        host_us = lru.get("hostfunc_callback_steady_us")
+        wait_us = lru.get("event_wait_steady_us")
+        lru_us = lru.get("lru_planner_steady_us")
+        if lru_us is None and host_us is not None and wait_us is not None:
+            lru_us = float(host_us) + float(wait_us)
+        if lru_us is None:
+            lru_us = result.get("lru_planner_steady_us")
+        lru_ms = float(lru_us) / 1000.0 if lru_us is not None else None
+        if host_us is not None:
+            result["hostfunc_callback_kernel_ms"] = float(host_us) / 1000.0
+        if wait_us is not None:
+            result["event_wait_kernel_ms"] = float(wait_us) / 1000.0
+        matched["sfa_copy"] = sfa_name
+        matched["li"] = li_name
+        matched["lru"] = (
+            "HOSTFUNC_CALLBACK+EVENT_WAIT" if lru_ms is not None else None
+        )
+    else:
+        li_ms, li_name = _match_op_avg_ms(
+            ops, _KERNEL_NAME_PATTERNS["li"],
+            exclude=_KERNEL_NAME_PATTERNS["b_li_manage"],
+        )
+        manage_ms, manage_name = _match_op_avg_ms(
+            ops, _KERNEL_NAME_PATTERNS["b_li_manage"],
+            exclude=_KERNEL_NAME_PATTERNS["li"],
+        )
+        sfa_ms, sfa_name = _match_op_avg_ms(ops, _KERNEL_NAME_PATTERNS["b_sfa_copy"])
+        if manage_ms is not None and li_ms is not None:
+            lru_ms = manage_ms - li_ms
+        else:
+            lru_ms = None
+        matched["li"] = li_name
+        matched["li_manage"] = manage_name
+        matched["sfa_copy"] = sfa_name
+        matched["lru"] = (
+            f"{manage_name} - {li_name}"
+            if manage_name and li_name else None
+        )
+        result["li_kernel_ms"] = li_ms
+        result["li_manage_kernel_ms"] = manage_ms
+
+    result["lru_kernel_ms"] = lru_ms
+    result["sfa_copy_kernel_ms"] = sfa_ms
+    if approach == "A":
+        result["li_kernel_ms"] = li_ms
+    result["kernel_match_names"] = matched
+    if not quiet:
+        def _fmt(v):
+            return "n/a" if v is None else f"{float(v):.4f}"
+        print(
+            f"[{approach}-kernel] lru_kernel_ms={_fmt(lru_ms)}  "
+            f"sfa_copy_kernel_ms={_fmt(sfa_ms)}  "
+            f"matched={matched}",
+            flush=True,
+        )
+    return result
 
 
 def _assert_tensor_eq(name: str, actual: torch.Tensor, expected: torch.Tensor) -> None:
@@ -305,7 +476,8 @@ def _as_float(value) -> float | None:
 
 
 # Approach A: after LightningIndexer, host-side LRU shows up as these msprof
-# markers. Their avg sum is the planner/LRU proxy used in this UT.
+# markers. ``lru_kernel_ms`` ALWAYS includes BOTH parts (sum), never hostfunc
+# alone: lru_kernel_ms = HOSTFUNC_CALLBACK + EVENT_WAIT (steady avg).
 _LRU_PROFILE_MARKERS = (
     "HOSTFUNC_CALLBACK",
     "EVENT_WAIT",
@@ -438,9 +610,10 @@ def _print_lru_planner_summary(
     fallback_rows: list[tuple[str, int, float, float]],
     *,
     drop_first: int = 1,
-) -> None:
+) -> dict:
     """Average HOSTFUNC_CALLBACK + EVENT_WAIT as Approach-A LRU planner time."""
     samples, source = _collect_lru_marker_samples(artifacts)
+    out: dict = {"source": source, "drop_first": drop_first, "markers": {}}
 
     print("----- PROFILE LRU PLANNER (Approach A proxy) -----", flush=True)
     print(
@@ -462,7 +635,8 @@ def _print_lru_planner_summary(
                 f"(looked for {_LRU_PROFILE_MARKERS} in trace_view.json).",
                 flush=True,
             )
-            return
+            out["found"] = False
+            return out
         print(
             "[profile] warning: only aggregated CSV rows available; "
             "cannot drop the cold first sample.",
@@ -474,11 +648,16 @@ def _print_lru_planner_summary(
                 print(f"{marker:<48} {'MISSING':>8}", flush=True)
                 continue
             name, count, avg_us, total_us = max(matched, key=lambda x: x[3])
+            out["markers"][marker] = {
+                "name": name, "count": count,
+                "avg_us": avg_us, "total_us": total_us,
+            }
             print(
                 f"{name:<48} {count:8d} {avg_us:12.3f} {total_us:14.3f}",
                 flush=True,
             )
-        return
+        out["found"] = bool(out["markers"])
+        return out
 
     print(
         f"[profile] steady-state avg drops the first {drop_first} sample(s) "
@@ -499,6 +678,7 @@ def _print_lru_planner_summary(
             print(f"{marker:<24} {'MISS':>4}", flush=True)
             continue
         steady_avg[marker] = float(stats["steady_avg_us"])
+        out["markers"][marker] = dict(stats)
         print(
             f"{marker:<24} {stats['count']:4d} "
             f"{stats['first_us']:10.3f} {stats['avg_us']:10.3f} "
@@ -507,8 +687,12 @@ def _print_lru_planner_summary(
             flush=True,
         )
 
+    out["found"] = bool(out["markers"])
     if len(steady_avg) == len(_LRU_PROFILE_MARKERS):
         lru_steady = sum(steady_avg.values())
+        out["lru_planner_steady_us"] = lru_steady
+        out["hostfunc_callback_steady_us"] = steady_avg["HOSTFUNC_CALLBACK"]
+        out["event_wait_steady_us"] = steady_avg["EVENT_WAIT"]
         print(
             f"{'LRU_PLANNER_STEADY':<24} "
             f"{'':>4} {'':>10} {'':>10} {lru_steady:12.3f}",
@@ -520,6 +704,7 @@ def _print_lru_planner_summary(
             f"{steady_avg['EVENT_WAIT']:.3f} = {lru_steady:.3f} us",
             flush=True,
         )
+    return out
 
 
 def summarize_profile_csvs(
@@ -528,13 +713,23 @@ def summarize_profile_csvs(
     *,
     drop_first: int = 1,
     include_lru_planner: bool = True,
-) -> None:
-    """Print average kernel / op times; optionally Approach-A LRU markers."""
+) -> dict:
+    """Print average kernel / op times; optionally Approach-A LRU markers.
+
+    Returns a JSON-serializable summary suitable for ``--out``.
+    """
     found = _ensure_profile_artifacts(profile_dir)
+    summary: dict = {
+        "profile_dir": str(Path(profile_dir).resolve()),
+        "artifacts": {k: str(v) for k, v in found.items()},
+        "source": None,
+        "top_ops": [],
+        "lru_planner": None,
+    }
     if not found:
         print("[profile] no profile artifacts found under "
               f"{profile_dir}", flush=True)
-        return
+        return summary
 
     rows: list[tuple[str, int, float, float]] = []
     source = None
@@ -588,6 +783,17 @@ def summarize_profile_csvs(
         rows = _rows_from_duration_groups(groups)
 
     rows.sort(key=lambda x: x[3], reverse=True)
+    summary["source"] = source
+    # Keep the full op list for kernel-name matching in --compare; top_ops
+    # remains the truncated view used for stdout / quick inspection.
+    summary["ops"] = [
+        {
+            "name": name, "count": count,
+            "avg_us": avg_us, "total_us": total_us,
+        }
+        for name, count, avg_us, total_us in rows
+    ]
+    summary["top_ops"] = summary["ops"][:top_n]
     if source == "op_statistic":
         _print_rows(
             "----- PROFILE OP STATISTIC (avg kernel time) -----", rows, top_n)
@@ -607,18 +813,20 @@ def summarize_profile_csvs(
             flush=True,
         )
     if include_lru_planner:
-        _print_lru_planner_summary(found, rows, drop_first=drop_first)
+        summary["lru_planner"] = _print_lru_planner_summary(
+            found, rows, drop_first=drop_first)
     else:
         print(
             "[profile] skip LRU planner summary "
             "(Approach B has no host LRU planner; LRU is inside li_manage).",
             flush=True,
         )
+    return summary
 
 
 def profile_pipeline(steps, warmup, iters, profile_dir=None, top_n: int = 30,
                      reset=None, drop_first: int = 1,
-                     include_lru_planner: bool = True):
+                     include_lru_planner: bool = True) -> dict:
     """Run the full pipeline under torch_npu.profiler (msprof backend).
 
     ``steps`` is a list of ``(name, callable)`` executed in order each iter.
@@ -630,6 +838,8 @@ def profile_pipeline(steps, warmup, iters, profile_dir=None, top_n: int = 30,
     Each invocation writes into a fresh ``run_<timestamp>_<pid>/`` subdirectory
     under ``profile_dir``, so parsing never picks a stale ``op_statistic.csv``
     left by a previous run that reused the same ``--profile-dir``.
+
+    Returns a JSON-serializable profile summary (includes ``run_dir``).
     """
     import tempfile
     import torch_npu.profiler as prof
@@ -676,12 +886,14 @@ def profile_pipeline(steps, warmup, iters, profile_dir=None, top_n: int = 30,
             torch.npu.synchronize()
 
     print(f"PROFILE_TRACE_DIR={run_dir}", flush=True)
-    summarize_profile_csvs(
+    summary = summarize_profile_csvs(
         str(run_dir),
         top_n=top_n,
         drop_first=drop_first,
         include_lru_planner=include_lru_planner,
     )
+    summary["run_dir"] = str(run_dir)
+    return summary
 
 
 # ===================== Approach A: vllm-ascend =====================
@@ -1183,32 +1395,10 @@ def run_a(args) -> dict:
         _a_full_pipeline, use_graph=use_graph,
         warmup=max(1, args.warmup // 2), reset=_a_reset_lru_state)
 
-    if getattr(args, "profile", False):
-        profile_pipeline(
-            [("full_pipeline", full_runner)],
-            args.warmup, args.profile_iters, args.profile_dir,
-            top_n=args.profile_top_n,
-            reset=_a_reset_lru_state,
-            drop_first=args.profile_drop_first,
-            include_lru_planner=True)
-        try:
-            offload.uninitialize()
-        except Exception as exc:
-            print(f"OFFLOAD_UNINIT_WARN {type(exc).__name__}: {exc}", flush=True)
-        return {
-            "approach": "A", "profile": True,
-            "timing_mode": full_mode,
-            "batch_size": batch, "q_heads": q_heads, "indexer_heads": idx_heads,
-            "seq_len": seq_len, "topk_layout": topk_layout,
-            "miss": miss, "hit_count": hit_count, "hit_ratio": hit_ratio,
-            "cache_tokens_req": cache_tokens_req, "fill_count": fill_count,
-            "stable_prefix": stable_prefix_len, "visible_seq": visible_seq_len,
-            "topk_buffer_size": topk_buffer_size,
-            "resident_capacity": resident_capacity,
-            "warmup": args.warmup, "iters": args.profile_iters,
-        }
-
-    # Event timing still breaks components out with separate graphs/runners.
+    # Event timing breaks components out with separate graphs/runners.
+    # Always measured (even under --profile) so --out has compare fields:
+    #   lru_ms      = planner_ms      ↔ B li_manage_minus_li_ms
+    #   sfa_copy_ms = fused_overlap_ms ↔ B scatter_sfa_ms
     li_runner, li_mode = maybe_graph_runner(
         _a_li, use_graph=use_graph, warmup=max(1, args.warmup // 2))
     pipeline_runner, pipeline_mode = maybe_graph_runner(
@@ -1218,18 +1408,34 @@ def run_a(args) -> dict:
         _a_fused, use_graph=use_graph, warmup=max(1, args.warmup // 2),
         reset=_a_reset_then_plan)
 
+    profile_summary = None
+    if getattr(args, "profile", False):
+        profile_summary = profile_pipeline(
+            [("full_pipeline", full_runner)],
+            args.warmup, args.profile_iters, args.profile_dir,
+            top_n=args.profile_top_n,
+            reset=_a_reset_lru_state,
+            drop_first=args.profile_drop_first,
+            include_lru_planner=True)
+
     li_ms = bench_events(li_runner, args.warmup, args.iters)
     pipeline_ms = bench_events(
         pipeline_runner, args.warmup, args.iters, reset=_a_reset_lru_state)
     fused_ms = bench_events(
         fused_runner, args.warmup, args.iters, reset=_a_reset_then_plan)
     planner_ms = max(0.0, pipeline_ms - fused_ms)
+    print(
+        f"[A-timing] LI={li_ms:.4f} ms  planner(lru)={planner_ms:.4f} ms  "
+        f"fused_overlap(sfa+copy)={fused_ms:.4f} ms  "
+        f"pipeline={pipeline_ms:.4f} ms",
+        flush=True,
+    )
     try:
         offload.uninitialize()
     except Exception as exc:
         print(f"OFFLOAD_UNINIT_WARN {type(exc).__name__}: {exc}", flush=True)
 
-    return {
+    result = {
         "approach": "A",
         "timing_mode": full_mode,
         "batch_size": batch, "q_heads": q_heads, "indexer_heads": idx_heads,
@@ -1239,12 +1445,33 @@ def run_a(args) -> dict:
         "stable_prefix": stable_prefix_len, "visible_seq": visible_seq_len,
         "topk_buffer_size": topk_buffer_size,
         "resident_capacity": resident_capacity,
-        "li_ms": li_ms, "planner_ms": planner_ms, "fused_overlap_ms": fused_ms,
+        "li_ms": li_ms,
+        "planner_ms": planner_ms,
+        "fused_overlap_ms": fused_ms,
         "pipeline_ms": pipeline_ms,
         "total_ms": li_ms + pipeline_ms,
-        "warmup": args.warmup, "iters": args.iters,
-        "li_mode": li_mode, "pipeline_mode": pipeline_mode, "fused_mode": fused_mode,
+        "warmup": args.warmup,
+        "iters": args.iters,
+        "li_mode": li_mode,
+        "pipeline_mode": pipeline_mode,
+        "fused_mode": fused_mode,
     }
+    attach_compare_fields(result, lru_ms=planner_ms, sfa_copy_ms=fused_ms)
+    if profile_summary is not None:
+        lru = profile_summary.get("lru_planner") or {}
+        result["profile"] = True
+        result["profile_run_dir"] = profile_summary.get("run_dir")
+        result["profile_dir"] = profile_summary.get("profile_dir")
+        result["lru_planner_steady_us"] = lru.get("lru_planner_steady_us")
+        result["hostfunc_callback_steady_us"] = lru.get(
+            "hostfunc_callback_steady_us")
+        result["event_wait_steady_us"] = lru.get("event_wait_steady_us")
+        result["profile_summary"] = profile_summary
+        # Profile-timeline LRU proxy (us); also promoted to lru_kernel_ms.
+        if lru.get("lru_planner_steady_us") is not None:
+            result["lru_profile_ms"] = float(lru["lru_planner_steady_us"]) / 1000.0
+        attach_kernel_compare_fields(result, "A")
+    return result
 
 
 # ===================== Approach B: nano =====================
@@ -1548,20 +1775,26 @@ def run_b(args) -> dict:
         _b_scatter_sfa, use_graph=use_graph,
         warmup=max(1, args.warmup // 2), reset=_b_reset_then_manage)
 
-    def _b_report_li_delta(lightning_indexer_ms: float, li_manage_ms: float) -> float:
+    def _b_report_timing(
+        lightning_indexer_ms: float,
+        li_manage_ms: float,
+        sfa_ms: float,
+    ) -> float:
         delta_ms = li_manage_ms - lightning_indexer_ms
         print(
             f"[B-timing] lightning_indexer={lightning_indexer_ms:.4f} ms  "
             f"li_manage={li_manage_ms:.4f} ms  "
-            f"delta(li_manage-LI)={delta_ms:+.4f} ms",
+            f"delta(li_manage-LI / lru)={delta_ms:+.4f} ms  "
+            f"scatter_sfa(sfa+copy)={sfa_ms:.4f} ms",
             flush=True,
         )
         return delta_ms
 
+    profile_summary = None
     if getattr(args, "profile", False):
         # Profile LI and li_manage as separate named ranges (same LI inputs),
         # then scatter. No host-LRU planner summary for B.
-        profile_pipeline(
+        profile_summary = profile_pipeline(
             [
                 ("lightning_indexer", li_runner),
                 ("li_manage", li_manage_runner),
@@ -1572,33 +1805,18 @@ def run_b(args) -> dict:
             reset=_b_reset,
             drop_first=args.profile_drop_first,
             include_lru_planner=False)
-        # Event delta is the explicit LI vs li_manage comparison metric.
-        lightning_indexer_ms = bench_events(
-            li_runner, args.warmup, args.iters)
-        li_manage_ms = bench_events(
-            li_manage_runner, args.warmup, args.iters, reset=_b_reset)
-        delta_ms = _b_report_li_delta(lightning_indexer_ms, li_manage_ms)
-        return {
-            "approach": "B", "profile": True,
-            "timing_mode": full_mode,
-            "batch_size": batch, "q_heads": q_heads, "indexer_heads": idx_heads,
-            "seq_len": seq_len, "topk_layout": topk_layout,
-            "cache_tokens": cache_tokens, "miss": miss,
-            "lightning_indexer_ms": lightning_indexer_ms,
-            "li_manage_ms": li_manage_ms,
-            "li_manage_minus_li_ms": delta_ms,
-            "warmup": args.warmup, "iters": args.profile_iters,
-            "li_mode": li_mode, "li_manage_mode": li_manage_mode,
-        }
 
+    # Always event-time comparable metrics for --out / --compare:
+    #   lru_ms      = li_manage - LI  ↔  A planner_ms
+    #   sfa_copy_ms = scatter_sfa    ↔  A fused_overlap_ms
     lightning_indexer_ms = bench_events(li_runner, args.warmup, args.iters)
     li_manage_ms = bench_events(
         li_manage_runner, args.warmup, args.iters, reset=_b_reset)
     sfa_ms = bench_events(
         scatter_runner, args.warmup, args.iters, reset=_b_reset_then_manage)
-    delta_ms = _b_report_li_delta(lightning_indexer_ms, li_manage_ms)
+    delta_ms = _b_report_timing(lightning_indexer_ms, li_manage_ms, sfa_ms)
 
-    return {
+    result = {
         "approach": "B",
         "timing_mode": full_mode,
         "batch_size": batch, "q_heads": q_heads, "indexer_heads": idx_heads,
@@ -1608,10 +1826,21 @@ def run_b(args) -> dict:
         "li_manage_ms": li_manage_ms,
         "li_manage_minus_li_ms": delta_ms,
         "scatter_sfa_ms": sfa_ms,
-        "total_ms": li_manage_ms + sfa_ms, "warmup": args.warmup, "iters": args.iters,
-        "li_mode": li_mode, "li_manage_mode": li_manage_mode,
+        "total_ms": li_manage_ms + sfa_ms,
+        "warmup": args.warmup,
+        "iters": args.iters,
+        "li_mode": li_mode,
+        "li_manage_mode": li_manage_mode,
         "scatter_mode": scatter_mode,
     }
+    attach_compare_fields(result, lru_ms=delta_ms, sfa_copy_ms=sfa_ms)
+    if profile_summary is not None:
+        result["profile"] = True
+        result["profile_run_dir"] = profile_summary.get("run_dir")
+        result["profile_dir"] = profile_summary.get("profile_dir")
+        result["profile_summary"] = profile_summary
+        attach_kernel_compare_fields(result, "B")
+    return result
 
 
 # ===================== Multi-scenario suite / Compare =====================
@@ -1735,6 +1964,73 @@ def _fmt_ms(value, digits: int = 4) -> str:
         return "n/a"
 
 
+def _scenario_lru_ms(result: dict) -> float | None:
+    """A planner / B (li_manage - LI) — event time."""
+    if result.get("lru_ms") is not None:
+        return float(result["lru_ms"])
+    if result.get("approach") == "A" and result.get("planner_ms") is not None:
+        return float(result["planner_ms"])
+    if result.get("li_manage_minus_li_ms") is not None:
+        return float(result["li_manage_minus_li_ms"])
+    if result.get("li_manage_ms") is not None \
+            and result.get("lightning_indexer_ms") is not None:
+        return float(result["li_manage_ms"]) - float(result["lightning_indexer_ms"])
+    return None
+
+
+def _scenario_sfa_copy_ms(result: dict) -> float | None:
+    """A fused_overlap / B scatter_sfa — event time."""
+    if result.get("sfa_copy_ms") is not None:
+        return float(result["sfa_copy_ms"])
+    if result.get("fused_overlap_ms") is not None:
+        return float(result["fused_overlap_ms"])
+    if result.get("scatter_sfa_ms") is not None:
+        return float(result["scatter_sfa_ms"])
+    return None
+
+
+def _ensure_kernel_compare_fields(result: dict) -> None:
+    """Fill kernel compare fields in-place from profile_summary if missing."""
+    if result.get("lru_kernel_ms") is not None \
+            and result.get("sfa_copy_kernel_ms") is not None:
+        return
+    if not result.get("profile_summary"):
+        return
+    approach = str(result.get("approach", "")).upper()
+    if approach in ("A", "B"):
+        attach_kernel_compare_fields(result, approach, quiet=True)
+
+
+def _scenario_lru_kernel_ms(result: dict) -> float | None:
+    """A: HOSTFUNC_CALLBACK + EVENT_WAIT (sum). B: li_manage_k - LI_k."""
+    _ensure_kernel_compare_fields(result)
+    if result.get("lru_kernel_ms") is not None:
+        return float(result["lru_kernel_ms"])
+    return None
+
+
+def _scenario_sfa_copy_kernel_ms(result: dict) -> float | None:
+    """A fused_overlap kernel / B scatter_sfa kernel."""
+    _ensure_kernel_compare_fields(result)
+    if result.get("sfa_copy_kernel_ms") is not None:
+        return float(result["sfa_copy_kernel_ms"])
+    return None
+
+
+def _print_pair_delta(label: str, a_ms, b_ms) -> None:
+    if a_ms is None or b_ms is None:
+        print(f"{label}: A={_fmt_ms(a_ms)}  B={_fmt_ms(b_ms)}  delta=n/a",
+              flush=True)
+        return
+    diff = float(a_ms) - float(b_ms)
+    who = "A faster" if diff < 0 else "B faster"
+    print(
+        f"{label}: A={_fmt_ms(a_ms)}  B={_fmt_ms(b_ms)}  "
+        f"A-B={diff:+.4f} ms ({who})",
+        flush=True,
+    )
+
+
 def _print_scenario_compare(ra: dict, rb: dict) -> None:
     key = scenario_key(ra)
     print(
@@ -1745,51 +2041,79 @@ def _print_scenario_compare(ra: dict, rb: dict) -> None:
     )
     print(
         f"Timing mode: A={ra.get('timing_mode', 'unknown')} "
-        f"B={rb.get('timing_mode', 'unknown')}",
+        f"B={rb.get('timing_mode', 'unknown')}"
+        f"{'  (profile+event)' if ra.get('profile') or rb.get('profile') else ''}",
         flush=True,
     )
-    if ra.get("profile") or rb.get("profile"):
+
+    a_lru = _scenario_lru_ms(ra)
+    b_lru = _scenario_lru_ms(rb)
+    a_sfa = _scenario_sfa_copy_ms(ra)
+    b_sfa = _scenario_sfa_copy_ms(rb)
+    print("--- EVENT TIME ---", flush=True)
+    _print_pair_delta("lru_ms      (A planner ↔ B LI_MANAGE-LI)", a_lru, b_lru)
+    _print_pair_delta("sfa_copy_ms (A fused  ↔ B scatter_sfa)", a_sfa, b_sfa)
+
+    a_lru_k = _scenario_lru_kernel_ms(ra)
+    b_lru_k = _scenario_lru_kernel_ms(rb)
+    a_sfa_k = _scenario_sfa_copy_kernel_ms(ra)
+    b_sfa_k = _scenario_sfa_copy_kernel_ms(rb)
+    print("--- KERNEL / PROFILE TIME ---", flush=True)
+    if all(v is None for v in (a_lru_k, b_lru_k, a_sfa_k, b_sfa_k)):
         print(
-            f"Approach A: profile={ra.get('profile', False)}  "
-            f"miss={ra.get('miss')} batch={ra.get('batch_size')}",
+            "kernel times n/a (re-run A/B with --profile so out JSON "
+            "contains profile_summary / lru_kernel_ms / sfa_copy_kernel_ms)",
             flush=True,
         )
-        print(
-            f"Approach B: profile={rb.get('profile', False)}  "
-            f"LI={_fmt_ms(rb.get('lightning_indexer_ms'))}  "
-            f"LI_MANAGE={_fmt_ms(rb.get('li_manage_ms'))}  "
-            f"delta(LI_MANAGE-LI)={_fmt_ms(rb.get('li_manage_minus_li_ms'))}",
-            flush=True,
+    else:
+        _print_pair_delta(
+            "lru_kernel_ms      (A HOSTFUNC_CALLBACK+EVENT_WAIT ↔ B LI_MANAGE_k-LI_k)",
+            a_lru_k, b_lru_k,
         )
-        return
+        if ra.get("hostfunc_callback_kernel_ms") is not None \
+                or ra.get("event_wait_kernel_ms") is not None:
+            print(
+                f"  A lru parts: HOSTFUNC_CALLBACK="
+                f"{_fmt_ms(ra.get('hostfunc_callback_kernel_ms'))} + "
+                f"EVENT_WAIT={_fmt_ms(ra.get('event_wait_kernel_ms'))} = "
+                f"{_fmt_ms(a_lru_k)}",
+                flush=True,
+            )
+        _print_pair_delta(
+            "sfa_copy_kernel_ms (A fused_k ↔ B scatter_k)",
+            a_sfa_k, b_sfa_k,
+        )
+        if ra.get("kernel_match_names") or rb.get("kernel_match_names"):
+            print(
+                f"  matched A={ra.get('kernel_match_names')}  "
+                f"B={rb.get('kernel_match_names')}",
+                flush=True,
+            )
 
     print(
-        f"Approach A (vllm-ascend):  LI={_fmt_ms(ra.get('li_ms'))}  "
-        f"planner(launch_host)={_fmt_ms(ra.get('planner_ms', 0.0))}  "
-        f"fused_overlap={_fmt_ms(ra.get('fused_overlap_ms'))}  "
-        f"pipeline={_fmt_ms(ra.get('pipeline_ms', 0.0))}  "
+        f"Approach A detail: LI={_fmt_ms(ra.get('li_ms'))}  "
+        f"planner={_fmt_ms(ra.get('planner_ms', a_lru))}  "
+        f"fused_overlap={_fmt_ms(ra.get('fused_overlap_ms', a_sfa))}  "
+        f"pipeline={_fmt_ms(ra.get('pipeline_ms'))}  "
         f"total={_fmt_ms(ra.get('total_ms'))}",
         flush=True,
     )
-    b_delta = rb.get("li_manage_minus_li_ms")
-    if b_delta is None and rb.get("li_manage_ms") is not None \
-            and rb.get("lightning_indexer_ms") is not None:
-        b_delta = float(rb["li_manage_ms"]) - float(rb["lightning_indexer_ms"])
     print(
-        f"Approach B (nano):        LI={_fmt_ms(rb.get('lightning_indexer_ms'))}  "
+        f"Approach B detail: LI={_fmt_ms(rb.get('lightning_indexer_ms'))}  "
         f"LI_MANAGE={_fmt_ms(rb.get('li_manage_ms'))}  "
-        f"delta(LI_MANAGE-LI)={_fmt_ms(b_delta)}  "
-        f"scatter_sfa={_fmt_ms(rb.get('scatter_sfa_ms'))}  "
+        f"delta(LI_MANAGE-LI)={_fmt_ms(b_lru)}  "
+        f"scatter_sfa={_fmt_ms(rb.get('scatter_sfa_ms', b_sfa))}  "
         f"total={_fmt_ms(rb.get('total_ms'))}",
         flush=True,
     )
     if ra.get("total_ms") is None or rb.get("total_ms") is None:
-        print("Delta (A-B): n/a (missing total_ms)", flush=True)
+        print("Delta total event (A-B): n/a (missing total_ms)", flush=True)
         return
     diff = float(ra["total_ms"]) - float(rb["total_ms"])
     who = "A faster" if diff < 0 else "B faster"
     print(
-        f"Delta (A-B): {diff:+.4f} ms  ({who} by {abs(diff):.4f} ms)",
+        f"Delta total event (A-B): {diff:+.4f} ms  "
+        f"({who} by {abs(diff):.4f} ms)",
         flush=True,
     )
 
@@ -1824,31 +2148,48 @@ def compare(args) -> None:
         ra = map_a[key]
         rb = map_b[key]
         _print_scenario_compare(ra, rb)
-        a_total = ra.get("total_ms")
-        b_total = rb.get("total_ms")
-        diff = None
-        if a_total is not None and b_total is not None:
-            diff = float(a_total) - float(b_total)
-        summary_rows.append(
-            (key[0], key[1], key[2], key[3], a_total, b_total, diff))
+        summary_rows.append((
+            key[0], key[1], key[2], key[3],
+            _scenario_lru_ms(ra), _scenario_lru_ms(rb),
+            _scenario_sfa_copy_ms(ra), _scenario_sfa_copy_ms(rb),
+            _scenario_lru_kernel_ms(ra), _scenario_lru_kernel_ms(rb),
+            _scenario_sfa_copy_kernel_ms(ra), _scenario_sfa_copy_kernel_ms(rb),
+            ra.get("total_ms"), rb.get("total_ms"),
+        ))
 
-    print("\n----- COMPARE TABLE -----", flush=True)
+    print("\n----- COMPARE TABLE (EVENT ms) -----", flush=True)
     print(
         f"{'batch':>6} {'miss':>6} {'seq':>8} {'cache':>8} "
-        f"{'A_total':>10} {'B_total':>10} {'A-B':>10} {'winner':>8}",
+        f"{'A_lru':>8} {'B_lru':>8} {'A_sfa':>8} {'B_sfa':>8} "
+        f"{'A_tot':>8} {'B_tot':>8}",
         flush=True,
     )
-    for batch, miss, seq_len, cache_tokens, a_total, b_total, diff in summary_rows:
-        if diff is None:
-            winner = "n/a"
-            diff_s = "n/a"
-        else:
-            winner = "A" if diff < 0 else "B"
-            diff_s = f"{diff:+.4f}"
+    for row in summary_rows:
+        (batch, miss, seq_len, cache_tokens,
+         a_lru, b_lru, a_sfa, b_sfa, *_rest) = row
+        a_total, b_total = row[-2], row[-1]
         print(
             f"{batch:6d} {miss:6d} {seq_len:8d} {cache_tokens:8d} "
-            f"{_fmt_ms(a_total):>10} {_fmt_ms(b_total):>10} "
-            f"{diff_s:>10} {winner:>8}",
+            f"{_fmt_ms(a_lru):>8} {_fmt_ms(b_lru):>8} "
+            f"{_fmt_ms(a_sfa):>8} {_fmt_ms(b_sfa):>8} "
+            f"{_fmt_ms(a_total):>8} {_fmt_ms(b_total):>8}",
+            flush=True,
+        )
+
+    print("\n----- COMPARE TABLE (KERNEL ms) -----", flush=True)
+    print(
+        f"{'batch':>6} {'miss':>6} {'seq':>8} {'cache':>8} "
+        f"{'A_lru_k':>8} {'B_lru_k':>8} {'A_sfa_k':>8} {'B_sfa_k':>8}",
+        flush=True,
+    )
+    for row in summary_rows:
+        (batch, miss, seq_len, cache_tokens,
+         _a_lru, _b_lru, _a_sfa, _b_sfa,
+         a_lru_k, b_lru_k, a_sfa_k, b_sfa_k, _a_tot, _b_tot) = row
+        print(
+            f"{batch:6d} {miss:6d} {seq_len:8d} {cache_tokens:8d} "
+            f"{_fmt_ms(a_lru_k):>8} {_fmt_ms(b_lru_k):>8} "
+            f"{_fmt_ms(a_sfa_k):>8} {_fmt_ms(b_sfa_k):>8}",
             flush=True,
         )
     print("UT_OK", flush=True)
@@ -2004,20 +2345,17 @@ def main():
     )
     for sc in result["scenarios"]:
         cache_tokens = sc.get("cache_tokens", sc.get("cache_tokens_req"))
-        if sc.get("profile"):
-            print(
-                f"  - batch={sc['batch_size']} miss={sc['miss']} "
-                f"seq_len={sc['seq_len']} cache_tokens={cache_tokens} "
-                f"profile=True",
-                flush=True,
-            )
-        else:
-            print(
-                f"  - batch={sc['batch_size']} miss={sc['miss']} "
-                f"seq_len={sc['seq_len']} cache_tokens={cache_tokens} "
-                f"total_ms={_fmt_ms(sc.get('total_ms'))}",
-                flush=True,
-            )
+        print(
+            f"  - batch={sc['batch_size']} miss={sc['miss']} "
+            f"seq_len={sc['seq_len']} cache_tokens={cache_tokens} "
+            f"lru_ms={_fmt_ms(sc.get('lru_ms'))} "
+            f"sfa_copy_ms={_fmt_ms(sc.get('sfa_copy_ms'))} "
+            f"lru_kernel_ms={_fmt_ms(sc.get('lru_kernel_ms'))} "
+            f"sfa_copy_kernel_ms={_fmt_ms(sc.get('sfa_copy_kernel_ms'))} "
+            f"total_ms={_fmt_ms(sc.get('total_ms'))}"
+            f"{' profile=True' if sc.get('profile') else ''}",
+            flush=True,
+        )
     print("UT_OK", flush=True)
 
 
