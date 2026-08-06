@@ -578,9 +578,10 @@ def run_a(args) -> dict:
     stable_prefix_npu = torch.zeros((batch,), dtype=torch.int32, device="npu")
     visible_seq_npu = torch.full((batch,), seq_len, dtype=torch.int32, device="npu")
     plan_stream = torch_npu.npu.Stream()
-    # Register the plan stream before any capture/replay so host callbacks are
-    # valid both in eager enqueue and inside NPUGraph.
-    torch_npu.npu._subscribe_report(plan_stream)
+    # Do NOT call _subscribe_report on this stream. Production enqueue uses
+    # aclrtLaunchHostFunc, which creates/subscribes its own callback thread.
+    # Mixing it with aclrtSubscribeReport on the same stream returns 107011
+    # (ACL_ERROR_RT_STREAM_SUBSCRIBE).
 
     def _planner_kwargs_ptrs():
         return (
