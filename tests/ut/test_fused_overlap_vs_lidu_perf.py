@@ -3,8 +3,10 @@
 Two OPP packages cannot coexist in one process, so run one approach per
 process (writes JSON), then --compare reads both.
 
-A: LI + host-side LRU planner + fused_overlap(copy+sfa in one kernel,
-   consuming the host-encoded external plan).
+A: LI + host-side LRU planner + fused_overlap(copy+sfa in one kernel).
+   LRU does not emit topk; it writes an external plan into
+   ``selection_membership_map``. Fused reads that plan plus the same topk
+   that was fed into the planner.
 B: LightningIndexer baseline (same LI inputs as li_manage) +
    LI_MANAGE(li+lru fused) + scatter_copy_sfa(copy+sfa fused).
    Reports ``li_manage_minus_li_ms`` = li_manage - lightning_indexer.
@@ -707,13 +709,6 @@ def run_a(args) -> dict:
         raw = offload.empty([nb + _ALIGN], dtype=torch.int8, pin_memory=True)
         return _align(raw, _ALIGN)[:nb].view(dtype).view(shape)
 
-    cfg = offload.OffloadConfig()
-    cfg.device_id = torch_npu.npu.current_device()
-    cfg.size = int(args.dram_size_gb * _GIB)
-    cfg.world_size = 1
-    cfg.rank_id = 0
-    offload.initialize(cfg)
-
     dt = torch.bfloat16
     batch = args.batch_size
     q_heads = args.q_heads
@@ -724,9 +719,30 @@ def run_a(args) -> dict:
     hit_count = TOPK - miss
     hit_ratio = 1.0 - (miss / float(TOPK))
     cache_tokens_req = int(args.cache_tokens)
-    fmbn = cdiv(seq_len, BLOCK_SIZE)
+    # Per-request CPU KV pool: batch independent sequences.
+    blocks_per_seq = cdiv(seq_len, BLOCK_SIZE)
+    fmbn = batch * blocks_per_seq
     smbn = cdiv(TOPK, BLOCK_SIZE)
     scale = 1.0 / math.sqrt(KVD)
+    elem = torch.empty((), dtype=dt).element_size()
+    cpu_kv_bytes = fmbn * BLOCK_SIZE * (KVD + KRD) * elem
+    # membership_map ~ [batch, 16392] int16 + a few aligned slabs of slack.
+    cpu_meta_bytes = batch * 16392 * 2 + 8 * _ALIGN
+    needed_pool = cpu_kv_bytes + cpu_meta_bytes + 64 * 1024 * 1024
+    pool_bytes = max(int(args.dram_size_gb * _GIB), int(needed_pool))
+    cfg = offload.OffloadConfig()
+    cfg.device_id = torch_npu.npu.current_device()
+    cfg.size = pool_bytes
+    cfg.world_size = 1
+    cfg.rank_id = 0
+    offload.initialize(cfg)
+    print(
+        f"[A-mem] CPU KV scaled by batch: blocks={fmbn} "
+        f"(batch={batch} x blocks_per_seq={blocks_per_seq})  "
+        f"full_kv+rope≈{cpu_kv_bytes / _GIB:.3f} GiB  "
+        f"offload_pool={pool_bytes / _GIB:.3f} GiB",
+        flush=True,
+    )
     torch.manual_seed(910000 + batch + q_heads * 17 + seq_len)
 
     q = torch.randn(batch, q_heads, KVD, dtype=dt, device="npu")
@@ -736,7 +752,12 @@ def run_a(args) -> dict:
     full_kv.zero_()
     full_rope = _empty_cpu([fmbn, BLOCK_SIZE, KRD], dt)
     full_rope.zero_()
-    full_bt = torch.arange(fmbn, dtype=torch.int32, device="npu").unsqueeze(0).expand(batch, -1).contiguous()
+    # Row r owns blocks [r*blocks_per_seq, (r+1)*blocks_per_seq).
+    full_bt = (
+        torch.arange(fmbn, dtype=torch.int32, device="npu")
+        .view(batch, blocks_per_seq)
+        .contiguous()
+    )
     aq = torch.tensor([1] * batch, dtype=torch.int32, device="npu")
     ak = torch.tensor([seq_len] * batch, dtype=torch.int32, device="npu")
 
@@ -1103,6 +1124,10 @@ def run_a(args) -> dict:
         return o[0] if isinstance(o, (tuple, list)) else o
 
     def _a_fused():
+        # Host LRU does NOT emit a new topk. Fused consumes:
+        #   - selection_membership_map: LRU-encoded external plan (THE LRU output)
+        #   - selection_topk_indices: the SAME topk that was fed into the planner
+        # Other selection_* buffers are workspace; plan tells fused hit/miss slots.
         return FUSED_OVERLAP(
             query=q_fused,
             selection_k_rope=sel_rope,
@@ -1124,8 +1149,8 @@ def run_a(args) -> dict:
             sparse_mode=3)
 
     def _a_planner_plus_fused():
-        # Production order on the compute stream: wait for side-stream LRU,
-        # then fused. LI and fused both stay on the compute stream.
+        # Production order: side-stream LRU writes plan into membership_map,
+        # compute stream waits, then fused reads that plan (+ shared topk).
         _a_planner()
         torch_npu.npu.current_stream().wait_stream(plan_stream)
         _a_fused()
@@ -1140,8 +1165,15 @@ def run_a(args) -> dict:
     _a_reset_lru_state()
     _a_planner_sync()
     _a_validate_lru_inputs_and_outputs()
+    # Fused must see the plan just written by the planner (not a stale map).
     _a_fused()
     torch.npu.synchronize()
+    print(
+        "[A-cfg] fused_overlap consumes LRU plan via selection_membership_map; "
+        "selection_topk_indices is the shared planner input topk (LRU does not "
+        "output topk).",
+        flush=True,
+    )
     print(f"[A-cfg] timing_mode={'graph' if use_graph else 'eager'}", flush=True)
 
     # Profile must capture ONE full pipeline. Capturing LI / fused as separate
@@ -1302,7 +1334,13 @@ def run_b(args) -> dict:
     for r in range(batch):
         ph = torch.arange(r * cb, (r + 1) * cb, dtype=torch.int32)
         hbm_bt[r] = ph[torch.randperm(cb)]
-    dram_bt = torch.stack([torch.randperm(sb, dtype=torch.int64).to(torch.int32) for _ in range(batch)])
+    # Per-request DRAM KV pool (swapped CPU backing), scaled by batch.
+    # Row r owns blocks [r*sb, (r+1)*sb); block table permutes within that range.
+    total_sb = batch * sb
+    dram_bt = torch.stack([
+        (torch.randperm(sb, dtype=torch.int64) + r * sb).to(torch.int32)
+        for r in range(batch)
+    ])
 
     thb = batch * cb
     hbm_kpe = torch.randn((thb, BLOCK_SIZE, 1, KRD), dtype=dt, device=dev)
@@ -1331,10 +1369,19 @@ def run_b(args) -> dict:
     li_query[:, 0, 2] = 4096
 
     g = torch.Generator().manual_seed(42)
-    dk = torch.randn((sb, BLOCK_SIZE, KRD), generator=g, dtype=torch.float32).to(dt)
-    dc = torch.randn((sb, BLOCK_SIZE, KVD), generator=g, dtype=torch.float32).to(dt)
+    dk = torch.randn((total_sb, BLOCK_SIZE, KRD), generator=g, dtype=torch.float32).to(dt)
+    dc = torch.randn((total_sb, BLOCK_SIZE, KVD), generator=g, dtype=torch.float32).to(dt)
     dram_kpe = _swap(dk, dev)
     dram_ckv = _swap(dc, dev)
+    dram_bytes = (
+        total_sb * BLOCK_SIZE * (KVD + KRD)
+        * torch.empty((), dtype=dt).element_size()
+    )
+    print(
+        f"[B-mem] DRAM KV scaled by batch: blocks={total_sb} "
+        f"(batch={batch} x sb={sb})  dram_kv+rope≈{dram_bytes / _GIB:.3f} GiB",
+        flush=True,
+    )
     torch.npu.synchronize()
 
     # ---- cache_slots rebuilt each reset: fixed miss, random hit/miss set ----
@@ -1355,19 +1402,17 @@ def run_b(args) -> dict:
     weights[:, 0] = 1
     cache_tokens_t = torch.full((batch,), cache_tokens, dtype=torch.int32, device=dev)
     candidate_lens = torch.full((batch,), seq_len, dtype=torch.int32, device=dev)
-    # src_ids and miss_counts are OUTPUTS of li_manage_out, pre-allocate with -1
+    # li_manage_out outputs (alias caller buffers):
+    #   source_ids / topk_index: miss-first then hit (not IOSORT within parts)
+    #   destination_slots / topk_slots: aligned 1:1 with source_ids
+    #   miss_counts
+    #   cache_slots (updated)
     src_ids_t = torch.full((batch, TOPK), -1, dtype=torch.int32, device=dev)
     li_src_ids = src_ids_t.unsqueeze(1)
     li_dst_slots = torch.empty_like(li_src_ids)
     miss_counts = torch.empty((batch,), dtype=torch.int32, device=dev)
-    # sparse_slots: physical slot positions for top-k tokens, extracted
-    # from cache_slots AFTER li_manage updates it with miss destinations
     use_graph = bool(getattr(args, "graph_mode", True))
-    topk_tokens_dev = topk_tokens.to(dev)
     req_e_dev = req_e.to(dev)
-    req_e_long = req_e_dev.to(torch.long)
-    topk_long = topk_tokens_dev.to(torch.long)
-    sparse_slots = torch.empty((batch, 1, TOPK), dtype=torch.int32, device=dev)
     actual_q = torch.arange(1, batch + 1, dtype=torch.int32, device=dev)
     actual_kv = torch.full((batch,), cache_tokens, dtype=torch.int32, device=dev)
     hbm_bt_dev = hbm_bt.to(dev)
@@ -1402,10 +1447,8 @@ def run_b(args) -> dict:
                     f"B row {r} cached topk hits={present}, expected {hit_count}")
         cache_slots.copy_(cs_cpu.to(dev))
         src_ids_t.fill_(-1)
-
-    def _b_extract_slots():
-        # Device-only gather so scatter can be captured into an NPUGraph.
-        sparse_slots[:, 0, :] = cache_slots[req_e_long][:, topk_long]
+        li_dst_slots.fill_(-1)
+        miss_counts.fill_(-1)
 
     def _b_li_manage():
         # LI-part inputs match _b_lightning_indexer (query/key/weights/bt/lens);
@@ -1431,9 +1474,14 @@ def run_b(args) -> dict:
         )
 
     def _b_scatter_sfa():
-        _b_extract_slots()
+        # Reuse li_manage outputs directly:
+        #   sparse_slots      <- destination_slots (topk_slots, miss-first order)
+        #   source_token_ids  <- source_ids      (topk_index, miss-first order)
+        #   copy_counts       <- miss_counts
+        # Do NOT re-gather with a prebuilt/unsorted topk; order must match
+        # li_manage's miss-then-hit layout.
         return torch.ops.ops_overlap.sparse_and_tail_attention_and_scatter_copy.default(
-            query, hbm_ckv, sparse_slots, cache_tokens_t, hbm_bt_dev,
+            query, hbm_ckv, li_dst_slots, cache_tokens_t, hbm_bt_dev,
             actual_q, actual_kv, qrope, hbm_kpe, dram_kpe, dram_ckv,
             dram_bt_dev, src_ids_t, miss_counts, scale)
 
@@ -1453,7 +1501,24 @@ def run_b(args) -> dict:
         raise RuntimeError(
             f"[B] controlled miss mismatch: got {actual_miss}, "
             f"expected {expected_miss}. Check cache_slots prefill.")
-    print(f"[B-cfg] verified miss_counts={actual_miss}", flush=True)
+    # li_manage lays out topk as miss-first then hit; slots alias cache_slots.
+    src_cpu = src_ids_t.cpu()
+    dst_cpu = li_dst_slots[:, 0, :].cpu()
+    cs_cpu = cache_slots.cpu()
+    for r in range(batch):
+        pr = int(req_e[r])
+        mapped = cs_cpu[pr, src_cpu[r].to(torch.long)]
+        if not torch.equal(mapped, dst_cpu[r]):
+            raise RuntimeError(
+                f"[B] row {r}: cache_slots[source_ids] != destination_slots; "
+                f"scatter must consume li_manage outputs in miss-first order.")
+        if int((dst_cpu[r] < 0).sum().item()) != 0:
+            raise RuntimeError(f"[B] row {r}: destination_slots contain -1")
+    print(
+        f"[B-cfg] verified miss_counts={actual_miss}; "
+        f"scatter will reuse li_manage source_ids/destination_slots/miss_counts",
+        flush=True,
+    )
     _b_scatter_sfa()
     torch.npu.synchronize()
     print(f"[B-cfg] timing_mode={'graph' if use_graph else 'eager'}", flush=True)
