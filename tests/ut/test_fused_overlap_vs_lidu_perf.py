@@ -17,12 +17,14 @@ Common compare fields written into every scenario JSON (profile or not):
 
 With ``--profile``, also emit kernel/timeline compare fields:
   ``lru_kernel_ms``      — A: HOSTFUNC_CALLBACK + EVENT_WAIT (both parts, sum);
-                           B: li_manage_kernel - LI_kernel
-  ``sfa_copy_kernel_ms`` — A: fused_overlap kernel; B: scatter_sfa kernel
+                           B: NanovllmLiManage − LightningIndexer (kernel avg)
+  ``sfa_copy_kernel_ms`` — A: FusedSparseAttentionOverlap;
+                           B: NanovllmSparseAndTailAttentionAndScatterCopy
 ``--compare`` prints both event and kernel pairs when present.
 
 NOTE: Approach-A ``lru_kernel_ms`` is NEVER hostfunc alone — it is always
-``hostfunc_callback_steady_us + event_wait_steady_us`` (converted to ms).
+``hostfunc_callback_avg_us + event_wait_avg_us`` over ALL captured samples
+(converted to ms). No cold-sample dropping / steady avg.
 
 Supports a scenario matrix via multi-value ``--batch-size`` / ``--miss`` /
 ``--seq-len`` / ``--cache-tokens`` (cartesian product). Each approach writes
@@ -132,26 +134,43 @@ def attach_compare_fields(
     return result
 
 
-# Substring patterns (lowercased) used to pick msprof rows for kernel compare.
+# Substring patterns (lowercased, alnum-normalized) for msprof op matching.
+# Canonical names seen in op_statistic:
+#   A SFA+copy: FusedSparseAttentionOverlap
+#   B LI:       LightningIndexer
+#   B LRU fuse: NanovllmLiManage
+#   B SFA+copy: NanovllmSparseAndTailAttentionAndScatterCopy
 _KERNEL_NAME_PATTERNS = {
     "li": (
+        "LightningIndexer",
+        "lightningindexer",
         "npu_lightning_indexer",
         "lightning_indexer",
-        "lightningindexer",
     ),
     "a_sfa_copy": (
+        "FusedSparseAttentionOverlap",
+        "fusedsparseattentionoverlap",
         "npu_fused_sparse_attention_overlap",
         "fused_sparse_attention_overlap",
         "fused_sparse_attention",
     ),
     "b_li_manage": (
+        "NanovllmLiManage",
+        "nanovllmlimanage",
+        "limanageout",
         "li_manage_out",
         "li_manage",
+        "limanage",
     ),
     "b_sfa_copy": (
+        "NanovllmSparseAndTailAttentionAndScatterCopy",
+        "nanovllmsparseandtailattentionandscattercopy",
+        "nanovllmsparse",
+        "sparseandtailattentionandscattercopy",
         "sparse_and_tail_attention_and_scatter_copy",
         "sparse_and_tail_attention",
         "scatter_copy",
+        "scattercopy",
     ),
 }
 
@@ -166,6 +185,11 @@ def _ops_from_profile_summary(profile_summary: dict | None) -> list[dict]:
     return top if isinstance(top, list) else []
 
 
+def _norm_op_key(name: str) -> str:
+    """Lowercase alnum-only key so LightningIndexer ↔ lightning_indexer match."""
+    return "".join(ch for ch in name.lower() if ch.isalnum())
+
+
 def _match_op_avg_ms(
     ops: list[dict],
     patterns: tuple[str, ...],
@@ -173,13 +197,15 @@ def _match_op_avg_ms(
     exclude: tuple[str, ...] = (),
 ) -> tuple[float | None, str | None]:
     """Return (avg_ms, matched_name) for the best-matching op by total_us."""
+    pat_keys = [_norm_op_key(p) for p in patterns]
+    excl_keys = [_norm_op_key(p) for p in exclude]
     best: dict | None = None
     for op in ops:
         name = str(op.get("name", ""))
-        lower = name.lower()
-        if exclude and any(tok in lower for tok in exclude):
+        key = _norm_op_key(name)
+        if excl_keys and any(tok and tok in key for tok in excl_keys):
             continue
-        if not any(tok in lower for tok in patterns):
+        if not any(tok and tok in key for tok in pat_keys):
             continue
         if best is None or float(op.get("total_us", 0.0)) > float(
                 best.get("total_us", 0.0)):
@@ -198,9 +224,9 @@ def attach_kernel_compare_fields(
     """Derive ``lru_kernel_ms`` / ``sfa_copy_kernel_ms`` from profile_summary.
 
     A ``lru_kernel_ms`` = HOSTFUNC_CALLBACK + EVENT_WAIT (both required parts).
-    A ``sfa_copy_kernel_ms`` = fused_overlap AI-Core kernel.
-    B ``lru_kernel_ms`` = li_manage kernel - LI kernel.
-    B ``sfa_copy_kernel_ms`` = scatter_sfa AI-Core kernel.
+    A ``sfa_copy_kernel_ms`` = FusedSparseAttentionOverlap.
+    B ``lru_kernel_ms`` = NanovllmLiManage − LightningIndexer (kernel avg).
+    B ``sfa_copy_kernel_ms`` = NanovllmSparseAndTailAttentionAndScatterCopy.
     """
     summary = result.get("profile_summary")
     if not summary:
@@ -215,14 +241,18 @@ def attach_kernel_compare_fields(
             exclude=_KERNEL_NAME_PATTERNS["b_li_manage"],
         )
         lru = summary.get("lru_planner") or {}
-        # Sum of BOTH timeline markers — do not drop EVENT_WAIT.
-        host_us = lru.get("hostfunc_callback_steady_us")
-        wait_us = lru.get("event_wait_steady_us")
-        lru_us = lru.get("lru_planner_steady_us")
+        # Sum of BOTH timeline markers over ALL samples (no drop-first).
+        host_us = lru.get("hostfunc_callback_avg_us",
+                          lru.get("hostfunc_callback_steady_us"))
+        wait_us = lru.get("event_wait_avg_us",
+                          lru.get("event_wait_steady_us"))
+        lru_us = lru.get("lru_planner_avg_us",
+                         lru.get("lru_planner_steady_us"))
         if lru_us is None and host_us is not None and wait_us is not None:
             lru_us = float(host_us) + float(wait_us)
         if lru_us is None:
-            lru_us = result.get("lru_planner_steady_us")
+            lru_us = result.get("lru_planner_avg_us",
+                               result.get("lru_planner_steady_us"))
         lru_ms = float(lru_us) / 1000.0 if lru_us is not None else None
         if host_us is not None:
             result["hostfunc_callback_kernel_ms"] = float(host_us) / 1000.0
@@ -234,6 +264,8 @@ def attach_kernel_compare_fields(
             "HOSTFUNC_CALLBACK+EVENT_WAIT" if lru_ms is not None else None
         )
     else:
+        # Prefer the names that appear in nano msprof: LightningIndexer /
+        # NanovllmLiManage. lru_kernel_ms = manage - LI.
         li_ms, li_name = _match_op_avg_ms(
             ops, _KERNEL_NAME_PATTERNS["li"],
             exclude=_KERNEL_NAME_PATTERNS["b_li_manage"],
@@ -256,6 +288,7 @@ def attach_kernel_compare_fields(
         )
         result["li_kernel_ms"] = li_ms
         result["li_manage_kernel_ms"] = manage_ms
+        result["li_manage_minus_li_kernel_ms"] = lru_ms
 
     result["lru_kernel_ms"] = lru_ms
     result["sfa_copy_kernel_ms"] = sfa_ms
@@ -265,12 +298,22 @@ def attach_kernel_compare_fields(
     if not quiet:
         def _fmt(v):
             return "n/a" if v is None else f"{float(v):.4f}"
-        print(
-            f"[{approach}-kernel] lru_kernel_ms={_fmt(lru_ms)}  "
-            f"sfa_copy_kernel_ms={_fmt(sfa_ms)}  "
-            f"matched={matched}",
-            flush=True,
-        )
+        if approach == "B":
+            print(
+                f"[B-kernel] LightningIndexer={_fmt(li_ms)}  "
+                f"NanovllmLiManage={_fmt(manage_ms)}  "
+                f"lru_kernel_ms(=NanovllmLiManage-LightningIndexer)={_fmt(lru_ms)}  "
+                f"NanovllmSparseAndTailAttentionAndScatterCopy="
+                f"{_fmt(sfa_ms)}  matched={matched}",
+                flush=True,
+            )
+        else:
+            print(
+                f"[A-kernel] lru_kernel_ms(HOSTFUNC+EVENT_WAIT)={_fmt(lru_ms)}  "
+                f"FusedSparseAttentionOverlap={_fmt(sfa_ms)}  "
+                f"matched={matched}",
+                flush=True,
+            )
     return result
 
 
@@ -477,7 +520,8 @@ def _as_float(value) -> float | None:
 
 # Approach A: after LightningIndexer, host-side LRU shows up as these msprof
 # markers. ``lru_kernel_ms`` ALWAYS includes BOTH parts (sum), never hostfunc
-# alone: lru_kernel_ms = HOSTFUNC_CALLBACK + EVENT_WAIT (steady avg).
+# alone: lru_kernel_ms = mean(HOSTFUNC_CALLBACK) + mean(EVENT_WAIT) over ALL
+# captured samples (no cold-sample drop).
 _LRU_PROFILE_MARKERS = (
     "HOSTFUNC_CALLBACK",
     "EVENT_WAIT",
@@ -609,21 +653,26 @@ def _print_lru_planner_summary(
     artifacts: dict[str, Path],
     fallback_rows: list[tuple[str, int, float, float]],
     *,
-    drop_first: int = 1,
+    drop_first: int = 0,
 ) -> dict:
-    """Average HOSTFUNC_CALLBACK + EVENT_WAIT as Approach-A LRU planner time."""
+    """Average HOSTFUNC_CALLBACK + EVENT_WAIT over ALL captured samples.
+
+    ``drop_first`` is ignored (kept for call-site compat). Reported averages
+    always include every sample — no steady/cold filtering.
+    """
+    del drop_first  # intentionally unused: always average all samples
     samples, source = _collect_lru_marker_samples(artifacts)
-    out: dict = {"source": source, "drop_first": drop_first, "markers": {}}
+    out: dict = {"source": source, "markers": {}}
 
     print("----- PROFILE LRU PLANNER (Approach A proxy) -----", flush=True)
     print(
         "HOSTFUNC_CALLBACK / EVENT_WAIT are Runtime timeline markers "
-        "(not AI-Core ops). Prefer trace_view.json.",
+        "(not AI-Core ops). Prefer trace_view.json. "
+        "avg = mean over ALL captured samples.",
         flush=True,
     )
     print(f"[profile] LRU marker source: {source}", flush=True)
     if source == "none":
-        # CSV aggregates cannot drop the cold first sample reliably.
         by_marker: dict[str, list[tuple[str, int, float, float]]] = defaultdict(list)
         for row in fallback_rows:
             marker = _match_lru_marker(row[0])
@@ -638,16 +687,17 @@ def _print_lru_planner_summary(
             out["found"] = False
             return out
         print(
-            "[profile] warning: only aggregated CSV rows available; "
-            "cannot drop the cold first sample.",
+            "[profile] warning: only aggregated CSV rows available.",
             flush=True,
         )
+        avg_all: dict[str, float] = {}
         for marker in _LRU_PROFILE_MARKERS:
             matched = by_marker.get(marker, [])
             if not matched:
                 print(f"{marker:<48} {'MISSING':>8}", flush=True)
                 continue
             name, count, avg_us, total_us = max(matched, key=lambda x: x[3])
+            avg_all[marker] = float(avg_us)
             out["markers"][marker] = {
                 "name": name, "count": count,
                 "avg_us": avg_us, "total_us": total_us,
@@ -657,51 +707,59 @@ def _print_lru_planner_summary(
                 flush=True,
             )
         out["found"] = bool(out["markers"])
+        if len(avg_all) == len(_LRU_PROFILE_MARKERS):
+            lru_avg = sum(avg_all.values())
+            out["lru_planner_avg_us"] = lru_avg
+            out["hostfunc_callback_avg_us"] = avg_all["HOSTFUNC_CALLBACK"]
+            out["event_wait_avg_us"] = avg_all["EVENT_WAIT"]
+            # Legacy aliases (same all-sample avg; not a dropped-first steady).
+            out["lru_planner_steady_us"] = lru_avg
+            out["hostfunc_callback_steady_us"] = avg_all["HOSTFUNC_CALLBACK"]
+            out["event_wait_steady_us"] = avg_all["EVENT_WAIT"]
         return out
 
     print(
-        f"[profile] steady-state avg drops the first {drop_first} sample(s) "
-        "per marker (first profile iter is often cold for EVENT_WAIT).",
-        flush=True,
-    )
-    print(
-        f"{'marker':<24} {'n':>4} {'first':>10} {'avg_all':>10} "
-        f"{'avg_steady':>12} {'median':>10} {'min':>10} {'max':>10}",
+        f"{'marker':<24} {'n':>4} {'avg_us':>12} "
+        f"{'median':>10} {'min':>10} {'max':>10} {'total_us':>14}",
         flush=True,
     )
 
-    steady_avg: dict[str, float] = {}
+    avg_all: dict[str, float] = {}
     for marker in _LRU_PROFILE_MARKERS:
         durs = samples.get(marker, [])
-        stats = _summarize_duration_samples(durs, drop_first=drop_first)
+        stats = _summarize_duration_samples(durs, drop_first=0)
         if not durs:
             print(f"{marker:<24} {'MISS':>4}", flush=True)
             continue
-        steady_avg[marker] = float(stats["steady_avg_us"])
+        avg_all[marker] = float(stats["avg_us"])
         out["markers"][marker] = dict(stats)
         print(
             f"{marker:<24} {stats['count']:4d} "
-            f"{stats['first_us']:10.3f} {stats['avg_us']:10.3f} "
-            f"{stats['steady_avg_us']:12.3f} {stats['median_us']:10.3f} "
-            f"{stats['min_us']:10.3f} {stats['max_us']:10.3f}",
+            f"{stats['avg_us']:12.3f} {stats['median_us']:10.3f} "
+            f"{stats['min_us']:10.3f} {stats['max_us']:10.3f} "
+            f"{stats['total_us']:14.3f}",
             flush=True,
         )
 
     out["found"] = bool(out["markers"])
-    if len(steady_avg) == len(_LRU_PROFILE_MARKERS):
-        lru_steady = sum(steady_avg.values())
-        out["lru_planner_steady_us"] = lru_steady
-        out["hostfunc_callback_steady_us"] = steady_avg["HOSTFUNC_CALLBACK"]
-        out["event_wait_steady_us"] = steady_avg["EVENT_WAIT"]
+    if len(avg_all) == len(_LRU_PROFILE_MARKERS):
+        lru_avg = sum(avg_all.values())
+        out["lru_planner_avg_us"] = lru_avg
+        out["hostfunc_callback_avg_us"] = avg_all["HOSTFUNC_CALLBACK"]
+        out["event_wait_avg_us"] = avg_all["EVENT_WAIT"]
+        # Legacy aliases (same all-sample avg; not a dropped-first steady).
+        out["lru_planner_steady_us"] = lru_avg
+        out["hostfunc_callback_steady_us"] = avg_all["HOSTFUNC_CALLBACK"]
+        out["event_wait_steady_us"] = avg_all["EVENT_WAIT"]
         print(
-            f"{'LRU_PLANNER_STEADY':<24} "
-            f"{'':>4} {'':>10} {'':>10} {lru_steady:12.3f}",
+            f"{'LRU_PLANNER_AVG':<24} "
+            f"{'':>4} {lru_avg:12.3f}",
             flush=True,
         )
         print(
-            "[profile] LRU planner steady avg = "
-            f"{steady_avg['HOSTFUNC_CALLBACK']:.3f} + "
-            f"{steady_avg['EVENT_WAIT']:.3f} = {lru_steady:.3f} us",
+            "[profile] LRU planner avg (all samples) = "
+            f"{avg_all['HOSTFUNC_CALLBACK']:.3f} + "
+            f"{avg_all['EVENT_WAIT']:.3f} = {lru_avg:.3f} us",
             flush=True,
         )
     return out
@@ -1462,14 +1520,17 @@ def run_a(args) -> dict:
         result["profile"] = True
         result["profile_run_dir"] = profile_summary.get("run_dir")
         result["profile_dir"] = profile_summary.get("profile_dir")
-        result["lru_planner_steady_us"] = lru.get("lru_planner_steady_us")
-        result["hostfunc_callback_steady_us"] = lru.get(
-            "hostfunc_callback_steady_us")
-        result["event_wait_steady_us"] = lru.get("event_wait_steady_us")
+        result["lru_planner_avg_us"] = lru.get("lru_planner_avg_us")
+        result["hostfunc_callback_avg_us"] = lru.get("hostfunc_callback_avg_us")
+        result["event_wait_avg_us"] = lru.get("event_wait_avg_us")
+        # Legacy aliases (== all-sample avg; name kept for older readers).
+        result["lru_planner_steady_us"] = result["lru_planner_avg_us"]
+        result["hostfunc_callback_steady_us"] = result["hostfunc_callback_avg_us"]
+        result["event_wait_steady_us"] = result["event_wait_avg_us"]
         result["profile_summary"] = profile_summary
         # Profile-timeline LRU proxy (us); also promoted to lru_kernel_ms.
-        if lru.get("lru_planner_steady_us") is not None:
-            result["lru_profile_ms"] = float(lru["lru_planner_steady_us"]) / 1000.0
+        if lru.get("lru_planner_avg_us") is not None:
+            result["lru_profile_ms"] = float(lru["lru_planner_avg_us"]) / 1000.0
         attach_kernel_compare_fields(result, "A")
     return result
 
@@ -2067,7 +2128,8 @@ def _print_scenario_compare(ra: dict, rb: dict) -> None:
         )
     else:
         _print_pair_delta(
-            "lru_kernel_ms      (A HOSTFUNC_CALLBACK+EVENT_WAIT ↔ B LI_MANAGE_k-LI_k)",
+            "lru_kernel_ms (A HOSTFUNC_CALLBACK+EVENT_WAIT ↔ "
+            "B NanovllmLiManage-LightningIndexer)",
             a_lru_k, b_lru_k,
         )
         if ra.get("hostfunc_callback_kernel_ms") is not None \
@@ -2079,16 +2141,25 @@ def _print_scenario_compare(ra: dict, rb: dict) -> None:
                 f"{_fmt_ms(a_lru_k)}",
                 flush=True,
             )
-        _print_pair_delta(
-            "sfa_copy_kernel_ms (A fused_k ↔ B scatter_k)",
-            a_sfa_k, b_sfa_k,
-        )
-        if ra.get("kernel_match_names") or rb.get("kernel_match_names"):
+        if rb.get("li_manage_kernel_ms") is not None \
+                or rb.get("li_kernel_ms") is not None:
             print(
-                f"  matched A={ra.get('kernel_match_names')}  "
-                f"B={rb.get('kernel_match_names')}",
+                f"  B lru parts: NanovllmLiManage="
+                f"{_fmt_ms(rb.get('li_manage_kernel_ms'))} - "
+                f"LightningIndexer={_fmt_ms(rb.get('li_kernel_ms'))} = "
+                f"{_fmt_ms(b_lru_k)}",
                 flush=True,
             )
+        _print_pair_delta(
+            "sfa_copy_kernel_ms (A FusedSparseAttentionOverlap ↔ "
+            "B NanovllmSparseAndTailAttentionAndScatterCopy)",
+            a_sfa_k, b_sfa_k,
+        )
+        print(
+            f"  matched A={ra.get('kernel_match_names')}  "
+            f"B={rb.get('kernel_match_names')}",
+            flush=True,
+        )
 
     print(
         f"Approach A detail: LI={_fmt_ms(ra.get('li_ms'))}  "
@@ -2276,10 +2347,8 @@ def parse_args():
     p.add_argument(
         "--profile-drop-first",
         type=int,
-        default=1,
-        help="When averaging LRU timeline markers from trace_view.json, drop "
-             "this many leading samples per marker (default 1). The first "
-             "profiled EVENT_WAIT is often a cold outlier.",
+        default=0,
+        help="Deprecated/no-op: LRU marker averages always use ALL samples.",
     )
     p.add_argument(
         "--parse-profile-dir",
