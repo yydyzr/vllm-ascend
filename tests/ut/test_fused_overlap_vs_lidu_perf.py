@@ -30,6 +30,7 @@ import math
 import os
 import statistics
 import sys
+import time
 from collections import defaultdict
 from pathlib import Path
 from typing import Callable
@@ -138,40 +139,100 @@ def maybe_graph_runner(runner, *, use_graph: bool, warmup: int = 3):
     return graph.replay, "graph"
 
 
-def _find_profile_csvs(profile_dir: str) -> dict[str, Path]:
-    """Locate common msprof/torch_npu summary CSVs under ``profile_dir``."""
-    root = Path(profile_dir)
-    wanted = ("op_statistic.csv", "kernel_details.csv", "operator_details.csv")
+def _path_mtime(path: Path) -> float:
+    try:
+        return path.stat().st_mtime
+    except OSError:
+        return 0.0
+
+
+def _newest_ascend_pt_dirs(profile_dir: str) -> list[Path]:
+    """Return ``*_ascend_pt`` dirs under profile_dir, newest first."""
+    root = Path(profile_dir).resolve()
+    if not root.is_dir():
+        return []
+    dirs = [p for p in root.rglob("*_ascend_pt") if p.is_dir()]
+    dirs.sort(key=_path_mtime, reverse=True)
+    return dirs
+
+
+def _csv_rank(path: Path) -> tuple:
+    """Prefer newest ASCEND_PROFILER_OUTPUT CSV from the latest ascend_pt run."""
+    parts_lower = [part.lower() for part in path.parts]
+    under_output = any(part == "ascend_profiler_output" for part in parts_lower)
+    under_ascend_pt = any(part.endswith("_ascend_pt") for part in parts_lower)
+    return (1 if under_output else 0, 1 if under_ascend_pt else 0, _path_mtime(path))
+
+
+def _profile_search_root(profile_dir: str) -> Path:
+    """Newest ascend_pt tree under profile_dir, else profile_dir itself."""
+    root = Path(profile_dir).resolve()
+    ascend_pts = _newest_ascend_pt_dirs(str(root))
+    if ascend_pts:
+        print(f"[profile] using newest ascend_pt dir: {ascend_pts[0]}",
+              flush=True)
+        return ascend_pts[0]
+    return root
+
+
+def _find_named_artifacts(search_root: Path, names: tuple[str, ...]) -> dict[str, Path]:
+    candidates: dict[str, list[Path]] = defaultdict(list)
+    for path in search_root.rglob("*"):
+        if not path.is_file():
+            continue
+        if path.name in names:
+            candidates[path.name].append(path.resolve())
+            continue
+        # task_time_*.csv / api_statistic_*.csv style exports
+        for name in names:
+            stem = name.rsplit(".", 1)[0]
+            if path.name.startswith(stem) and path.suffix == Path(name).suffix:
+                candidates[name].append(path.resolve())
     found: dict[str, Path] = {}
-    for path in root.rglob("*.csv"):
-        name = path.name
-        if name in wanted and name not in found:
-            found[name] = path
+    for name, paths in candidates.items():
+        best = max(paths, key=_csv_rank)
+        found[name] = best
+        print(f"[profile] selected {name}: {best}", flush=True)
     return found
 
 
-def _ensure_profile_csvs(profile_dir: str) -> dict[str, Path]:
-    """Return parsed CSVs, calling offline analyse() once if needed."""
-    found = _find_profile_csvs(profile_dir)
-    if "op_statistic.csv" in found or "kernel_details.csv" in found:
+def _find_profile_artifacts(profile_dir: str) -> dict[str, Path]:
+    """Locate summary/trace artifacts for the newest run under ``profile_dir``."""
+    search_root = _profile_search_root(profile_dir)
+    wanted = (
+        "op_statistic.csv",
+        "kernel_details.csv",
+        "operator_details.csv",
+        "api_statistic.csv",
+        "task_time.csv",
+        "trace_view.json",
+    )
+    return _find_named_artifacts(search_root, wanted)
+
+
+def _ensure_profile_artifacts(profile_dir: str) -> dict[str, Path]:
+    """Return profile artifacts, calling offline analyse() once if needed."""
+    found = _find_profile_artifacts(profile_dir)
+    if found:
         return found
     try:
         from torch_npu.profiler.profiler import analyse
     except Exception as exc:
         print(f"[profile] offline analyse unavailable: {exc}", flush=True)
         return found
-    print("[profile] summary CSV not ready; running offline analyse()...",
+    print("[profile] summary artifacts not ready; running offline analyse()...",
           flush=True)
-    try:
-        analyse(profile_dir)
-    except TypeError:
-        # Some torch_npu versions expect an ascend_pt directory, not the root.
-        for ascend_pt in Path(profile_dir).rglob("*_ascend_pt"):
-            analyse(str(ascend_pt))
-    except Exception as exc:
-        print(f"[profile] offline analyse failed: {exc}", flush=True)
-        return found
-    return _find_profile_csvs(profile_dir)
+    ascend_pts = _newest_ascend_pt_dirs(profile_dir)
+    analyse_targets = [str(p) for p in ascend_pts[:1]] or [
+        str(Path(profile_dir).resolve())]
+    for target in analyse_targets:
+        print(f"[profile] analyse target: {target}", flush=True)
+        try:
+            analyse(target)
+        except Exception as exc:
+            print(f"[profile] offline analyse failed for {target}: {exc}",
+                  flush=True)
+    return _find_profile_artifacts(profile_dir)
 
 
 def _pick_csv_field(row: dict, *candidates: str) -> str | None:
@@ -227,8 +288,118 @@ def _print_rows(title: str, rows: list[tuple[str, int, float, float]], top_n: in
               flush=True)
 
 
-def _print_lru_planner_summary(rows: list[tuple[str, int, float, float]]) -> None:
+def _rows_from_duration_groups(
+    groups: dict[str, list[float]],
+) -> list[tuple[str, int, float, float]]:
+    rows = []
+    for name, durs in groups.items():
+        rows.append((name, len(durs), statistics.mean(durs), sum(durs)))
+    rows.sort(key=lambda x: x[3], reverse=True)
+    return rows
+
+
+def _parse_trace_view_lru_rows(trace_path: Path) -> list[tuple[str, int, float, float]]:
+    """Parse HOSTFUNC_CALLBACK / EVENT_WAIT from timeline JSON.
+
+    These Runtime/Task-Scheduler markers appear in MindStudio timeline
+    (``trace_view.json``), not in AI-Core ``op_statistic`` / ``kernel_details``.
+    Chrome-trace complete events use ``dur`` in microseconds.
+    """
+    try:
+        payload = json.loads(trace_path.read_text())
+    except Exception as exc:
+        print(f"[profile] failed to read {trace_path}: {exc}", flush=True)
+        return []
+
+    if isinstance(payload, dict):
+        events = payload.get("traceEvents") or payload.get("events") or []
+    elif isinstance(payload, list):
+        events = payload
+    else:
+        return []
+
+    groups: dict[str, list[float]] = defaultdict(list)
+    for event in events:
+        if not isinstance(event, dict):
+            continue
+        name = str(event.get("name") or event.get("args", {}).get("name") or "")
+        marker = _match_lru_marker(name)
+        if marker is None:
+            continue
+        dur = _as_float(event.get("dur"))
+        if dur is None:
+            # Some exports use begin/end pairs instead of complete events.
+            continue
+        # Keep the original timeline name; marker matching is fuzzy.
+        groups[name].append(dur)
+    return _rows_from_duration_groups(groups)
+
+
+def _parse_csv_lru_rows(csv_path: Path) -> list[tuple[str, int, float, float]]:
+    """Best-effort LRU marker parse from api_statistic / task_time CSVs."""
+    rows: list[tuple[str, int, float, float]] = []
+    with csv_path.open(newline="") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            name_key = _pick_csv_field(
+                row, "API Name", "Name", "OP Name", "Op Name", "OP Type",
+                "Task Type", "Type")
+            if name_key is None:
+                continue
+            name = str(row[name_key]).strip()
+            if _match_lru_marker(name) is None:
+                continue
+            count_key = _pick_csv_field(
+                row, "Count", "Calls", "Call Count", "Total Count")
+            total_key = _pick_csv_field(
+                row, "Time(us)", "Total Time(us)", "Total Duration(us)",
+                "Total Time (us)", "Duration(us)")
+            avg_key = _pick_csv_field(
+                row, "Avg(us)", "Avg Time(us)", "Avg Duration(us)",
+                "Avg Time (us)", "Average Time(us)")
+            count = _as_float(row[count_key]) if count_key else None
+            total_us = _as_float(row[total_key]) if total_key else None
+            avg_us = _as_float(row[avg_key]) if avg_key else None
+            if avg_us is None and total_us is not None and count:
+                avg_us = total_us / count
+            if avg_us is None and total_us is not None and not count:
+                # task_time rows are often one duration per line.
+                avg_us = total_us
+                count = 1
+                total_us = total_us
+            if avg_us is None:
+                continue
+            rows.append((name, int(count or 0), avg_us, total_us or 0.0))
+    rows.sort(key=lambda x: x[3], reverse=True)
+    return rows
+
+
+def _collect_lru_marker_rows(
+    artifacts: dict[str, Path],
+    fallback_rows: list[tuple[str, int, float, float]],
+) -> tuple[list[tuple[str, int, float, float]], str]:
+    """Return LRU marker rows and the source used to obtain them."""
+    if "trace_view.json" in artifacts:
+        rows = _parse_trace_view_lru_rows(artifacts["trace_view.json"])
+        if rows:
+            return rows, f"trace_view.json:{artifacts['trace_view.json']}"
+    for key in ("task_time.csv", "api_statistic.csv"):
+        if key in artifacts:
+            rows = _parse_csv_lru_rows(artifacts[key])
+            if rows:
+                return rows, f"{key}:{artifacts[key]}"
+    rows = [row for row in fallback_rows if _match_lru_marker(row[0])]
+    if rows:
+        return rows, "op_statistic/kernel_details"
+    return [], "none"
+
+
+def _print_lru_planner_summary(
+    artifacts: dict[str, Path],
+    fallback_rows: list[tuple[str, int, float, float]],
+) -> None:
     """Average HOSTFUNC_CALLBACK + EVENT_WAIT as Approach-A LRU planner time."""
+    rows, source = _collect_lru_marker_rows(artifacts, fallback_rows)
     by_marker: dict[str, list[tuple[str, int, float, float]]] = defaultdict(list)
     for row in rows:
         marker = _match_lru_marker(row[0])
@@ -237,14 +408,16 @@ def _print_lru_planner_summary(rows: list[tuple[str, int, float, float]]) -> Non
 
     print("----- PROFILE LRU PLANNER (Approach A proxy) -----", flush=True)
     print(
-        "After LightningIndexer, HOSTFUNC_CALLBACK + EVENT_WAIT is treated "
-        "as the host-side LRU planner cost.",
+        "HOSTFUNC_CALLBACK / EVENT_WAIT are Runtime timeline markers "
+        "(not AI-Core ops). Prefer trace_view.json, then task_time/api_statistic.",
         flush=True,
     )
+    print(f"[profile] LRU marker source: {source}", flush=True)
     if not by_marker:
         print(
             "[profile] LRU markers not found "
-            f"(looked for {_LRU_PROFILE_MARKERS}).",
+            f"(looked for {_LRU_PROFILE_MARKERS} in "
+            "trace_view.json / task_time.csv / api_statistic.csv).",
             flush=True,
         )
         return
@@ -270,7 +443,6 @@ def _print_lru_planner_summary(rows: list[tuple[str, int, float, float]]) -> Non
     if len(marker_avg) == len(_LRU_PROFILE_MARKERS):
         lru_avg = sum(marker_avg.values())
         lru_total = sum(marker_total.values())
-        # Counts should be close; report the min as a sanity check.
         lru_count = min(marker_count.values())
         print(
             f"{'LRU_PLANNER(=HOSTFUNC_CALLBACK+EVENT_WAIT)':<48} "
@@ -286,10 +458,10 @@ def _print_lru_planner_summary(rows: list[tuple[str, int, float, float]]) -> Non
 
 
 def summarize_profile_csvs(profile_dir: str, top_n: int = 30) -> None:
-    """Print average kernel / op times from exported msprof CSVs."""
-    found = _ensure_profile_csvs(profile_dir)
+    """Print average kernel / op times and LRU timeline markers."""
+    found = _ensure_profile_artifacts(profile_dir)
     if not found:
-        print("[profile] no op_statistic.csv / kernel_details.csv found under "
+        print("[profile] no profile artifacts found under "
               f"{profile_dir}", flush=True)
         return
 
@@ -323,7 +495,7 @@ def summarize_profile_csvs(profile_dir: str, top_n: int = 30) -> None:
                 if avg_us is None:
                     continue
                 rows.append((name, int(count or 0), avg_us, total_us or 0.0))
-    else:
+    elif "kernel_details.csv" in found:
         path = found["kernel_details.csv"]
         source = "kernel_details"
         print(f"[profile] parsing {path}", flush=True)
@@ -342,14 +514,13 @@ def summarize_profile_csvs(profile_dir: str, top_n: int = 30) -> None:
                 if duration is None:
                     continue
                 groups[str(row[name_key]).strip()].append(duration)
-        for name, durs in groups.items():
-            rows.append((name, len(durs), statistics.mean(durs), sum(durs)))
+        rows = _rows_from_duration_groups(groups)
 
     rows.sort(key=lambda x: x[3], reverse=True)
     if source == "op_statistic":
         _print_rows(
             "----- PROFILE OP STATISTIC (avg kernel time) -----", rows, top_n)
-    else:
+    elif source == "kernel_details":
         _print_rows(
             "----- PROFILE KERNEL DETAILS (avg over captured iters) -----",
             rows, top_n)
@@ -358,7 +529,13 @@ def summarize_profile_csvs(profile_dir: str, top_n: int = 30) -> None:
             "kernel launches in this profile window.",
             flush=True,
         )
-    _print_lru_planner_summary(rows)
+    else:
+        print(
+            "[profile] no op_statistic/kernel_details; still trying LRU "
+            "markers from timeline/runtime exports.",
+            flush=True,
+        )
+    _print_lru_planner_summary(found, rows)
 
 
 def profile_pipeline(steps, warmup, iters, profile_dir=None, top_n: int = 30,
@@ -369,6 +546,10 @@ def profile_pipeline(steps, warmup, iters, profile_dir=None, top_n: int = 30,
     Prefer a single step that represents one production round so kernels are
     not duplicated and stay on the intended streams.
     ``reset`` runs outside the timed/profiled work each iteration.
+
+    Each invocation writes into a fresh ``run_<timestamp>_<pid>/`` subdirectory
+    under ``profile_dir``, so parsing never picks a stale ``op_statistic.csv``
+    left by a previous run that reused the same ``--profile-dir``.
     """
     import tempfile
     import torch_npu.profiler as prof
@@ -378,6 +559,11 @@ def profile_pipeline(steps, warmup, iters, profile_dir=None, top_n: int = 30,
         print(f"[profile] no --profile-dir given, using temp dir: {profile_dir}",
               flush=True)
     os.makedirs(profile_dir, exist_ok=True)
+    # Isolate this capture from older exports under the same --profile-dir.
+    run_dir = Path(profile_dir).resolve() / (
+        f"run_{time.strftime('%Y%m%d_%H%M%S')}_{os.getpid()}")
+    run_dir.mkdir(parents=True, exist_ok=False)
+    print(f"[profile] run dir: {run_dir}", flush=True)
 
     for _ in range(max(0, warmup)):
         if reset is not None:
@@ -387,14 +573,16 @@ def profile_pipeline(steps, warmup, iters, profile_dir=None, top_n: int = 30,
             fn()
         torch.npu.synchronize()
 
+    # Level2 includes CANN Runtime / Task Scheduler data that surfaces
+    # HOSTFUNC_CALLBACK and EVENT_WAIT on the timeline.
     exp = prof._ExperimentalConfig(
         export_type=prof.ExportType.Text,
-        profiler_level=prof.ProfilerLevel.Level1,
+        profiler_level=prof.ProfilerLevel.Level2,
         aic_metrics=prof.AiCMetrics.PipeUtilization,
         data_simplification=True,
     )
     activities = [prof.ProfilerActivity.CPU, prof.ProfilerActivity.NPU]
-    trace_cb = prof.tensorboard_trace_handler(profile_dir)
+    trace_cb = prof.tensorboard_trace_handler(str(run_dir))
     with prof.profile(activities=activities, experimental_config=exp,
                       on_trace_ready=trace_cb):
         for _ in range(iters):
@@ -407,8 +595,8 @@ def profile_pipeline(steps, warmup, iters, profile_dir=None, top_n: int = 30,
                     fn()
             torch.npu.synchronize()
 
-    print(f"PROFILE_TRACE_DIR={profile_dir}", flush=True)
-    summarize_profile_csvs(profile_dir, top_n=top_n)
+    print(f"PROFILE_TRACE_DIR={run_dir}", flush=True)
+    summarize_profile_csvs(str(run_dir), top_n=top_n)
 
 
 # ===================== Approach A: vllm-ascend =====================
