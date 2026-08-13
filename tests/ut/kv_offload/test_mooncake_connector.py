@@ -335,6 +335,80 @@ class TestMooncakeTransferGroups(unittest.TestCase):
             4,
         )
 
+    def test_sfa_indexer_group_is_replicated_for_unequal_pd_tp(self):
+        worker = MooncakeConnectorWorker.__new__(MooncakeConnectorWorker)
+        worker.num_key_value_heads = 64
+        indexer_group = {
+            "kv_cache_spec_type": "AscendSFAIndexerCacheSpec",
+            "kv_cache_spec": {
+                "num_kv_heads": 1,
+                "total_num_kv_heads": 64,
+                "head_size": 128,
+                "scale_dim": 1,
+            },
+        }
+        mla_group = {
+            "kv_cache_spec_type": "AscendMLAAttentionSpec",
+            "kv_cache_spec": {"num_kv_heads": 1, "total_num_kv_heads": 64},
+        }
+
+        self.assertEqual(worker._get_attention_group_num_key_value_heads(indexer_group), 1)
+        self.assertEqual(worker._get_attention_group_num_key_value_heads(mla_group), 1)
+        self.assertEqual(
+            worker._get_attention_group_num_need_pulls_for_decode_tp(indexer_group, 16, 4),
+            1,
+        )
+        self.assertEqual(
+            worker._get_attention_group_num_need_pulls_for_decode_tp(mla_group, 16, 4),
+            1,
+        )
+
+    def test_sfa_indexer_spec_total_heads_stays_local(self):
+        from vllm_ascend.core.kv_cache_interface import AscendSFAIndexerCacheSpec
+
+        worker = MooncakeConnectorWorker.__new__(MooncakeConnectorWorker)
+        worker.vllm_config = MockVllmConfig()
+        worker.vllm_config.model_config.get_total_num_kv_heads = MagicMock(return_value=64)
+        indexer_spec = AscendSFAIndexerCacheSpec(
+            block_size=128,
+            num_kv_heads=1,
+            head_size=128,
+            dtype=torch.int8,
+            scale_dim=1,
+            scale_dtype=torch.float16,
+            cache_sparse_li_c8=True,
+        )
+        self.assertEqual(worker._get_spec_total_num_kv_heads(indexer_spec, 0), 1)
+
+    def test_reformat_kv_cache_hybrid_linear_skips_non_divisible_tensors(self):
+        num_blocks = 1
+        block_size = 128
+        tp_num_need_pulls = 4
+        k_cache = torch.arange(num_blocks * block_size * 128, dtype=torch.float32).reshape(
+            num_blocks, block_size, 1, 128
+        )
+        scale_cache = torch.arange(num_blocks * block_size, dtype=torch.float32).reshape(num_blocks, block_size, 1, 1)
+        expected_k = (
+            k_cache.reshape(num_blocks, tp_num_need_pulls, block_size, -1)
+            .transpose(1, 2)
+            .contiguous()
+            .reshape_as(k_cache)
+        )
+        expected_scale = scale_cache.clone()
+
+        thread = KVCacheRecvingThread.__new__(KVCacheRecvingThread)
+        thread.kv_caches = {"layer.0.indexer": (k_cache, scale_cache)}
+        group_kv_caches = {"layer.0.indexer": (k_cache, scale_cache)}
+
+        thread.reformat_kv_cache_hybrid_linear_torch(
+            [[0]],
+            tp_num_need_pulls,
+            group_kv_caches,
+        )
+
+        torch.testing.assert_close(group_kv_caches["layer.0.indexer"][0], expected_k)
+        torch.testing.assert_close(group_kv_caches["layer.0.indexer"][1], expected_scale)
+
     def test_build_kv_group2layeridx_splits_uniform_group_by_kv_heads(self):
         mla_spec = MLAAttentionSpec(
             block_size=16,

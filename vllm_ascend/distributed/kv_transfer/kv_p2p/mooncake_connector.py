@@ -57,6 +57,7 @@ from vllm.v1.request import RequestStatus
 
 from vllm_ascend import envs as ascend_envs
 from vllm_ascend.ascend_config import get_ascend_config, init_ascend_config
+from vllm_ascend.core.kv_cache_interface import AscendSFAIndexerCacheSpec
 from vllm_ascend.distributed.kv_transfer.utils.mooncake_transfer_engine import global_te
 from vllm_ascend.distributed.kv_transfer.utils.utils import (
     RegisterRegions,
@@ -69,6 +70,13 @@ from vllm_ascend.distributed.utils import (
     get_decode_context_model_parallel_world_size,
 )
 from vllm_ascend.utils import enable_custom_op, enable_sfa_dcp_replicated_indexer
+
+# MLA / SFA indexer KV is replicated across TP (num_kv_heads=1), not GQA-sharded.
+_REPLICATED_ATTENTION_KV_SPEC_TYPES = {
+    "MLAAttentionSpec",
+    "AscendMLAAttentionSpec",
+    "AscendSFAIndexerCacheSpec",
+}
 
 # isort: off
 if TYPE_CHECKING:
@@ -1026,7 +1034,8 @@ class KVCacheRecvingThread(threading.Thread):
         flat_block_ids = [item for sublist in block_ids for item in sublist]
         if not flat_block_ids or tp_num_need_pulls == 1:
             return
-        device = list(self.kv_caches.values())[0][0].device
+        first_layer_cache = next(iter(self.kv_caches.values()))
+        device = MooncakeConnectorWorker._as_kv_cache_tuple(first_layer_cache)[0].device
         block_ids_tensor = torch.tensor(flat_block_ids, dtype=torch.long, device=device)
         num_blocks = block_ids_tensor.numel()
 
@@ -1034,8 +1043,12 @@ class KVCacheRecvingThread(threading.Thread):
             # The transferred cache is laid out as
             # [block, split, token, head_per_split, dim]. Restore it to
             # [block, token, split, head_per_split, dim] in the selected blocks.
+            # Skip tensors that are not TP-sharded (e.g. SFA indexer scale).
             selected = cache.index_select(0, block_ids_tensor)
             block_size = cache.shape[1]
+            split_elems = num_blocks * tp_num_need_pulls * block_size
+            if split_elems == 0 or selected.numel() % split_elems != 0:
+                return
             transposed = (
                 selected.reshape(num_blocks, tp_num_need_pulls, block_size, -1)
                 .transpose(1, 2)
@@ -1044,9 +1057,11 @@ class KVCacheRecvingThread(threading.Thread):
             )
             cache.index_copy_(0, block_ids_tensor, transposed)
 
-        for _, (k_cache_layer, v_cache_layer) in group_kv_caches.items():
-            _transpose_cache_by_block(k_cache_layer)
-            _transpose_cache_by_block(v_cache_layer)
+        for layer_cache in group_kv_caches.values():
+            for cache_layer in MooncakeConnectorWorker._as_kv_cache_tuple(layer_cache):
+                if cache_layer is None:
+                    continue
+                _transpose_cache_by_block(cache_layer)
 
     def _append_mamba_transfer_meta(
         self,
@@ -1134,14 +1149,18 @@ class KVCacheRecvingThread(threading.Thread):
         length_list.append(remote_ssm_len)
 
     def _get_group_kv_caches(self, group_idx: int, layer_indices: list[int] | None = None) -> dict[str, Any]:
+        group_spec, group_layer_indices = self.kv_group2layeridx[group_idx]
         if layer_indices is None:
-            _, layer_indices = self.kv_group2layeridx[group_idx]
+            layer_indices = group_layer_indices
         layer_index_set = set(layer_indices)
+        group_layer_names = set(group_spec["layer_names"])
         model_type = self.vllm_config.model_config.hf_text_config.model_type
         num_attn_module = 2 if model_type in ("longcat_flash", "longcat_flash_ngram") else 1
         from vllm.v1.worker.utils import extract_layer_index
 
         def layer_in_group(layer_name: str) -> bool:
+            if layer_name not in group_layer_names:
+                return False
             if "mtp" in layer_name:
                 return any(layer_idx >= self.num_layers for layer_idx in layer_index_set)
             return extract_layer_index(layer_name, num_attn_module) in layer_index_set
@@ -2109,7 +2128,8 @@ class MooncakeConnectorWorker:
 
     def _get_spec_total_num_kv_heads(self, spec: Any, layer_idx: int) -> int | None:
         local_num_kv_heads = self._get_spec_num_key_value_heads(spec)
-        if local_num_kv_heads is None or isinstance(spec, MLAAttentionSpec):
+        # MLA and SFA indexer caches are replicated across TP, not GQA-sharded.
+        if local_num_kv_heads is None or isinstance(spec, (MLAAttentionSpec, AscendSFAIndexerCacheSpec)):
             return local_num_kv_heads
 
         model_config = self.vllm_config.model_config
@@ -3208,6 +3228,8 @@ class MooncakeConnectorWorker:
         prefill_tp_size: int,
         decode_tp_size: int,
     ) -> int:
+        if group_spec.get("kv_cache_spec_type") in _REPLICATED_ATTENTION_KV_SPEC_TYPES:
+            return 1
         num_key_value_heads = self._get_attention_group_num_key_value_heads(group_spec)
         num_d_block_heads = max(1, num_key_value_heads // decode_tp_size)
         num_p_block_heads = max(1, num_key_value_heads // prefill_tp_size)
@@ -3215,19 +3237,29 @@ class MooncakeConnectorWorker:
 
     def _get_attention_group_num_key_value_heads(self, group_spec: dict[str, Any]) -> int:
         kv_cache_spec = group_spec.get("kv_cache_spec", {})
+        replicated = group_spec.get("kv_cache_spec_type") in _REPLICATED_ATTENTION_KV_SPEC_TYPES
+        head_keys = (
+            ("num_kv_heads", "num_key_value_heads")
+            if replicated
+            else (
+                "total_num_kv_heads",
+                "num_kv_heads",
+                "num_key_value_heads",
+            )
+        )
         if isinstance(kv_cache_spec, dict):
-            for key in ("total_num_kv_heads", "num_kv_heads", "num_key_value_heads"):
+            for key in head_keys:
                 num_key_value_heads = kv_cache_spec.get(key)
                 if isinstance(num_key_value_heads, int):
                     return num_key_value_heads
             for spec in kv_cache_spec.values():
                 if not isinstance(spec, dict):
                     continue
-                for key in ("total_num_kv_heads", "num_kv_heads", "num_key_value_heads"):
+                for key in head_keys:
                     num_key_value_heads = spec.get(key)
                     if isinstance(num_key_value_heads, int):
                         return num_key_value_heads
-        return self.num_key_value_heads
+        return 1 if replicated else self.num_key_value_heads
 
     def _get_attention_group_remote_rank(
         self,
