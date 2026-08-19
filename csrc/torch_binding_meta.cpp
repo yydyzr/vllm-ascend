@@ -1427,6 +1427,29 @@ void npu_fused_li_manage_mtp_meta(
     return;
 }
 
+void npu_fused_copy_sfa_mtp_meta(
+    const at::Tensor &query_rope,
+    const at::Tensor &query,
+    const at::Tensor &actual_seq_lengths_query,
+    const at::Tensor &actual_seq_lengths_kv,
+    const at::Tensor &num_cache_tokens,
+    const at::Tensor &topk_dst_slots,
+    const at::Tensor &topk_src_ids,
+    const at::Tensor &miss_src_ids,
+    const at::Tensor &miss_dst_slots,
+    const at::Tensor &miss_counts,
+    const at::Tensor &hbm_block_table,
+    const at::Tensor &dram_block_table,
+    at::Tensor hbm_k_rope,
+    at::Tensor hbm_kv_cache,
+    const at::Tensor &dram_k_rope,
+    const at::Tensor &dram_kv_cache,
+    double scale_value,
+    at::Tensor attention_out)
+{
+    return;
+}
+
 } // namespace meta
 } // namespace vllm_ascend
 
@@ -1530,6 +1553,8 @@ TORCH_LIBRARY_IMPL_EXPAND(CONCAT(_C, _ascend), Meta, ops) {
     ops.impl("store_kv_block", &vllm_ascend::meta::store_kv_block);
     // fused_li_manage_mtp
     ops.impl("npu_fused_li_manage_mtp", &vllm_ascend::meta::npu_fused_li_manage_mtp_meta);
+    // fused_copy_sfa_mtp
+    ops.impl("npu_fused_copy_sfa_mtp", &vllm_ascend::meta::npu_fused_copy_sfa_mtp_meta);
 }
 }
 #endif
