@@ -252,6 +252,17 @@ class AscendCommonAttentionMetadata(CommonAttentionMetadata):
     # resident LRU (adler32-hashed request ids and token->request mapping).
     req_ids_tensor: torch.Tensor | None = None
     token_to_req: torch.Tensor | None = None
+    # Sparse KV offload & nano fused op related metadata
+    # topk_buffer slot id of each request in current batch (req_pool_entries)
+    req_topk_buffer_slots: torch.Tensor | None = None
+    # slot_mapping & block_table corresponding to device kv cache (topk_buffer + 2 tail blocks)
+    device_slot_mapping: torch.Tensor | None = None
+    device_block_table: torch.Tensor | None = None
+    # seq_len of offloaded full blocks (tail_length = actual_seq_len_key - offload_seq_lengths_key)
+    offload_seq_lengths_key: torch.Tensor | None = None
+    # history hot kv record for fused_li_manage operator hot kv reuse
+    cache_state: torch.Tensor | None = None
+    cache_slots_pool: torch.Tensor | None = None
 
     # TODO: Remove it when vLLM no longer uses this function.
     def unpadded(self, num_actual_tokens: int, num_actual_reqs: int) -> "AscendCommonAttentionMetadata":

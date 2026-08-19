@@ -184,6 +184,14 @@ class AscendSFAMetadata:
     # by AscendSFAKVOffloadMetadataBuilder.
     req_ids_tensor: torch.Tensor | None = None
     token_to_req: torch.Tensor | None = None
+    # Sparse KV offload & nano fused operator related metadata,
+    # refer to definition in attention/utils.py for detail information.
+    req_topk_buffer_slots: torch.Tensor | None = None
+    device_slot_mapping: torch.Tensor | None = None
+    device_block_table: torch.Tensor | None = None
+    offload_seq_lengths_key: torch.Tensor | None = None
+    cache_state: torch.Tensor | None = None
+    cache_slots_pool: torch.Tensor | None = None
 
 
 M = TypeVar("M", bound=AscendSFAMetadata)

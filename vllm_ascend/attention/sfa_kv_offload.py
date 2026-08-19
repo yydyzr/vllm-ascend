@@ -107,6 +107,13 @@ class AscendSFAKVOffloadMetadataBuilder(AscendSFAMetadataBuilder):
         metadata.num_decode_tokens = num_decode_tokens
         metadata.req_ids_tensor = common_attn_metadata.req_ids_tensor
         metadata.token_to_req = common_attn_metadata.token_to_req
+        if get_ascend_config().sparse_kv_offload_config.fused_op_type == "nano":
+            metadata.req_topk_buffer_slots = common_attn_metadata.req_topk_buffer_slots[:num_decodes]
+            metadata.device_slot_mapping = common_attn_metadata.device_slot_mapping[:num_decode_tokens]
+            metadata.device_block_table = common_attn_metadata.device_block_table[:num_decodes]
+            metadata.offload_seq_lengths_key = common_attn_metadata.offload_seq_lengths_key[:num_decodes]
+            metadata.cache_state = common_attn_metadata.cache_state
+            metadata.cache_slots_pool = common_attn_metadata.cache_slots_pool
         return metadata
 
     def build(

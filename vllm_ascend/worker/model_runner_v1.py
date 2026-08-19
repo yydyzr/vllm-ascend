@@ -102,7 +102,7 @@ from vllm.v1.sample.rejection_sampler import PLACEHOLDER_TOKEN_ID, RejectionSamp
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 from vllm.v1.spec_decode.ngram_proposer_gpu import copy_num_valid_draft_tokens
 from vllm.v1.structured_output.utils import apply_grammar_bitmask
-from vllm.v1.utils import record_function_or_nullcontext
+from vllm.v1.utils import CpuGpuBuffer, record_function_or_nullcontext
 from vllm.v1.worker import mamba_utils
 from vllm.v1.worker.gpu_model_runner import AsyncGPUModelRunnerOutput, GPUModelRunner
 from vllm.v1.worker.ubatch_utils import (
@@ -576,9 +576,39 @@ class NPUModelRunner(GPUModelRunner):
         # Per-request metadata consumed by the Sparse KV offload resident LRU.
         self._offload_req_ids_tensor = None
         self._offload_token_to_req = None
+        self._offload_req_topk_buffer_slots = None
+        self._offload_device_slot_mapping = None
+        self._offload_device_block_table = None
+        self._offload_seq_lengths_key = None
+        self._offload_cache_state = None
+        self._offload_cache_slots_pool = None
         if self.sparse_kv_offload_enabled:
             self._offload_req_ids_tensor = self._make_buffer(self.max_num_reqs, dtype=torch.int64)
             self._offload_token_to_req = self._make_buffer(self.max_num_tokens, dtype=torch.int32)
+            if self.sparse_kv_offload_config.fused_op_type == "nano":
+                self._offload_req_topk_buffer_slots = self._make_buffer(self.max_num_reqs, dtype=torch.int32)
+                num_speculative_tokens = self.speculative_config.num_speculative_tokens \
+                    if self.speculative_config else 0
+                num_mtp_draft_slots = max(num_speculative_tokens - 1, 0) * self.max_num_reqs
+                self._offload_device_slot_mapping = self._make_buffer(
+                    self.max_num_tokens + num_mtp_draft_slots,
+                    dtype=torch.int32,
+                )
+                tail_block_num = 2
+                max_num_blocks = cdiv(
+                    max(self.max_model_len, self.sparse_kv_offload_config.topk_buffer_size),
+                    self.block_size,
+                ) + tail_block_num
+                self._offload_device_block_table = self._make_buffer(
+                    (self.max_num_reqs, max_num_blocks),
+                    dtype=torch.int32,
+                )
+                self._offload_seq_lengths_key = self._make_buffer(self.max_num_reqs, dtype=torch.int32)
+                self._offload_cache_state = self._make_buffer(self.max_num_reqs, dtype=torch.int32)
+                self._offload_cache_slots_pool = self._make_buffer(
+                    (self.max_num_reqs, self.max_model_len),
+                    dtype=torch.int32,
+                )
 
     @property
     def use_dcp(self) -> bool:
@@ -2870,14 +2900,26 @@ class NPUModelRunner(GPUModelRunner):
         num_reqs_padded = num_reqs_padded or num_reqs
         if self.sparse_kv_offload_enabled:
             update_sparse_kv_offload_metadata(
+                self.sparse_kv_offload_config,
                 num_tokens,
                 num_reqs,
                 num_tokens_padded,
                 num_reqs_padded,
                 self.input_batch.req_ids[:num_reqs],
                 self.query_start_loc,
+                num_scheduled_tokens_np,
+                self.block_size,
+                self.decode_threshold,
+                self._positions_np_buf[:num_tokens],
+                self.optimistic_seq_lens_cpu[:num_reqs],
                 self._offload_req_ids_tensor,
                 self._offload_token_to_req,
+                self._offload_req_topk_buffer_slots,
+                self._offload_device_slot_mapping,
+                self._offload_device_block_table,
+                self._offload_seq_lengths_key,
+                self._offload_cache_state,
+                self._offload_cache_slots_pool,
             )
         attn_metadata: PerLayerAttnMetadata = {}
         if ubatch_slices is not None:
@@ -2949,6 +2991,11 @@ class NPUModelRunner(GPUModelRunner):
                     )
             return blk_table_tensor, slot_mapping
 
+        def _get_valid_meta(x: CpuGpuBuffer, valid_count: int | None = None) -> torch.Tensor | None:
+            if x is None:
+                return None
+            return x.gpu[:valid_count] if valid_count is not None else x.gpu
+
         block_table_gid_0, slot_mapping_gid_0 = _get_block_table_and_slot_mapping(0)
         self.long_seq_metadata, block_table_gid_0 = _get_dcp_metadata(block_table_gid_0)
         num_computed_tokens_cpu = self.input_batch.num_computed_tokens_cpu_tensor[
@@ -3008,6 +3055,12 @@ class NPUModelRunner(GPUModelRunner):
                 if self._offload_token_to_req is not None
                 else None
             ),
+            req_topk_buffer_slots=_get_valid_meta(self._offload_req_topk_buffer_slots, num_reqs_padded),
+            device_slot_mapping=_get_valid_meta(self._offload_device_slot_mapping, num_tokens_padded),
+            device_block_table=_get_valid_meta(self._offload_device_block_table, num_reqs_padded),
+            offload_seq_lengths_key=_get_valid_meta(self._offload_seq_lengths_key, num_reqs_padded),
+            cache_state=_get_valid_meta(self._offload_cache_state),
+            cache_slots_pool=_get_valid_meta(self._offload_cache_slots_pool),
         )
 
         if logits_indices is not None and self.cache_config.kv_sharing_fast_prefill:

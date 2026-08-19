@@ -1,4 +1,6 @@
+from collections import deque
 import contextlib
+import math
 import os
 import typing
 from zlib import adler32
@@ -79,20 +81,27 @@ def allocate_kv_offload_topk_buffer_pair(
         vllm_config.scheduler_config.max_num_batched_tokens,
         vllm_config.scheduler_config.max_num_seqs * decode_width,
     )
-    topk_buffer_k_size_bytes = max_num_topk_rows * topk_buffer_size * num_kv_heads * k_dim * torch.bfloat16.itemsize
-    topk_buffer_v_size_bytes = max_num_topk_rows * topk_buffer_size * num_kv_heads * v_dim * torch.bfloat16.itemsize
+    topk_buffer_k_shape = [max_num_topk_rows, topk_buffer_size, num_kv_heads, k_dim]
+    topk_buffer_v_shape = [max_num_topk_rows, topk_buffer_size, num_kv_heads, v_dim]
+    if sparse_kv_offload_config.fused_op_type == "nano":
+        block_size = vllm_config.cache_config.block_size
+        tail_block_num = 2
+        topk_buffer_k_shape = [max_num_topk_rows, topk_buffer_size + tail_block_num * block_size, num_kv_heads, k_dim]
+        topk_buffer_v_shape = [max_num_topk_rows, topk_buffer_size + tail_block_num * block_size, num_kv_heads, v_dim]
+    topk_buffer_k_size_bytes = math.prod(topk_buffer_k_shape) * torch.bfloat16.itemsize
+    topk_buffer_v_size_bytes = math.prod(topk_buffer_v_shape) * torch.bfloat16.itemsize
     # NOTE make sure to allocate k+v together and split them after allocate.
     # Refer to the comment in empty_aligned_int8_cpu_tensors for reason.
     topk_buffer_raw = torch.empty([topk_buffer_k_size_bytes + topk_buffer_v_size_bytes], dtype=torch.int8, device="npu")
     topk_buffer_k = (
         topk_buffer_raw[:topk_buffer_k_size_bytes]
         .view(torch.bfloat16)
-        .view([max_num_topk_rows, topk_buffer_size, num_kv_heads, k_dim])
+        .view(topk_buffer_k_shape)
     )
     topk_buffer_v = (
         topk_buffer_raw[topk_buffer_k_size_bytes : topk_buffer_k_size_bytes + topk_buffer_v_size_bytes]
         .view(torch.bfloat16)
-        .view([max_num_topk_rows, topk_buffer_size, num_kv_heads, v_dim])
+        .view(topk_buffer_v_shape)
     )
     return (topk_buffer_k, topk_buffer_v)
 
@@ -231,47 +240,6 @@ def reshape_kv_cache_tensors_for_sparse_kv_offload(
     return (k_cache, v_cache, k_cache_cpu, v_cache_cpu, topk_buffer_k, topk_buffer_v)
 
 
-def update_sparse_kv_offload_metadata(
-    num_tokens: int,
-    num_reqs: int,
-    num_tokens_padded: int,
-    num_reqs_padded: int,
-    req_ids: list[str],
-    query_start_loc: CpuGpuBuffer,
-    offload_req_ids_tensor: CpuGpuBuffer,
-    offload_token_to_req: CpuGpuBuffer,
-) -> None:
-    """Populate per-request identity tensors for the Sparse KV offload LRU.
-
-    Request ids are adler32 hashes of the scheduler request id,
-    rows are reset whenever the occupying request changes.
-    """
-    offload_req_ids_tensor.np[:num_reqs_padded].fill(0)
-    effective_num_reqs = min(num_reqs, len(req_ids))
-    req_id_values = np.asarray(
-        [
-            adler32(req_id.encode("utf-8")) if isinstance(req_id, str) else row + 1
-            for row, req_id in enumerate(req_ids[:effective_num_reqs])
-        ],
-        dtype=np.int64,
-    )
-    offload_req_ids_tensor.np[:effective_num_reqs] = req_id_values
-    offload_req_ids_tensor.copy_to_gpu(num_reqs_padded)
-
-    query_start_loc_cpu = query_start_loc.cpu[: num_reqs + 1]
-    query_lens = np.diff(query_start_loc_cpu.numpy()).astype(np.int32, copy=False)
-    token_to_req = np.repeat(np.arange(num_reqs, dtype=np.int32), query_lens)
-    if token_to_req.shape[0] < num_tokens:
-        raise RuntimeError(
-            "KV offload token_to_req metadata is shorter than the scheduled token batch: "
-            f"metadata={token_to_req.shape[0]}, tokens={num_tokens}"
-        )
-    offload_token_to_req.np[:num_tokens] = token_to_req[:num_tokens]
-    if num_tokens_padded > num_tokens:
-        offload_token_to_req.np[num_tokens:num_tokens_padded].fill(0)
-    offload_token_to_req.copy_to_gpu(num_tokens_padded)
-
-
 def prepare_sparse_kv_offload_mtp_dummy_metadata(
     num_tokens: int,
     num_reqs: int,
@@ -297,6 +265,56 @@ def prepare_sparse_kv_offload_mtp_dummy_metadata(
         req_ids_buffer.gpu[:num_reqs],
         token_to_req_buffer.gpu[:num_tokens],
     )
+
+
+class TopkBufferSlotManager:
+    """
+    A manager to allocate one request to a specific topk_buffer slot,
+    each request will stay in this allocated slot until it's finished.
+    """
+    def __init__(
+        self,
+        topk_buffer_rows: int,
+    ):
+        self.slots_pool = deque(range(topk_buffer_rows))
+        self.req2slot: dict[str, int] = {}
+
+    def _allocate_slot_for_req(self, req_id):
+        if req_id in self.req2slot:
+            return
+        if len(self.slots_pool) <= 0:
+            raise ValueError(f"No enough topk buffer slot to allocate for new req {req_id}.")
+        new_slot = self.slots_pool.popleft()
+        self.req2slot[req_id] = new_slot
+
+    def _free_slot_of_req(self, req_id: str):
+        if req_id not in self.req2slot:
+            return
+        old_slot = self.req2slot.pop(req_id)
+        self.slots_pool.append(old_slot)
+
+    def allocate_topk_buffer_slots(self, req_ids: list[str]) -> tuple[list[int], list[bool]]:
+        """
+        First free ununsed slots (for request which is finished),
+        then allocate slots for new requsts.
+        Return: slot_id of each request, and whether this request is allocated to a new slot (first decode)
+        """
+        # first free unused slots
+        req_ids_set = set(req_ids)
+        to_free_req_ids = [old_req_id for old_req_id in self.req2slot.keys() if old_req_id not in req_ids_set]
+        for to_free_req_id in to_free_req_ids:
+            self._free_slot_of_req(to_free_req_id)
+        # then allocate slots for new req
+        to_allocate_req_ids = [req_id for req_id in req_ids if req_id not in self.req2slot]
+        for to_allocate_req_id in to_allocate_req_ids:
+            self._allocate_slot_for_req(to_allocate_req_id)
+        # finally return the cached or new slot_ids of each request, and corresponding first allocate flags
+        slot_ids = []
+        first_allocate = []
+        for req_id in req_ids:
+            slot_ids.append(self.req2slot[req_id])
+            first_allocate.append(True if req_id in to_allocate_req_ids else False)
+        return slot_ids, first_allocate
 
 
 class SparseKVOffloadManager:
@@ -369,6 +387,8 @@ class SparseKVOffloadManager:
         config.scene = offload.Scene.SHARED
         assert offload.initialize(config) == 0, "Sparse KV offload offload.initialize failed."
         self.tp_group.barrier()
+
+        self.topk_buffer_slot_manager = TopkBufferSlotManager(self.max_num_reqs)
 
     def _build_cpp(self):
         os.environ["TORCH_EXTENSIONS_ALWAYS_BUILD"] = "1"
@@ -761,6 +781,9 @@ class SparseKVOffloadManager:
         self.lru_miss_position_workspace_ptr = self.lru_miss_position_workspace.data_ptr()
         self.lru_epochs_ptr = self.lru_epochs.data_ptr()
 
+    def allocate_topk_buffer_slots(self, new_req_ids: list[str]):
+        return self.topk_buffer_slot_manager.allocate_topk_buffer_slots(new_req_ids)
+
     def offload_new_kv(
         self,
         slot_mapping: torch.Tensor,
@@ -1079,3 +1102,126 @@ def init_sparse_kv_offload_manager(
 def get_sparse_kv_offload_manager():
     assert _SPARSE_KV_OFFLOAD_MANAGER is not None, "KV offload manager is not initialized."
     return _SPARSE_KV_OFFLOAD_MANAGER
+
+
+CACHE_STATE_NO_OFFLOAD = -3
+CACHE_STATE_OFFLOAD_INIT = -2
+CACHE_SLOTS_POOL_INVALID_ID = -65536
+
+
+def update_sparse_kv_offload_metadata(
+    sparse_kv_offload_config: SparseKVOffloadConfig,
+    num_tokens: int,
+    num_reqs: int,
+    num_tokens_padded: int,
+    num_reqs_padded: int,
+    req_ids: list[str],
+    query_start_loc: CpuGpuBuffer,
+    num_scheduled_tokens_np: np.array,
+    block_size: int,
+    decode_threshold: int,
+    positions_np: np.array,
+    seq_lens_cpu_tensor: torch.Tensor,
+    offload_req_ids_tensor: CpuGpuBuffer,
+    offload_token_to_req: CpuGpuBuffer,
+    offload_req_topk_buffer_slots: CpuGpuBuffer | None,
+    offload_device_slot_mapping: CpuGpuBuffer | None,
+    offload_device_block_table: CpuGpuBuffer | None,
+    offload_seq_lengths_key: CpuGpuBuffer | None,
+    offload_cache_state: CpuGpuBuffer | None,
+    offload_cache_slots_pool: CpuGpuBuffer | None,
+) -> None:
+    """Populate per-request identity tensors for the Sparse KV offload LRU.
+
+    Request ids are adler32 hashes of the scheduler request id,
+    rows are reset whenever the occupying request changes.
+    """
+    offload_req_ids_tensor.np[:num_reqs_padded].fill(0)
+    effective_num_reqs = min(num_reqs, len(req_ids))
+    req_id_values = np.asarray(
+        [
+            adler32(req_id.encode("utf-8")) if isinstance(req_id, str) else row + 1
+            for row, req_id in enumerate(req_ids[:effective_num_reqs])
+        ],
+        dtype=np.int64,
+    )
+    offload_req_ids_tensor.np[:effective_num_reqs] = req_id_values
+    offload_req_ids_tensor.copy_to_gpu(num_reqs_padded)
+
+    query_start_loc_cpu = query_start_loc.cpu[: num_reqs + 1]
+    query_lens = np.diff(query_start_loc_cpu.numpy()).astype(np.int32, copy=False)
+    token_to_req = np.repeat(np.arange(num_reqs, dtype=np.int32), query_lens)
+    if token_to_req.shape[0] < num_tokens:
+        raise RuntimeError(
+            "KV offload token_to_req metadata is shorter than the scheduled token batch: "
+            f"metadata={token_to_req.shape[0]}, tokens={num_tokens}"
+        )
+    offload_token_to_req.np[:num_tokens] = token_to_req[:num_tokens]
+    if num_tokens_padded > num_tokens:
+        offload_token_to_req.np[num_tokens:num_tokens_padded].fill(0)
+    offload_token_to_req.copy_to_gpu(num_tokens_padded)
+
+    if sparse_kv_offload_config.fused_op_type == "nano":
+        num_decode_reqs = (num_scheduled_tokens_np <= decode_threshold).sum()
+        if num_decode_reqs <= 0:
+            return
+        num_decode_tokens = num_scheduled_tokens_np[:num_decode_reqs].sum()
+        tail_block_num = 2
+
+        # req_topk_buffer_slots
+        decode_req_ids = req_ids[:num_decode_reqs]
+        topk_buffer_slots, first_allocate = get_sparse_kv_offload_manager().allocate_topk_buffer_slots(decode_req_ids)
+        offload_req_topk_buffer_slots.np[:num_decode_reqs] = np.array(topk_buffer_slots)
+        offload_req_topk_buffer_slots.copy_to_gpu()
+
+        # device_slot_mapping
+        decode_positions_np = positions_np[:num_decode_tokens]
+        topk_buffer_size = sparse_kv_offload_config.topk_buffer_size
+        offset_in_tail_blocks = decode_positions_np % (tail_block_num * block_size)
+        offset_of_topk_buffer = np.repeat(topk_buffer_size, num_decode_tokens)
+        offset_of_req = np.repeat(topk_buffer_slots, query_lens[:num_decode_reqs]) * \
+            (topk_buffer_size + tail_block_num * block_size)
+        device_slot_mapping = offset_of_req + offset_of_topk_buffer + offset_in_tail_blocks
+        offload_device_slot_mapping.np[:num_decode_tokens] = device_slot_mapping
+        offload_device_slot_mapping.copy_to_gpu()
+
+        # device_block_table
+        device_block_table_np = offload_device_block_table.np[:num_decode_reqs]
+        device_block_table_np.fill(0)
+        topk_buffer_block_num = topk_buffer_size // block_size
+        device_block_table_np[..., :topk_buffer_block_num] = \
+            np.expand_dims(np.arange(topk_buffer_block_num), axis=0).repeat(num_decode_reqs, axis=0)
+        start_positions = positions_np[query_start_loc.np[:num_decode_reqs]]
+        device_block_table_np[..., topk_buffer_block_num] = (start_positions // block_size) % tail_block_num
+        for tail_block_offset in range(1, tail_block_num):
+            device_block_table_np[..., topk_buffer_block_num + tail_block_offset] = \
+                (device_block_table_np[..., topk_buffer_block_num + tail_block_offset - 1] + 1) % tail_block_num
+        device_block_table_np[..., topk_buffer_block_num : topk_buffer_block_num + tail_block_num] += \
+            topk_buffer_block_num
+        block_offset_of_req = np.expand_dims(topk_buffer_slots, axis=1) * (topk_buffer_block_num + tail_block_num)
+        block_offset_of_req = block_offset_of_req.repeat(topk_buffer_block_num + tail_block_num, axis=1)
+        device_block_table_np[..., :topk_buffer_block_num + tail_block_num] += block_offset_of_req
+        offload_device_block_table.copy_to_gpu()
+
+        # offload_seq_lengths_key
+        total_block_num = cdiv(seq_lens_cpu_tensor[:num_decode_reqs], block_size)
+        offloaded_block_num = (total_block_num - tail_block_num).clamp(0)
+        offload_seq_lengths_key.cpu[:num_decode_reqs] = offloaded_block_num * block_size
+        offload_seq_lengths_key.copy_to_gpu()
+
+        # cache_states and cache_slots_pool
+        # NOTE Since we only need to update slots of new(first decode) requests and leave the other slots unchanged,
+        # can't call copy_to_gpu here, manually async copy the specific slot instead.
+        new_req_slot_ids = np.array(topk_buffer_slots)[first_allocate]
+        for new_req_slot_id in new_req_slot_ids:
+            offload_cache_state.cpu[new_req_slot_id] = CACHE_STATE_OFFLOAD_INIT
+            offload_cache_state.gpu[new_req_slot_id].copy_(
+                offload_cache_state.cpu[new_req_slot_id],
+                non_blocking=True,
+            )
+            offload_cache_slots_pool.cpu[new_req_slot_id][:topk_buffer_size] = -(torch.arange(topk_buffer_size) + 1)
+            offload_cache_slots_pool.cpu[new_req_slot_id][topk_buffer_size:].fill_(CACHE_SLOTS_POOL_INVALID_ID)
+            offload_cache_slots_pool.gpu[new_req_slot_id].copy_(
+                offload_cache_slots_pool.cpu[new_req_slot_id],
+                non_blocking=True,
+            )

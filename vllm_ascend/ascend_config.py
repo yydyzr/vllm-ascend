@@ -1168,6 +1168,8 @@ class SparseKVOffloadConfig:
         self.topk_buffer_size = int(user_config.get("topk_buffer_size", 4096))
         self.dram_size_per_dp_GB = int(user_config.get("dram_size_per_dp_GB", 128))
         self.keep_device_kv_cache = bool(user_config.get("keep_device_kv_cache", False))
+        self.fused_op_type = str(user_config.get("fused_op_type", "default"))
+        self.support_fused_op_types = ["default", "nano"]
 
         if hasattr(vllm_config.model_config.hf_text_config, "compress_ratios"):
             raise ValueError("Sparse KV offload don't support compress now.")
@@ -1202,6 +1204,10 @@ class SparseKVOffloadConfig:
             raise ValueError(
                 "sparse_kv_offload_config.topk_buffer_size must be >= topk, "
                 f"got topk_buffer_size={self.topk_buffer_size}, topk={self.topk}"
+            )
+        if self.fused_op_type not in self.support_fused_op_types:
+            raise ValueError(
+                f"fused op type: {self.fused_op_type} is not in supported op list: {self.support_fused_op_types}."
             )
 
 
