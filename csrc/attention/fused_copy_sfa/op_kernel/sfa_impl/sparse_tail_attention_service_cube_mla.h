@@ -12,8 +12,8 @@
  * \file sparse_tail_attention_service_cube_mla.h
  * \brief use 7 buffer for matmul l1, better pipeline
  */
-#ifndef NANOVLLM_SPARSE_TAIL_ATTENTION_SERVICE_CUBE_MLA_H
-#define NANOVLLM_SPARSE_TAIL_ATTENTION_SERVICE_CUBE_MLA_H
+#ifndef SFA_IMPL_SPARSE_TAIL_ATTENTION_SERVICE_CUBE_MLA_H
+#define SFA_IMPL_SPARSE_TAIL_ATTENTION_SERVICE_CUBE_MLA_H
 
 #include "kernel_operator.h"
 #include "kernel_operator_list_tensor_intf.h"
@@ -1080,4 +1080,4 @@ __aicore__ inline void SFAMatmulService<SFAT>::ComputeMm2(const RunInfo &info, c
     qpL1BufIter += mL1Loops;
 }
 
-#endif // NANOVLLM_SPARSE_TAIL_ATTENTION_SERVICE_CUBE_MLA_H
+#endif // SFA_IMPL_SPARSE_TAIL_ATTENTION_SERVICE_CUBE_MLA_H

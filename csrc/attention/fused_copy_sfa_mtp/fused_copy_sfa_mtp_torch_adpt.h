@@ -1,11 +1,32 @@
-#ifndef NANOVLLM_FUSED_COPY_SFA_MTP_TORCH_ADPT_H
-#define NANOVLLM_FUSED_COPY_SFA_MTP_TORCH_ADPT_H
+#ifndef FUSED_COPY_SFA_MTP_TORCH_ADPT_H
+#define FUSED_COPY_SFA_MTP_TORCH_ADPT_H
 
 namespace vllm_ascend {
 
-// MTP3 source-aware copy + causal sparse Attention in one AscendC launch.
-// HBM caches are mutated in place and the caller owns attention_out; no cache
-// aliases are exposed through the public torch.library schema.
+// MTP3 (query_len=4) fused source-aware DRAM-to-HBM copy + causal sparse
+// attention in one AscendC launch. HBM caches are mutated in place and the
+// caller owns attention_out; no cache aliases are exposed through the public
+// torch.library schema.
+//
+// Parameters:
+//   query_rope              - bf16/fp16 [B*4, N, 64],  read-only, 4-way attention query (rope part)
+//   query                   - bf16/fp16 [B*4, N, 512], read-only, 4-way attention query (nope part)
+//   actual_seq_lengths_query - int32 [B], read-only, TND cumulative query lengths, values are [4, 8, ..., B*4]
+//   actual_seq_lengths_kv   - int32 [B], read-only, final KV length for the 4th query per request
+//   num_cache_tokens        - int32 [B], read-only, HBM cache token budget C per request
+//   topk_dst_slots          - int32 [B*4, 1, 2048], read-only, 4-way top-2048 HBM logical slots
+//   topk_src_ids            - int32 [B*4, 1, 2048], read-only, 4-way top-2048 source token IDs (HBM hit positions are -1)
+//   miss_src_ids            - int32 [B, 8192], read-only, unique miss source IDs in the 4-way union (first miss_counts valid)
+//   miss_dst_slots          - int32 [B, 8192], read-only, unique miss HBM logical slots (first miss_counts valid)
+//   miss_counts             - int32 [B], read-only, unique union miss token count per request
+//   hbm_block_table         - int32 [B, HBM_MAX_BLOCKS], read-only, HBM block table
+//   dram_block_table        - int32 [B, DRAM_MAX_BLOCKS], read-only, DRAM block table
+//   hbm_k_rope              - bf16/fp16 [HBM_BLOCKS, 128, 1, 64], read-write, HBM KV cache (rope), attention input and copy dest
+//   hbm_kv_cache            - bf16/fp16 [HBM_BLOCKS, 128, 1, 512], read-write, HBM KV cache (nope), attention input and copy dest
+//   dram_k_rope             - bf16/fp16 [DRAM_BLOCKS, 128, 64], read-only, DRAM KV cache (rope), copy source
+//   dram_kv_cache           - bf16/fp16 [DRAM_BLOCKS, 128, 512], read-only, DRAM KV cache (nope), copy source
+//   scale_value             - float, read-only, attention scale
+//   attention_out           - bf16/fp16 [B*4, N, 512], write-only, 4-way causal sparse attention result
 inline void npu_fused_copy_sfa_mtp(
     const at::Tensor& query_rope,
     const at::Tensor& query,

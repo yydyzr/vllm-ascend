@@ -12,8 +12,8 @@
  * \file sparse_tail_attention_tiling.h
  * \brief
  */
-#ifndef NANOVLLM_SPARSE_TAIL_ATTENTION_TILING_H
-#define NANOVLLM_SPARSE_TAIL_ATTENTION_TILING_H
+#ifndef SPARSE_TAIL_ATTENTION_TILING_H
+#define SPARSE_TAIL_ATTENTION_TILING_H
 
 #include <sstream>
 #include <graph/utils/type_utils.h>
@@ -590,4 +590,4 @@ public:
 
 } // namespace sta
 } // namespace optiling
-#endif // NANOVLLM_SPARSE_TAIL_ATTENTION_TILING_H
+#endif // SPARSE_TAIL_ATTENTION_TILING_H

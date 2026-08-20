@@ -130,6 +130,8 @@ elif [[ "$SOC_VERSION" =~ ^ascend910b ]]; then
         "sparse_attention_score"
         "fused_li_manage_mtp"
         "fused_copy_sfa_mtp"
+        "fused_li_manage"
+        "fused_copy_sfa"
     )
 
     CUSTOM_OPS=$(IFS=';'; echo "${CUSTOM_OPS_ARRAY[*]}")
@@ -178,6 +180,8 @@ elif [[ "$SOC_VERSION" =~ ^ascend910_93 ]]; then
         "sparse_attention_score"
         "fused_li_manage_mtp"
         "fused_copy_sfa_mtp"
+        "fused_li_manage"
+        "fused_copy_sfa"
     )
     CUSTOM_OPS=$(IFS=';'; echo "${CUSTOM_OPS_ARRAY[*]}")
     SOC_ARG="ascend910_93"

@@ -849,6 +849,15 @@ def device():
     return dev
 
 
+@pytest.fixture(autouse=True)
+def _cleanup_npu_memory():
+    gc.collect()
+    torch.npu.empty_cache()
+    yield
+    gc.collect()
+    torch.npu.empty_cache()
+
+
 # ---------------------------------------------------------------------------
 # Meta check (in-place op returns None; buffers keep caller shapes/dtypes)
 # ---------------------------------------------------------------------------

@@ -1,15 +1,12 @@
-#ifndef FUSED_COPY_SFA_MTP_TILING_H
-#define FUSED_COPY_SFA_MTP_TILING_H
+#ifndef FUSED_COPY_SFA_TILING_H
+#define FUSED_COPY_SFA_TILING_H
 
 #include "../../sparse_tail_attention/op_host/sparse_tail_attention_tiling.h"
 
 namespace optiling {
 using namespace sta;
 
-// Keep the production sparse Attention payload as an exact prefix.  The
-// kernel reinterprets that prefix as SparseTailAttentionTilingDataMla
-// and consumes the suffix for source-aware DRAM gather metadata.
-BEGIN_TILING_DATA_DEF(FusedCopySfaMtpTilingData)
+BEGIN_TILING_DATA_DEF(FusedCopySfaTilingData)
 TILING_DATA_FIELD_DEF_STRUCT(SparseTailAttentionBaseParamsMla, baseParams);
 TILING_DATA_FIELD_DEF_STRUCT(SparseTailAttentionSplitKVParamsMla, splitKVParams);
 TILING_DATA_FIELD_DEF_STRUCT(SparseTailAttentionSingleCoreParamsMla, singleCoreParams);
@@ -20,10 +17,10 @@ TILING_DATA_FIELD_DEF(uint32_t, dramMaxBlockNum);
 END_TILING_DATA_DEF
 
 REGISTER_TILING_DATA_CLASS(
-    FusedCopySfaMtp,
-    FusedCopySfaMtpTilingData)
+    FusedCopySfa,
+    FusedCopySfaTilingData)
 
-struct FusedCopySfaMtpCompileInfo {
+struct FusedCopySfaCompileInfo {
 };
 
 }  // namespace optiling

@@ -12,8 +12,8 @@
  * \file sparse_tail_attention_service_vector_mla.h
  * \brief
  */
-#ifndef NANOVLLM_SPARSE_TAIL_ATTENTION_SERVICE_VECTOR_MLA_H
-#define NANOVLLM_SPARSE_TAIL_ATTENTION_SERVICE_VECTOR_MLA_H
+#ifndef SPARSE_TAIL_ATTENTION_SERVICE_VECTOR_MLA_H
+#define SPARSE_TAIL_ATTENTION_SERVICE_VECTOR_MLA_H
 
 #include "kernel_operator.h"
 #include "kernel_operator_list_tensor_intf.h"
@@ -1552,4 +1552,4 @@ SFAVectorService<SFAT>::RowMuls(LocalTensor<T> dstUb, LocalTensor<T> src0Ub, Loc
     }
 }
 
-#endif // NANOVLLM_SPARSE_TAIL_ATTENTION_SERVICE_VECTOR_MLA_H
+#endif // SPARSE_TAIL_ATTENTION_SERVICE_VECTOR_MLA_H

@@ -2,8 +2,8 @@
  * Copyright (c) 2026 Huawei Technologies Co., Ltd.
  */
 
-#ifndef NANOVLLM_FUSED_LI_MANAGE_MTP_TILING_H_
-#define NANOVLLM_FUSED_LI_MANAGE_MTP_TILING_H_
+#ifndef FUSED_LI_MANAGE_MTP_TILING_H_
+#define FUSED_LI_MANAGE_MTP_TILING_H_
 
 #include "error/ops_error.h"
 #include "exe_graph/runtime/tiling_context.h"

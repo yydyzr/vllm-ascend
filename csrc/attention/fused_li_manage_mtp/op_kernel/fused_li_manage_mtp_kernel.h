@@ -2,8 +2,8 @@
  * Copyright (c) 2026 Huawei Technologies Co., Ltd.
  */
 
-#ifndef NANOVLLM_FUSED_LI_MANAGE_MTP_KERNEL_H_
-#define NANOVLLM_FUSED_LI_MANAGE_MTP_KERNEL_H_
+#ifndef FUSED_LI_MANAGE_MTP_KERNEL_H_
+#define FUSED_LI_MANAGE_MTP_KERNEL_H_
 
 #include "kernel_operator.h"
 #include "lib/matmul_intf.h"

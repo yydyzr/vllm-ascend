@@ -1,8 +1,26 @@
-#ifndef NANOVLLM_FUSED_LI_MANAGE_MTP_TORCH_ADPT_H_
-#define NANOVLLM_FUSED_LI_MANAGE_MTP_TORCH_ADPT_H_
+#ifndef FUSED_LI_MANAGE_MTP_TORCH_ADPT_H_
+#define FUSED_LI_MANAGE_MTP_TORCH_ADPT_H_
 
 namespace vllm_ascend {
 
+// MTP3 (query_len=4) fused LightningIndexer + top-2048 union + hit/evict +
+// request-pool update. The caller pre-allocates all output buffers; the
+// operator writes in place and returns void.
+//
+// Parameters:
+//   query                - bf16/fp16 [B*4, 32, 128], read-only, 4-way MTP3 index queries
+//   index_weights        - bf16/fp16 [B*4, 32],      read-only, per-head aggregation weights for 4 queries
+//   index_key_cache      - bf16/fp16 [INDEX_BLOCKS, 128, 1, 128], read-only, index key cache
+//   index_block_table    - int32 [B, INDEX_MAX_BLOCKS], read-only, index cache block table
+//   num_candidate_tokens - int32 [B], read-only, prefill full-block token count per request
+//   num_cache_tokens     - int32 [B], read-only, HBM cache token budget C per request
+//   req_pool_entries     - int32 [B], read-only, request-pool row index per request
+//   cache_slots_pool     - int32 [POOL_SIZE, SOURCE_CAPACITY], read-write, persistent source-to-HBM slot mapping
+//   topk_src_ids         - int32 [B*4, 1, 2048], write-only, 4-way top-2048 source token IDs (HBM hit positions are -1)
+//   topk_dst_slots       - int32 [B*4, 1, 2048], write-only, 4-way top-2048 HBM logical slots
+//   miss_src_ids         - int32 [B, 8192], write-only, unique miss source IDs in the 4-way union (first miss_counts valid)
+//   miss_dst_slots       - int32 [B, 8192], write-only, unique miss HBM logical slots (first miss_counts valid)
+//   miss_counts          - int32 [B], write-only, unique union miss token count per request
 inline void npu_fused_li_manage_mtp(
     const at::Tensor& query,
     const at::Tensor& index_weights,

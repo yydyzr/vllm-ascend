@@ -191,6 +191,15 @@ def device():
     return dev
 
 
+@pytest.fixture(autouse=True)
+def _cleanup_npu_memory():
+    gc.collect()
+    torch.npu.empty_cache()
+    yield
+    gc.collect()
+    torch.npu.empty_cache()
+
+
 @pytest.mark.parametrize("batch_size,heads,source_len,cache_tokens,tail_tokens", [
     (4, 2, 20992, 8192, 64),
 ])

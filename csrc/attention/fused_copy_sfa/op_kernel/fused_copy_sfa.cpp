@@ -1,21 +1,19 @@
 #include "kernel_operator.h"
-#define C_TEMPLATE 0
-#define V_TEMPLATE 1
-#define SFA_CANONICAL_SOURCE_TILES 1
+#include "../../fused_copy_sfa/op_kernel/sfa_impl/sparse_tail_attention_template_tiling_key.h"
 
-// OPC generates only this operator's tiling class.  The fused payload has the
-// complete production SFA payload as its prefix, so expose it under the type
-// name expected by the shared SFA implementation (the same pattern used by
-// the non-MTP fused_copy_sfa kernel).
+// The fused tiling payload starts with the complete production SFA payload.
+// The source-aware gather changes live in a private kernel fork so the
+// standalone SFA baseline remains byte-identical to nano-vLLM.
 using SparseTailAttentionTilingDataMla =
-    FusedCopySfaMtpTilingData;
+    FusedCopySfaTilingData;
 
 #include "../../fused_copy_sfa/op_kernel/sfa_impl/sparse_tail_attention_kernel_mla.h"
 
 using namespace AscendC;
-namespace {
-template <typename T>
-__aicore__ inline void RunFusedMtp(
+
+template <typename T, int FLASH_DECODE, int LAYOUT_T, int KV_LAYOUT_T,
+          int TEMPLATE_MODE>
+__aicore__ inline void RunSourceAwareAttention(
     __gm__ uint8_t *query,
     __gm__ uint8_t *key,
     __gm__ uint8_t *value,
@@ -29,44 +27,39 @@ __aicore__ inline void RunFusedMtp(
     __gm__ uint8_t *dramKeyRope,
     __gm__ uint8_t *dramKvCache,
     __gm__ uint8_t *dramBlockTable,
-    __gm__ uint8_t *topkSourceIds,
-    __gm__ uint8_t *missSourceIds,
-    __gm__ uint8_t *missDestinationSlots,
-    __gm__ uint8_t *missCounts,
+    __gm__ uint8_t *sourceTokenIds,
+    __gm__ uint8_t *copyCounts,
     __gm__ uint8_t *attentionOut,
     __gm__ uint8_t *attentionWorkspace,
-    const FusedCopySfaMtpTilingData *fusedTiling,
+    const FusedCopySfaTilingData *fusedTiling,
     __gm__ uint8_t *tiling,
     TPipe *pipe)
 {
-    // The source-aware SFA path reuses each query-level DRAM gather for the
-    // persistent HBM update.  Compact union metadata remains part of the ABI
-    // for metadata/COPYSFA composition but needs no separate pre-copy pass.
-    (void)missSourceIds;
-    (void)missDestinationSlots;
-
-    using MtpType = SFAType<
-        T, T, T, false, SFA_LAYOUT::TND, SFA_LAYOUT::PA_BSND,
-        V_TEMPLATE, SFA_STAGE_NORMAL, true, true>;
-    SparseTailAttentionMla<MtpType> attention;
-    const auto *attentionTiling = reinterpret_cast<
-        const SparseTailAttentionTilingDataMla *>(fusedTiling);
-    attention.Init(
+    using FusedType = SFAType<
+        T, T, T, FLASH_DECODE,
+        static_cast<SFA_LAYOUT>(LAYOUT_T),
+        static_cast<SFA_LAYOUT>(KV_LAYOUT_T),
+        TEMPLATE_MODE, SFA_STAGE_NORMAL, true>;
+    SparseTailAttentionMla<FusedType> op;
+    const auto *attentionTiling =
+        reinterpret_cast<
+            const SparseTailAttentionTilingDataMla *>(
+                fusedTiling);
+    op.Init(
         query, key, value, sparseIndices, cacheTokens, nullptr,
         actualSeqLengthsQuery, actualSeqLengthsKv, hbmBlockTable,
         queryRope, hbmKeyRope, attentionOut,
         nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
         attentionWorkspace, attentionTiling, tiling, pipe);
-    attention.InitSourceAwareGather(
-        dramKeyRope, dramKvCache, dramBlockTable, topkSourceIds,
-        missCounts, fusedTiling->copyCap,
+    op.InitSourceAwareGather(
+        dramKeyRope, dramKvCache, dramBlockTable, sourceTokenIds,
+        copyCounts, fusedTiling->copyCap,
         fusedTiling->dramMaxBlockNum);
-    attention.Process();
+    op.Process();
 }
 
-}  // namespace
-
-extern "C" __global__ __aicore__ void fused_copy_sfa_mtp(
+template <int FLASH_DECODE, int LAYOUT_T, int KV_LAYOUT_T, int TEMPLATE_MODE>
+__global__ __aicore__ void fused_copy_sfa(
     __gm__ uint8_t *query,
     __gm__ uint8_t *key,
     __gm__ uint8_t *value,
@@ -80,43 +73,38 @@ extern "C" __global__ __aicore__ void fused_copy_sfa_mtp(
     __gm__ uint8_t *dramKeyRope,
     __gm__ uint8_t *dramKvCache,
     __gm__ uint8_t *dramBlockTable,
-    __gm__ uint8_t *topkSourceIds,
-    __gm__ uint8_t *missSourceIds,
-    __gm__ uint8_t *missDestinationSlots,
-    __gm__ uint8_t *missCounts,
+    __gm__ uint8_t *sourceTokenIds,
+    __gm__ uint8_t *copyCounts,
     __gm__ uint8_t *attentionOut,
     __gm__ uint8_t *workspace,
     __gm__ uint8_t *tiling)
 {
     KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_2);
     GET_TILING_DATA_WITH_STRUCT(
-        FusedCopySfaMtpTilingData,
+        FusedCopySfaTilingData,
         fusedTilingIn, tiling);
     const auto *fusedTiling = &fusedTilingIn;
 
     TPipe pipe;
     __gm__ uint8_t *attentionWorkspace = GetUserWorkspace(workspace);
-    if (TILING_KEY_IS(1)) {
-        if constexpr (ORIG_DTYPE_QUERY == DT_FLOAT16) {
-            RunFusedMtp<half>(
+    if constexpr (ORIG_DTYPE_QUERY == DT_FLOAT16) {
+        RunSourceAwareAttention<
+            half, FLASH_DECODE, LAYOUT_T, KV_LAYOUT_T, TEMPLATE_MODE>(
                 query, key, value, sparseIndices, cacheTokens,
                 hbmBlockTable, actualSeqLengthsQuery,
                 actualSeqLengthsKv, queryRope, hbmKeyRope,
                 dramKeyRope, dramKvCache, dramBlockTable,
-                topkSourceIds, missSourceIds, missDestinationSlots,
-                missCounts,
-                attentionOut, attentionWorkspace, fusedTiling,
-                tiling, &pipe);
-        } else {
-            RunFusedMtp<bfloat16_t>(
+                sourceTokenIds, copyCounts, attentionOut,
+                attentionWorkspace, fusedTiling, tiling, &pipe);
+    } else {
+        RunSourceAwareAttention<
+            bfloat16_t, FLASH_DECODE, LAYOUT_T, KV_LAYOUT_T,
+            TEMPLATE_MODE>(
                 query, key, value, sparseIndices, cacheTokens,
                 hbmBlockTable, actualSeqLengthsQuery,
                 actualSeqLengthsKv, queryRope, hbmKeyRope,
                 dramKeyRope, dramKvCache, dramBlockTable,
-                topkSourceIds, missSourceIds, missDestinationSlots,
-                missCounts,
-                attentionOut, attentionWorkspace, fusedTiling,
-                tiling, &pipe);
-        }
+                sourceTokenIds, copyCounts, attentionOut,
+                attentionWorkspace, fusedTiling, tiling, &pipe);
     }
 }

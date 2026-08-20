@@ -12,8 +12,8 @@
  * \file sparse_tail_attention_service_vector_mla.h
  * \brief
  */
-#ifndef NANOVLLM_SPARSE_TAIL_ATTENTION_SERVICE_VECTOR_MLA_H
-#define NANOVLLM_SPARSE_TAIL_ATTENTION_SERVICE_VECTOR_MLA_H
+#ifndef SFA_IMPL_SPARSE_TAIL_ATTENTION_SERVICE_VECTOR_MLA_H
+#define SFA_IMPL_SPARSE_TAIL_ATTENTION_SERVICE_VECTOR_MLA_H
 
 #include "kernel_operator.h"
 #include "kernel_operator_list_tensor_intf.h"
@@ -1759,7 +1759,7 @@ __aicore__ inline void SFAVectorService<SFAT>::MergeKv(const RunInfo &runInfo)
         if (virtualTileStart < runInfo.sparseTokenCount) {
             int64_t sourceTileStart = virtualTileStart;
             // MTP3 keeps canonical source tiles; qlen=1 retains staggering.
-#if !defined(NANOVLLM_SFA_CANONICAL_SOURCE_TILES)
+#if !defined(SFA_CANONICAL_SOURCE_TILES)
             if (missCount > 0) {
                 sourceTileStart = GetStaggeredSparseIndex(
                     virtualTileStart, runInfo);
@@ -2313,4 +2313,4 @@ SFAVectorService<SFAT>::RowMuls(LocalTensor<T> dstUb, LocalTensor<T> src0Ub, Loc
     }
 }
 
-#endif // NANOVLLM_SPARSE_TAIL_ATTENTION_SERVICE_VECTOR_MLA_H
+#endif // SFA_IMPL_SPARSE_TAIL_ATTENTION_SERVICE_VECTOR_MLA_H

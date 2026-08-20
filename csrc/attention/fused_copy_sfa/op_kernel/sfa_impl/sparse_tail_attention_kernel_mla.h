@@ -13,8 +13,8 @@
  * \brief
  */
 
-#ifndef NANOVLLM_SPARSE_TAIL_ATTENTION_KERNEL_MLA_H
-#define NANOVLLM_SPARSE_TAIL_ATTENTION_KERNEL_MLA_H
+#ifndef SFA_IMPL_SPARSE_TAIL_ATTENTION_KERNEL_MLA_H
+#define SFA_IMPL_SPARSE_TAIL_ATTENTION_KERNEL_MLA_H
 
 #include "kernel_operator.h"
 #include "kernel_operator_list_tensor_intf.h"
@@ -1071,4 +1071,4 @@ __aicore__ inline void SparseTailAttentionMla<SFAT>::CalcSinnerTopKBegin(RunInfo
         DealActSeqLenIsZero(info.bIdx, info.gS1Idx / constInfo.gSize, tempLoopInfo.n2Idx);
     }
 }
-#endif // NANOVLLM_SPARSE_TAIL_ATTENTION_KERNEL_MLA_H
+#endif // SFA_IMPL_SPARSE_TAIL_ATTENTION_KERNEL_MLA_H

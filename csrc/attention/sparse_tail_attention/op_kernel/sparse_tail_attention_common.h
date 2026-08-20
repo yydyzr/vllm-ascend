@@ -13,8 +13,8 @@
  * \brief
  */
 
-#ifndef NANOVLLM_SPARSE_TAIL_ATTENTION_COMMON_H
-#define NANOVLLM_SPARSE_TAIL_ATTENTION_COMMON_H
+#ifndef SPARSE_TAIL_ATTENTION_COMMON_H
+#define SPARSE_TAIL_ATTENTION_COMMON_H
 
 #include "kernel_operator.h"
 #include "lib/matmul_intf.h"
@@ -206,4 +206,4 @@ struct MSplitInfo {
     uint32_t vecDealM = 0U;
 };
 
-#endif // NANOVLLM_SPARSE_TAIL_ATTENTION_COMMON_H
+#endif // SPARSE_TAIL_ATTENTION_COMMON_H
