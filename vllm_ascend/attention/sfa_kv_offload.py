@@ -10,10 +10,13 @@ Data plane (see zsc-sfa-kv-offload-merge-plan.md):
   ``keep_device_kv_cache=True``): ``exec_kv`` writes the NPU paged main
   cache as usual, then the layer's cache rows are committed D2H
   (``cache_cpu[slot] = cache_npu[slot]``) through the manager;
-- decode: no NPU main K/V cache at all (indexer K cache only). The current
-  token's K/V is produced compute-only and committed D2H directly; top-k
-  misses are loaded H2D into the resident (topk) buffer and a single
-  resident SFA attention runs.
+- decode (``fused_op_type=default``): no NPU main K/V cache at all
+  (indexer K cache only). The current token's K/V is produced compute-only
+  and committed D2H directly; top-k misses are loaded H2D into the resident
+  (topk) buffer and a single resident SFA attention runs.
+- decode (``fused_op_type=nano``): write the current token into the two
+  HBM tail blocks of the topk buffer, then D2H from those tail slots into
+  the CPU paged pool.
 """
 
 from typing import Any, TypeVar
@@ -187,11 +190,42 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
         return PreprocessType.NATIVE
 
     @staticmethod
+    def _use_nano_fused_op() -> bool:
+        return get_ascend_config().sparse_kv_offload_config.fused_op_type == "nano"
+
+    @staticmethod
     def _cpu_cache_pair(manager, layer_name: str):
         layer_id = manager._get_offload_layer_id(layer_name)
-        if manager.tp_rank != 0:
+        # default: only TP0 allocates CPU pools. nano: non-0 ranks restore
+        # shared GVA views in register_kv_caches for fused_copy_sfa.
+        if layer_id >= len(manager.k_caches_cpu) or layer_id >= len(manager.v_caches_cpu):
             return None, None
         return manager.k_caches_cpu[layer_id], manager.v_caches_cpu[layer_id]
+
+    @staticmethod
+    def _topk_buffer_pair(manager, layer_name: str):
+        layer_id = manager._get_offload_layer_id(layer_name)
+        return manager.topk_buffers_k[layer_id], manager.topk_buffers_v[layer_id]
+
+    @staticmethod
+    def _scatter_kv_to_device_slots(
+        k_nope: torch.Tensor,
+        k_pe: torch.Tensor,
+        buffer_k: torch.Tensor,
+        buffer_v: torch.Tensor,
+        device_slots: torch.Tensor,
+    ) -> None:
+        slot_index = device_slots.reshape(-1, 1).to(dtype=torch.int64)
+        torch_npu.npu_scatter_nd_update_(
+            buffer_k.reshape(-1, k_nope.shape[-1]),
+            slot_index,
+            k_nope.reshape(-1, k_nope.shape[-1]),
+        )
+        torch_npu.npu_scatter_nd_update_(
+            buffer_v.reshape(-1, k_pe.shape[-1]),
+            slot_index,
+            k_pe.reshape(-1, k_pe.shape[-1]),
+        )
 
     @staticmethod
     def _resident_views(manager, layer_name: str, rows: int):
@@ -316,17 +350,48 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
             manager = get_sparse_kv_offload_manager()
             layer_name = self._offload_layer_name()
             k_cache_cpu, v_cache_cpu = self._cpu_cache_pair(manager, layer_name)
-            manager.offload_new_kv(
-                slot_mapping=slots,
-                k_cache_cpu=k_cache_cpu,
-                v_cache_cpu=v_cache_cpu,
-                k_cache_npu=None,
-                v_cache_npu=None,
-                k=k_nope,
-                v=k_pe,
-                has_prefill=False,
-                capturing=self._in_graph_runtime(),
-            )
+            if self._use_nano_fused_op():
+                device_slots = attn_metadata.device_slot_mapping
+                if device_slots is None:
+                    raise RuntimeError(
+                        "nano fused decode requires device_slot_mapping metadata"
+                    )
+                token_count = device_slots.numel()
+                k_nope = k_nope[:token_count]
+                k_pe = k_pe[:token_count]
+                dst_slots = slots.reshape(-1)[:token_count]
+                buffer_k, buffer_v = self._topk_buffer_pair(manager, layer_name)
+                self._scatter_kv_to_device_slots(
+                    k_nope,
+                    k_pe,
+                    buffer_k,
+                    buffer_v,
+                    device_slots,
+                )
+                manager.offload_new_kv(
+                    slot_mapping=dst_slots,
+                    k_cache_cpu=k_cache_cpu,
+                    v_cache_cpu=v_cache_cpu,
+                    k_cache_npu=buffer_k,
+                    v_cache_npu=buffer_v,
+                    k=None,
+                    v=None,
+                    has_prefill=False,
+                    capturing=self._in_graph_runtime(),
+                    src_slot_mapping=device_slots,
+                )
+            else:
+                manager.offload_new_kv(
+                    slot_mapping=slots,
+                    k_cache_cpu=k_cache_cpu,
+                    v_cache_cpu=v_cache_cpu,
+                    k_cache_npu=None,
+                    v_cache_npu=None,
+                    k=k_nope,
+                    v=k_pe,
+                    has_prefill=False,
+                    capturing=self._in_graph_runtime(),
+                )
             return k_pe, k_nope
 
         # Prefill / mixed batch (colocate debug only): stage in the NPU paged

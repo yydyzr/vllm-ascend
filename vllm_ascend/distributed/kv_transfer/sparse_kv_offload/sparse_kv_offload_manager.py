@@ -478,6 +478,29 @@ class SparseKVOffloadManager:
             )
         return layer_id
 
+    def _use_nano_fused_op(self) -> bool:
+        return self.sparse_kv_offload_config.fused_op_type == "nano"
+
+    def _restore_bfloat16_tensor(self, ptr: int, shape: list[int]) -> torch.Tensor:
+        view = self.sparse_kv_offload_cpp.restore_bfloat16_tensor(ptr, shape)
+        if int(view.data_ptr()) != int(ptr):
+            raise RuntimeError(
+                "restore_bfloat16_tensor returned a tensor with unexpected data_ptr: "
+                f"expected={ptr}, got={view.data_ptr()}"
+            )
+        if list(view.shape) != list(shape):
+            raise RuntimeError(
+                "restore_bfloat16_tensor returned unexpected shape: "
+                f"expected={shape}, got={list(view.shape)}"
+            )
+        if view.dtype != torch.bfloat16:
+            raise RuntimeError(
+                f"restore_bfloat16_tensor returned unexpected dtype: {view.dtype}"
+            )
+        if not view.is_contiguous():
+            raise RuntimeError("restore_bfloat16_tensor requires a contiguous view")
+        return view
+
     def register_kv_caches(
         self,
         kv_caches: dict[str, torch.Tensor],
@@ -557,9 +580,13 @@ class SparseKVOffloadManager:
         self.gvas_k_bases: list[int] = []
         self.gvas_v_bases: list[int] = []
         self.cpu_block_lens: list[tuple[int, int]] = []
+        use_nano = self._use_nano_fused_op()
         gvas_k_tensor = torch.zeros([self.num_layers], dtype=torch.int64, device="npu")
         gvas_v_tensor = torch.zeros([self.num_layers], dtype=torch.int64, device="npu")
         cpu_block_lens_tensor = torch.zeros([self.num_layers, 2], dtype=torch.int64, device="npu")
+        # MLA CPU pools are always 4D: [num_blocks, block_size, num_kv_heads, head_dim].
+        shape_k_tensor = torch.zeros([4], dtype=torch.int64, device="npu")
+        shape_v_tensor = torch.zeros([4], dtype=torch.int64, device="npu")
         if self.tp_rank == 0:
             for layer_id in range(self.num_layers):
                 k_cpu = self.k_caches_cpu[layer_id]
@@ -572,9 +599,29 @@ class SparseKVOffloadManager:
                 cpu_block_lens_tensor[layer_id, 1] = (
                     v_cpu.numel() * v_cpu.element_size() // self.kv_cache_config.num_blocks
                 )
+            if use_nano:
+                if len(self.k_caches_cpu[0].shape) != 4:
+                    raise RuntimeError(
+                        "Sparse KV offload nano restore expects a 4D CPU K cache, "
+                        f"got shape={tuple(self.k_caches_cpu[0].shape)}"
+                    )
+                if len(self.v_caches_cpu[0].shape) != 4:
+                    raise RuntimeError(
+                        "Sparse KV offload nano restore expects a 4D CPU V cache, "
+                        f"got shape={tuple(self.v_caches_cpu[0].shape)}"
+                    )
+                shape_k_tensor.copy_(
+                    torch.tensor(self.k_caches_cpu[0].shape, dtype=torch.int64, device="npu")
+                )
+                shape_v_tensor.copy_(
+                    torch.tensor(self.v_caches_cpu[0].shape, dtype=torch.int64, device="npu")
+                )
         self.tp_group.broadcast(gvas_k_tensor, src=0)
         self.tp_group.broadcast(gvas_v_tensor, src=0)
         self.tp_group.broadcast(cpu_block_lens_tensor, src=0)
+        if use_nano:
+            self.tp_group.broadcast(shape_k_tensor, src=0)
+            self.tp_group.broadcast(shape_v_tensor, src=0)
         for layer_id in range(self.num_layers):
             self.gvas_k_bases.append(gvas_k_tensor[layer_id].item())
             self.gvas_v_bases.append(gvas_v_tensor[layer_id].item())
@@ -583,6 +630,36 @@ class SparseKVOffloadManager:
                     cpu_block_lens_tensor[layer_id, 0].item(),
                     cpu_block_lens_tensor[layer_id, 1].item(),
                 )
+            )
+
+        # fused_copy_sfa needs a DRAM tensor on every TP rank. TP0 owns the
+        # shared host pool; other ranks only wrap the broadcast GVA.
+        if use_nano and self.tp_rank != 0:
+            cpu_k_shape = [int(x) for x in shape_k_tensor.tolist()]
+            cpu_v_shape = [int(x) for x in shape_v_tensor.tolist()]
+            if any(dim <= 0 for dim in cpu_k_shape + cpu_v_shape):
+                raise RuntimeError(
+                    "Sparse KV offload nano restore received invalid CPU cache "
+                    f"shapes: k={cpu_k_shape}, v={cpu_v_shape}"
+                )
+            if any(ptr == 0 for ptr in self.gvas_k_bases + self.gvas_v_bases):
+                raise RuntimeError(
+                    "Sparse KV offload nano restore received a zero GVA pointer "
+                    f"on tp_rank={self.tp_rank}"
+                )
+            self.k_caches_cpu = [
+                self._restore_bfloat16_tensor(ptr, cpu_k_shape) for ptr in self.gvas_k_bases
+            ]
+            self.v_caches_cpu = [
+                self._restore_bfloat16_tensor(ptr, cpu_v_shape) for ptr in self.gvas_v_bases
+            ]
+            logger.info(
+                "Sparse KV offload restored shared CPU KV views on tp_rank=%s "
+                "layer_count=%s k_shape=%s v_shape=%s",
+                self.tp_rank,
+                self.num_layers,
+                cpu_k_shape,
+                cpu_v_shape,
             )
 
         gvas_buffer_offset = 0
@@ -789,12 +866,13 @@ class SparseKVOffloadManager:
         slot_mapping: torch.Tensor,
         k_cache_cpu: torch.Tensor | None,
         v_cache_cpu: torch.Tensor | None,
-        k_cache_npu: torch.Tensor | None,  # prefill (colocate debug only): cache_npu[slot] -> cache_cpu[slot]
-        v_cache_npu: torch.Tensor | None,  # prefill (colocate debug only): cache_npu[slot] -> cache_cpu[slot]
-        k: torch.Tensor | None,  # decode: k/v -> cache_cpu[slot]
-        v: torch.Tensor | None,  # decode: k/v -> cache_cpu[slot]
+        k_cache_npu: torch.Tensor | None,  # NPU source cache: cache_npu[src_slot] -> cache_cpu[dst_slot]
+        v_cache_npu: torch.Tensor | None,
+        k: torch.Tensor | None,  # legacy decode: k/v rows -> cache_cpu[slot]
+        v: torch.Tensor | None,
         has_prefill: bool = False,
         capturing: bool = False,
+        src_slot_mapping: torch.Tensor | None = None,
     ) -> None:
         # the has_prefill path (NPU paged cache -> CPU pool D2H) only exists
         # for single-node PD-colocate debug.
@@ -812,17 +890,27 @@ class SparseKVOffloadManager:
                 "never stages prefill KV in an NPU paged cache"
             )
 
-        if has_prefill:
+        copy_from_npu_cache = has_prefill or src_slot_mapping is not None
+        if copy_from_npu_cache:
             if k_cache_npu is None or v_cache_npu is None:
-                raise ValueError("prefill offload requires NPU paged K/V caches")
+                raise ValueError("NPU-cache D2H requires K/V device caches")
             device = k_cache_npu.device
         else:
             if k is None or v is None:
                 raise ValueError("decode offload requires current-token K/V")
             device = k.device
 
-        slots = slot_mapping.reshape(-1).to(device=device, dtype=torch.int64)
-        token_count = slots.numel()
+        dst_slots = slot_mapping.reshape(-1).to(device=device, dtype=torch.int64)
+        token_count = dst_slots.numel()
+        if src_slot_mapping is not None:
+            src_slots = src_slot_mapping.reshape(-1).to(device=device, dtype=torch.int64)
+            if src_slots.numel() != token_count:
+                raise ValueError(
+                    "src_slot_mapping and slot_mapping must have the same length, "
+                    f"got src={src_slots.numel()}, dst={token_count}"
+                )
+        else:
+            src_slots = dst_slots
         if token_count > self.max_num_tokens:
             raise ValueError(
                 "Sparse KV offload rows exceed D2H descriptor capacity, "
@@ -835,13 +923,23 @@ class SparseKVOffloadManager:
             raise ValueError(
                 f"Sparse KV offload CPU K/V pools have incompatible token capacities: k={num_k_slots}, v={num_v_slots}"
             )
-        valid = (slots >= 0) & (slots < num_k_slots)
-        safe_slots = slots.clamp(min=0, max=num_k_slots - 1)
+        dst_valid = (dst_slots >= 0) & (dst_slots < num_k_slots)
+        safe_dst_slots = dst_slots.clamp(min=0, max=num_k_slots - 1)
 
-        if has_prefill:
+        if copy_from_npu_cache:
             assert k_cache_npu is not None and v_cache_npu is not None
-            src_k = int(k_cache_npu.data_ptr()) + safe_slots * self.token_size_bytes_k
-            src_v = int(v_cache_npu.data_ptr()) + safe_slots * self.token_size_bytes_v
+            num_src_k_slots = k_cache_npu.numel() * k_cache_npu.element_size() // self.token_size_bytes_k
+            num_src_v_slots = v_cache_npu.numel() * v_cache_npu.element_size() // self.token_size_bytes_v
+            if num_src_k_slots != num_src_v_slots or num_src_k_slots <= 0:
+                raise ValueError(
+                    "Sparse KV offload NPU K/V caches have incompatible token "
+                    f"capacities: k={num_src_k_slots}, v={num_src_v_slots}"
+                )
+            src_valid = (src_slots >= 0) & (src_slots < num_src_k_slots)
+            valid = dst_valid & src_valid
+            safe_src_slots = src_slots.clamp(min=0, max=num_src_k_slots - 1)
+            src_k = int(k_cache_npu.data_ptr()) + safe_src_slots * self.token_size_bytes_k
+            src_v = int(v_cache_npu.data_ptr()) + safe_src_slots * self.token_size_bytes_v
         else:
             assert k is not None and v is not None
             k_rows = k.reshape(-1, self.token_size_bytes_k // k.element_size())
@@ -853,11 +951,12 @@ class SparseKVOffloadManager:
             if not v_rows.is_contiguous():
                 v_rows = v_rows.contiguous()
             token_indices = self.d2h_token_indices_npu[:token_count]
+            valid = dst_valid
             src_k = int(k_rows.data_ptr()) + token_indices * self.token_size_bytes_k
             src_v = int(v_rows.data_ptr()) + token_indices * self.token_size_bytes_v
 
-        dst_k = int(k_cache_cpu.data_ptr()) + safe_slots * self.token_size_bytes_k
-        dst_v = int(v_cache_cpu.data_ptr()) + safe_slots * self.token_size_bytes_v
+        dst_k = int(k_cache_cpu.data_ptr()) + safe_dst_slots * self.token_size_bytes_k
+        dst_v = int(v_cache_cpu.data_ptr()) + safe_dst_slots * self.token_size_bytes_v
         self.d2h_src_ptrs_npu[:token_count].copy_(src_k)
         self.d2h_src_ptrs_npu[token_count : 2 * token_count].copy_(src_v)
         self.d2h_dst_ptrs_npu[:token_count].copy_(dst_k)
