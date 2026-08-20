@@ -605,8 +605,10 @@ class NPUModelRunner(GPUModelRunner):
                 )
                 self._offload_seq_lengths_key = self._make_buffer(self.max_num_reqs, dtype=torch.int32)
                 self._offload_cache_state = self._make_buffer(self.max_num_reqs, dtype=torch.int32)
+                # LIM requires cache_slots_pool.width == index_block_table.cols * block_size.
+                slots_width = cdiv(self.max_model_len, self.block_size) * self.block_size
                 self._offload_cache_slots_pool = self._make_buffer(
-                    (self.max_num_reqs, self.max_model_len),
+                    (self.max_num_reqs, slots_width),
                     dtype=torch.int32,
                 )
 

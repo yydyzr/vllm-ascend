@@ -16,7 +16,8 @@ Data plane (see zsc-sfa-kv-offload-merge-plan.md):
   (topk) buffer and a single resident SFA attention runs.
 - decode (``fused_op_type=nano``): write the current token into the two
   HBM tail blocks of the topk buffer, then D2H from those tail slots into
-  the CPU paged pool.
+  the CPU paged pool; decode attention uses ``fused_li_manage`` +
+  ``fused_copy_sfa`` (``torch.ops._C_ascend``).
 """
 
 from typing import Any, TypeVar
@@ -29,6 +30,7 @@ from vllm.forward_context import (
     is_forward_context_available,
 )
 from vllm.logger import logger
+from vllm.triton_utils import HAS_TRITON
 
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
@@ -47,7 +49,10 @@ from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.sparse_kv_offload_manager import (
     get_sparse_kv_offload_manager,
 )
+from vllm_ascend.ops.triton.rope import rope_forward_triton_siso
 from vllm_ascend.utils import enable_dsa_cp
+
+NANO_FUSED_TOPK = 2048
 
 M = TypeVar("M", bound=AscendSFAMetadata)
 
@@ -336,6 +341,222 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
         )
         return k_nope, k_pe
 
+    def _pd_decode_consumer(self) -> bool:
+        # Prefix topk fill is for PD-disaggregated decode only; colocate/mixed
+        # first-decode init is intentionally out of scope for now.
+        return bool(self.is_kv_consumer and not self.is_kv_producer)
+
+    def _maybe_nano_prefix_init(
+        self,
+        attn_metadata: M,
+        manager,
+        layer_name: str,
+    ) -> None:
+        if not manager.has_nano_init_step():
+            return
+        if not self._pd_decode_consumer():
+            return
+        if self._in_graph_runtime():
+            raise RuntimeError(
+                "nano PD first-decode topk-buffer prefix init must remain eager"
+            )
+        num_decodes = int(attn_metadata.num_decodes or 0)
+        if (
+            attn_metadata.cache_slots_pool is None
+            or attn_metadata.offload_seq_lengths_key is None
+        ):
+            raise RuntimeError(
+                "nano prefix init requires cache_slots_pool and offload_seq_lengths_key"
+            )
+        manager.initialize_nano_prefix_topk_buffer(
+            layer_name=layer_name,
+            block_table=attn_metadata.block_table[:num_decodes],
+            cache_slots_pool=attn_metadata.cache_slots_pool,
+            cache_state=attn_metadata.cache_state,
+            offload_seq_lengths_key=attn_metadata.offload_seq_lengths_key[:num_decodes],
+            write_slots=not self.skip_topk,
+        )
+
+    def indexer_select_post_process(
+        self,
+        x: torch.Tensor,
+        q_c: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
+        kv_cache: tuple[torch.Tensor, ...],
+        attn_metadata: M,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        actual_seq_lengths_query: torch.Tensor,
+        actual_seq_lengths_key: torch.Tensor,
+    ):
+        if not (self._use_nano_fused_op() and self._is_decode_only(attn_metadata)):
+            return super().indexer_select_post_process(
+                x,
+                q_c,
+                kv_cache,
+                attn_metadata,
+                cos,
+                sin,
+                actual_seq_lengths_query,
+                actual_seq_lengths_key,
+            )
+        return self._nano_fused_li_manage(
+            x,
+            q_c,
+            kv_cache,
+            attn_metadata,
+            cos,
+            sin,
+            actual_seq_lengths_key,
+        )
+
+    def _nano_fused_li_manage(
+        self,
+        x: torch.Tensor,
+        q_c: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
+        kv_cache: tuple[torch.Tensor, ...],
+        attn_metadata: M,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        actual_seq_lengths_key: torch.Tensor,
+    ) -> torch.Tensor:
+        if not self.has_indexer:
+            raise RuntimeError(
+                f"nano fused_li_manage requires an indexer. layer_name={self.layer_name}."
+            )
+        if self.enable_sparse_li_c8:
+            raise NotImplementedError("nano fused_li_manage does not support sparse LI C8")
+        assert self.wk_weights_proj is not None
+        assert self.wq_b is not None
+
+        num_decodes = int(attn_metadata.num_decodes or 0)
+        num_decode_tokens = int(attn_metadata.num_decode_tokens or 0)
+        if num_decodes <= 0:
+            raise RuntimeError("nano fused_li_manage requires decode requests")
+        if num_decode_tokens != num_decodes:
+            raise NotImplementedError(
+                "nano fused_li_manage does not support MTP multi-token decode yet "
+                f"(num_decode_tokens={num_decode_tokens}, num_decodes={num_decodes})"
+            )
+        if attn_metadata.req_topk_buffer_slots is None:
+            raise RuntimeError("nano fused_li_manage requires req_topk_buffer_slots")
+        if attn_metadata.cache_slots_pool is None:
+            raise RuntimeError("nano fused_li_manage requires cache_slots_pool")
+        if attn_metadata.offload_seq_lengths_key is None:
+            raise RuntimeError("nano fused_li_manage requires offload_seq_lengths_key")
+
+        manager = get_sparse_kv_offload_manager()
+        layer_name = self._offload_layer_name()
+        self._maybe_nano_prefix_init(attn_metadata, manager, layer_name)
+
+        kw, _ = self.wk_weights_proj(x)
+        weights = kw[:, self.head_dim :]
+        if isinstance(q_c, tuple):
+            q_c_tensor, q_c_scale = q_c
+            q_c_tensor = q_c_tensor.view(-1, q_c_tensor.shape[-1])
+            quant_matmul_kwargs = dict(
+                bias=None,
+                output_dtype=x.dtype,
+            )
+            if q_c_tensor.dtype == torch.float8_e4m3fn:
+                if q_c_scale.dim() == 2:
+                    q_c_scale = q_c_scale.view(q_c_scale.shape[0], -1, 2)
+                quant_matmul_kwargs.update(
+                    scale_dtype=torch_npu.float8_e8m0fnu,
+                    pertoken_scale_dtype=torch_npu.float8_e8m0fnu,
+                    group_sizes=[1, 1, getattr(self.wq_b.quant_method.quant_method, "group_size", 32)],
+                )
+            elif q_c_scale.dim() > 1 and q_c_scale.shape[-1] == 1:
+                q_c_scale = q_c_scale.squeeze(dim=-1)
+            q_li = torch_npu.npu_quant_matmul(
+                q_c_tensor,
+                self.wq_b.weight,
+                self.wq_b.weight_scale,
+                pertoken_scale=q_c_scale,
+                **quant_matmul_kwargs,
+            )
+        else:
+            q_li, _ = self.wq_b(q_c)
+        q_li = q_li.view(-1, self.n_head, self.head_dim)
+        if HAS_TRITON:
+            q_li = rope_forward_triton_siso(
+                q_li, cos, sin, rope_dim=self.qk_rope_head_dim, is_neox_style=self.is_rope_neox_style
+            )
+        else:
+            q_li_pe, q_li_nope = torch.split(
+                q_li, [self.qk_rope_head_dim, self.head_dim - self.qk_rope_head_dim], dim=-1
+            )
+            q_li_pe = q_li_pe.unsqueeze(2)
+            q_li_pe = torch_npu.npu_rotary_mul(q_li_pe, cos, sin)
+            q_li_pe = q_li_pe.squeeze(2)
+            q_li = torch.cat([q_li_pe, q_li_nope], dim=-1)
+
+        q_li = q_li[:num_decodes]
+        weights = weights[:num_decodes]
+        if q_li.shape[1] not in (32, 64):
+            raise RuntimeError(
+                f"nano fused_li_manage expects 32 or 64 index heads, got {q_li.shape[1]}"
+            )
+        if q_li.shape[-1] != 128:
+            raise RuntimeError(
+                f"nano fused_li_manage expects head_dim=128, got {q_li.shape[-1]}"
+            )
+
+        topk_src_ids, topk_dst_slots, miss_counts = manager.get_lim_output_buffers(num_decodes)
+
+        index_key = kv_cache[self.kv_cache_indexer_k_idx]
+        block_size = manager.block_size
+        # LIM requires [blocks, 128, 1, 128].
+        if index_key.ndim == 4 and index_key.size(1) == block_size and index_key.size(2) == 1:
+            index_key_cache = index_key
+        else:
+            index_key_cache = index_key.view(-1, block_size, 1, self.head_dim)
+
+        block_table = attn_metadata.block_table[:num_decodes]
+        expected_slots_width = block_table.size(1) * block_size
+        cache_slots_pool = attn_metadata.cache_slots_pool
+        if cache_slots_pool.size(1) != expected_slots_width:
+            raise RuntimeError(
+                "cache_slots_pool width must equal block_table_cols * block_size for LIM, "
+                f"got pool={cache_slots_pool.size(1)}, expected={expected_slots_width}"
+            )
+
+        # Candidates = fully offloaded blocks only; dense tail is attended by SFA.
+        num_candidate_tokens = attn_metadata.offload_seq_lengths_key[:num_decodes].to(
+            dtype=torch.int32
+        )
+        num_cache_tokens = manager.lim_num_cache_tokens[:num_decodes]
+        req_pool_entries = attn_metadata.req_topk_buffer_slots[:num_decodes].to(dtype=torch.int32)
+
+        if not cache_slots_pool.is_contiguous():
+            raise RuntimeError("cache_slots_pool must be contiguous for in-place LIM updates")
+        if not block_table.is_contiguous():
+            block_table = block_table.contiguous()
+        if not num_candidate_tokens.is_contiguous():
+            num_candidate_tokens = num_candidate_tokens.contiguous()
+        if not req_pool_entries.is_contiguous():
+            req_pool_entries = req_pool_entries.contiguous()
+        if not index_key_cache.is_contiguous():
+            index_key_cache = index_key_cache.contiguous()
+
+        torch.ops._C_ascend.fused_li_manage(
+            q_li.contiguous(),
+            weights.contiguous(),
+            index_key_cache,
+            block_table,
+            num_candidate_tokens,
+            num_cache_tokens,
+            req_pool_entries,
+            cache_slots_pool,
+            topk_src_ids,
+            topk_dst_slots,
+            miss_counts,
+        )
+        manager.mark_lim_outputs_ready(num_decodes)
+
+        # IndexShare / skip_topk consumers reuse topk_indices_buffer.
+        # Shape matches lightning_indexer: [T, 1, topk].
+        return topk_src_ids
+
     def exec_kv(
         self,
         kv_no_split: torch.Tensor,
@@ -446,6 +667,36 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
                 block_table=block_table,
             )
 
+        if self._use_nano_fused_op():
+            decode_attn_output = self._nano_fused_copy_sfa(
+                ql_nope=ql_nope,
+                q_pe=q_pe,
+                attn_metadata=attn_metadata,
+                actual_seq_lengths_key=actual_seq_lengths_key,
+                manager=manager,
+                layer_name=layer_name,
+                num_decodes=num_decodes,
+                num_decode_tokens=num_decode_tokens,
+            )
+            if num_prefills == 0:
+                return self._pad_to_input_tokens(decode_attn_output, ql_nope.shape[0])
+            _check_device_kv_cache_exist()
+            prefill_query_offset = actual_seq_lengths_query[num_decodes - 1]
+            prefill_query_lens = actual_seq_lengths_query[num_decodes:] - prefill_query_offset
+            prefill_block_table = attn_metadata.block_table[num_decodes : num_decodes + num_prefills]
+            prefill_attn_output = super()._execute_sparse_flash_attention_process(
+                ql_nope[num_decode_tokens:],
+                q_pe[num_decode_tokens:],
+                kv_cache,
+                topk_indices[num_decode_tokens:],
+                attn_metadata,
+                prefill_query_lens,
+                actual_seq_lengths_key[num_decodes:],
+                block_table=prefill_block_table,
+            )
+            attn_output = torch.cat([decode_attn_output, prefill_attn_output], dim=0)
+            return self._pad_to_input_tokens(attn_output, ql_nope.shape[0])
+
         if attn_metadata.req_ids_tensor is None or attn_metadata.token_to_req is None:
             raise RuntimeError("Sparse KV offload requires req_ids_tensor/token_to_req metadata")
         token_to_req = attn_metadata.token_to_req[:num_decode_tokens]
@@ -541,3 +792,93 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
         )
         attn_output = torch.cat([decode_attn_output, prefill_attn_output], dim=0)
         return self._pad_to_input_tokens(attn_output, ql_nope.shape[0])
+
+    def _nano_fused_copy_sfa(
+        self,
+        *,
+        ql_nope: torch.Tensor,
+        q_pe: torch.Tensor,
+        attn_metadata: M,
+        actual_seq_lengths_key: torch.Tensor,
+        manager,
+        layer_name: str,
+        num_decodes: int,
+        num_decode_tokens: int,
+    ) -> torch.Tensor:
+        if num_decode_tokens != num_decodes:
+            raise NotImplementedError(
+                "nano fused_copy_sfa does not support MTP multi-token decode yet "
+                f"(num_decode_tokens={num_decode_tokens}, num_decodes={num_decodes})"
+            )
+        if attn_metadata.device_block_table is None:
+            raise RuntimeError("nano fused_copy_sfa requires device_block_table")
+        if attn_metadata.offload_seq_lengths_key is None:
+            raise RuntimeError("nano fused_copy_sfa requires offload_seq_lengths_key")
+
+        # skip_topk shared layers never enter LIM; still need per-layer H2D fill.
+        self._maybe_nano_prefix_init(attn_metadata, manager, layer_name)
+
+        if self.skip_topk:
+            topk_src_ids, topk_dst_slots, miss_counts = manager.require_lim_outputs(num_decodes)
+        else:
+            topk_src_ids, topk_dst_slots, miss_counts = manager.get_lim_output_buffers(num_decodes)
+            if manager._last_lim_batch_size < num_decodes:
+                raise RuntimeError(
+                    "nano fused_copy_sfa expected fused_li_manage outputs for "
+                    f"batch_size={num_decodes}"
+                )
+
+        q = ql_nope[:num_decode_tokens]
+        q_rope = q_pe[:num_decode_tokens]
+        if q.ndim != 3 or q.size(-1) != self.kv_lora_rank:
+            raise RuntimeError(
+                f"nano fused_copy_sfa expects ql_nope [B,N,{self.kv_lora_rank}], got {tuple(q.shape)}"
+            )
+        if q_rope.ndim != 3 or q_rope.size(-1) != self.qk_rope_head_dim:
+            raise RuntimeError(
+                f"nano fused_copy_sfa expects q_pe [B,N,{self.qk_rope_head_dim}], got {tuple(q_rope.shape)}"
+            )
+
+        # HBM: buffer_k = CKV (kv_lora), buffer_v = KPE (rope)
+        hbm_kv_cache, hbm_k_rope = manager.hbm_kv_pair_for_fused(layer_name)
+        # DRAM: k_cpu = CKV, v_cpu = KPE
+        dram_kv_cache, dram_k_rope = manager.dram_kv_pair_for_fused(layer_name)
+
+        # Adapter requires DRAM tensors on the same NPU device as query.
+        # Shared GVA views restored as CPU must be NPU-tagged host tensors once
+        # the custom op is installed; fail clearly until then.
+        if dram_kv_cache.device != q.device or dram_k_rope.device != q.device:
+            raise RuntimeError(
+                "nano fused_copy_sfa requires DRAM KV tensors on the query NPU device "
+                f"(got dram_ckv={dram_kv_cache.device}, query={q.device}). "
+                "Provide NPU-visible host/swapped views of the shared GVA when "
+                "registering fused_copy_sfa under torch.ops._C_ascend."
+            )
+
+        offload_lens = attn_metadata.offload_seq_lengths_key[:num_decodes].to(dtype=torch.int32)
+        seq_lens = actual_seq_lengths_key[:num_decodes].to(dtype=torch.int32)
+        tail_lens = (seq_lens - offload_lens).clamp_min(0)
+        actual_seq_lengths_kv = manager.lim_num_cache_tokens[:num_decodes] + tail_lens
+        actual_seq_lengths_query = manager.lim_query_lens[:num_decodes]
+        num_cache_tokens = manager.lim_num_cache_tokens[:num_decodes]
+
+        attention_out = manager.get_fused_attention_out(q)
+        torch.ops._C_ascend.fused_copy_sfa(
+            q_rope.contiguous(),
+            q.contiguous(),
+            actual_seq_lengths_query.contiguous(),
+            actual_seq_lengths_kv.contiguous(),
+            num_cache_tokens.contiguous(),
+            topk_dst_slots,
+            topk_src_ids.view(num_decodes, NANO_FUSED_TOPK),
+            miss_counts,
+            attn_metadata.device_block_table[:num_decodes].contiguous(),
+            attn_metadata.block_table[:num_decodes].contiguous(),
+            hbm_k_rope,
+            hbm_kv_cache,
+            dram_k_rope,
+            dram_kv_cache,
+            float(self.scale),
+            attention_out,
+        )
+        return attention_out

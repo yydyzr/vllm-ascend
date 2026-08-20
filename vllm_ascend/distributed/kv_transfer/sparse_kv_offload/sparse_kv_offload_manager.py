@@ -481,8 +481,20 @@ class SparseKVOffloadManager:
     def _use_nano_fused_op(self) -> bool:
         return self.sparse_kv_offload_config.fused_op_type == "nano"
 
-    def _restore_bfloat16_tensor(self, ptr: int, shape: list[int]) -> torch.Tensor:
-        view = self.sparse_kv_offload_cpp.restore_bfloat16_tensor(ptr, shape)
+    def _restore_bfloat16_tensor(
+        self,
+        ptr: int,
+        shape: list[int],
+        *,
+        as_privateuse1: bool = False,
+    ) -> torch.Tensor:
+        device_index = int(torch_npu.npu.current_device()) if as_privateuse1 else 0
+        view = self.sparse_kv_offload_cpp.restore_bfloat16_tensor(
+            ptr,
+            shape,
+            as_privateuse1,
+            device_index,
+        )
         if int(view.data_ptr()) != int(ptr):
             raise RuntimeError(
                 "restore_bfloat16_tensor returned a tensor with unexpected data_ptr: "
@@ -634,33 +646,56 @@ class SparseKVOffloadManager:
 
         # fused_copy_sfa needs a DRAM tensor on every TP rank. TP0 owns the
         # shared host pool; other ranks only wrap the broadcast GVA.
-        if use_nano and self.tp_rank != 0:
-            cpu_k_shape = [int(x) for x in shape_k_tensor.tolist()]
-            cpu_v_shape = [int(x) for x in shape_v_tensor.tolist()]
-            if any(dim <= 0 for dim in cpu_k_shape + cpu_v_shape):
-                raise RuntimeError(
-                    "Sparse KV offload nano restore received invalid CPU cache "
-                    f"shapes: k={cpu_k_shape}, v={cpu_v_shape}"
+        # Additionally build NPU-tagged views of the same GVA for fused_copy_sfa
+        # device checks (D2H still uses the CPU-tagged owner/view via data_ptr).
+        self.k_caches_dram: list[torch.Tensor] = []
+        self.v_caches_dram: list[torch.Tensor] = []
+        if use_nano:
+            if self.tp_rank != 0:
+                cpu_k_shape = [int(x) for x in shape_k_tensor.tolist()]
+                cpu_v_shape = [int(x) for x in shape_v_tensor.tolist()]
+                if any(dim <= 0 for dim in cpu_k_shape + cpu_v_shape):
+                    raise RuntimeError(
+                        "Sparse KV offload nano restore received invalid CPU cache "
+                        f"shapes: k={cpu_k_shape}, v={cpu_v_shape}"
+                    )
+                if any(ptr == 0 for ptr in self.gvas_k_bases + self.gvas_v_bases):
+                    raise RuntimeError(
+                        "Sparse KV offload nano restore received a zero GVA pointer "
+                        f"on tp_rank={self.tp_rank}"
+                    )
+                self.k_caches_cpu = [
+                    self._restore_bfloat16_tensor(ptr, cpu_k_shape) for ptr in self.gvas_k_bases
+                ]
+                self.v_caches_cpu = [
+                    self._restore_bfloat16_tensor(ptr, cpu_v_shape) for ptr in self.gvas_v_bases
+                ]
+                logger.info(
+                    "Sparse KV offload restored shared CPU KV views on tp_rank=%s "
+                    "layer_count=%s k_shape=%s v_shape=%s",
+                    self.tp_rank,
+                    self.num_layers,
+                    cpu_k_shape,
+                    cpu_v_shape,
                 )
-            if any(ptr == 0 for ptr in self.gvas_k_bases + self.gvas_v_bases):
-                raise RuntimeError(
-                    "Sparse KV offload nano restore received a zero GVA pointer "
-                    f"on tp_rank={self.tp_rank}"
+            # NPU-tagged host views for fused_copy_sfa (same physical GVA).
+            for layer_id in range(self.num_layers):
+                k_cpu = self.k_caches_cpu[layer_id]
+                v_cpu = self.v_caches_cpu[layer_id]
+                self.k_caches_dram.append(
+                    self._restore_bfloat16_tensor(
+                        int(k_cpu.data_ptr()),
+                        list(k_cpu.shape),
+                        as_privateuse1=True,
+                    )
                 )
-            self.k_caches_cpu = [
-                self._restore_bfloat16_tensor(ptr, cpu_k_shape) for ptr in self.gvas_k_bases
-            ]
-            self.v_caches_cpu = [
-                self._restore_bfloat16_tensor(ptr, cpu_v_shape) for ptr in self.gvas_v_bases
-            ]
-            logger.info(
-                "Sparse KV offload restored shared CPU KV views on tp_rank=%s "
-                "layer_count=%s k_shape=%s v_shape=%s",
-                self.tp_rank,
-                self.num_layers,
-                cpu_k_shape,
-                cpu_v_shape,
-            )
+                self.v_caches_dram.append(
+                    self._restore_bfloat16_tensor(
+                        int(v_cpu.data_ptr()),
+                        list(v_cpu.shape),
+                        as_privateuse1=True,
+                    )
+                )
 
         gvas_buffer_offset = 0
         gvas_buffer_size_bytes = self.max_num_topk_rows * self.topk * 2 * 8  # 2: k+v, 8: int64
@@ -857,6 +892,322 @@ class SparseKVOffloadManager:
         self.lru_slot_workspace_ptr = self.lru_slot_workspace.data_ptr()
         self.lru_miss_position_workspace_ptr = self.lru_miss_position_workspace.data_ptr()
         self.lru_epochs_ptr = self.lru_epochs.data_ptr()
+
+        if use_nano:
+            self._init_nano_fused_workspaces(device)
+
+    def _init_nano_fused_workspaces(self, device: torch.device) -> None:
+        """Preallocate LIM / fused_copy_sfa buffers with stable addresses."""
+        nano_fused_topk = 2048
+        if self.topk != nano_fused_topk:
+            raise ValueError(
+                "nano fused ops require sparse_kv_offload_config.topk == "
+                f"{nano_fused_topk}, got {self.topk}"
+            )
+        rows = self.max_num_topk_rows
+        self.lim_topk_src_ids = torch.empty(
+            (rows, 1, nano_fused_topk),
+            dtype=torch.int32,
+            device=device,
+        )
+        self.lim_topk_dst_slots = torch.empty(
+            (rows, 1, nano_fused_topk),
+            dtype=torch.int32,
+            device=device,
+        )
+        self.lim_miss_counts = torch.empty(
+            (rows,),
+            dtype=torch.int32,
+            device=device,
+        )
+        self.lim_query_lens = torch.arange(1, rows + 1, dtype=torch.int32, device=device)
+        self.lim_num_cache_tokens = torch.full(
+            (rows,),
+            self.topk_buffer_size,
+            dtype=torch.int32,
+            device=device,
+        )
+        self.lim_actual_seq_lengths_kv = torch.empty(
+            (rows,),
+            dtype=torch.int32,
+            device=device,
+        )
+        self._fused_attention_out: dict[tuple[int, ...], torch.Tensor] = {}
+        self._last_lim_batch_size = 0
+        # PD first-decode prefix fill: pool entries / batch rows for this step.
+        self._nano_init_pool_entries: list[int] = []
+        self._nano_init_req_rows: list[int] = []
+        self._nano_init_slots_written = False
+        self._nano_init_h2d_layers: set[str] = set()
+
+    def clear_nano_init_step(self) -> None:
+        self._nano_init_pool_entries = []
+        self._nano_init_req_rows = []
+        self._nano_init_slots_written = False
+        self._nano_init_h2d_layers = set()
+
+    def set_nano_init_step(self, req_rows: list[int], pool_entries: list[int]) -> None:
+        if len(req_rows) != len(pool_entries):
+            raise ValueError(
+                "nano init req_rows and pool_entries length mismatch: "
+                f"{len(req_rows)} vs {len(pool_entries)}"
+            )
+        self._nano_init_req_rows = list(req_rows)
+        self._nano_init_pool_entries = list(pool_entries)
+        self._nano_init_slots_written = False
+        self._nano_init_h2d_layers = set()
+
+    def has_nano_init_step(self) -> bool:
+        return bool(self._nano_init_pool_entries)
+
+    def initialize_nano_prefix_topk_buffer(
+        self,
+        layer_name: str,
+        block_table: torch.Tensor,
+        cache_slots_pool: torch.Tensor,
+        cache_state: torch.Tensor | None,
+        offload_seq_lengths_key: torch.Tensor,
+        *,
+        write_slots: bool,
+    ) -> None:
+        """PD first-decode: fill topk buffer with tokens ``0..C-1`` and update slots.
+
+        LIM assumes the hot topk buffer is already full. On the first decode after
+        PD pull we identity-map the leading ``topk_buffer_size`` DRAM tokens into
+        HBM slots ``0..C-1`` and record ``cache_slots_pool[token]=slot``.
+
+        Shared IndexShare layers pass ``write_slots=False`` and only H2D into
+        their own layer buffers using the owner's slot table.
+        """
+        if not self._nano_init_pool_entries:
+            return
+        if not self._use_nano_fused_op():
+            raise RuntimeError("initialize_nano_prefix_topk_buffer requires fused_op_type=nano")
+
+        layer_id = self._get_offload_layer_id(layer_name)
+        cache_tokens = self.topk_buffer_size
+        block_size = self.block_size
+        # nano topk_buffer row layout: hot region + 2-block dense tail
+        row_stride_tokens = cache_tokens + 2 * block_size
+        token_size_k = self.token_size_bytes_k
+        token_size_v = self.token_size_bytes_v
+        block_bytes_k = self.cpu_block_lens[layer_id][0]
+        block_bytes_v = self.cpu_block_lens[layer_id][1]
+        gvas_k_base = self.gvas_k_bases[layer_id]
+        gvas_v_base = self.gvas_v_bases[layer_id]
+        addr_k_base = self.addr_k_bases[layer_id]
+        addr_v_base = self.addr_v_bases[layer_id]
+        max_blocks = block_table.size(1)
+
+        # Validate every init row has enough offloaded candidates to fill C.
+        offload_lens_cpu = offload_seq_lengths_key.detach().to(device="cpu", dtype=torch.int32)
+        for req_row, pool_entry in zip(self._nano_init_req_rows, self._nano_init_pool_entries):
+            candidate_tokens = int(offload_lens_cpu[req_row].item())
+            if candidate_tokens < cache_tokens:
+                raise RuntimeError(
+                    "nano first-decode prefix init requires offloaded candidates "
+                    f">= topk_buffer_size ({cache_tokens}), got {candidate_tokens} "
+                    f"for pool_entry={pool_entry}, req_row={req_row}"
+                )
+            if candidate_tokens % block_size != 0:
+                raise RuntimeError(
+                    "nano first-decode candidates must be complete blocks, "
+                    f"got candidate_tokens={candidate_tokens}, block_size={block_size}"
+                )
+
+        if write_slots and not self._nano_init_slots_written:
+            # cache_slots[token] = hbm_slot  (identity for the leading C tokens)
+            for pool_entry in self._nano_init_pool_entries:
+                slots_row = cache_slots_pool[pool_entry]
+                slots_row.fill_(CACHE_SLOTS_POOL_INVALID_ID)
+                slots_row[:cache_tokens] = torch.arange(
+                    cache_tokens,
+                    dtype=torch.int32,
+                    device=slots_row.device,
+                )
+                if cache_state is not None:
+                    cache_state[pool_entry] = CACHE_STATE_OFFLOAD_READY
+            self._nano_init_slots_written = True
+
+        if layer_name in self._nano_init_h2d_layers:
+            return
+        self._nano_init_h2d_layers.add(layer_name)
+
+        # Chunked H2D through the existing sparse_copy descriptor buffers.
+        max_tokens_per_copy = self.max_num_topk_rows * self.topk
+        if max_tokens_per_copy <= 0:
+            raise RuntimeError("sparse_copy descriptor capacity is zero")
+
+        pending: list[tuple[int, int, int, int]] = []
+        # (pool_entry, req_row, token_start, token_count)
+        for req_row, pool_entry in zip(self._nano_init_req_rows, self._nano_init_pool_entries):
+            remaining = cache_tokens
+            token_start = 0
+            while remaining > 0:
+                chunk = min(remaining, max_tokens_per_copy)
+                pending.append((pool_entry, req_row, token_start, chunk))
+                token_start += chunk
+                remaining -= chunk
+
+        block_table_cpu = block_table.detach().to(device="cpu", dtype=torch.int32)
+        for pool_entry, req_row, token_start, chunk in pending:
+            self._sparse_copy_prefix_chunk(
+                pool_entry=pool_entry,
+                req_row=req_row,
+                token_start=token_start,
+                token_count=chunk,
+                block_table_cpu=block_table_cpu,
+                max_blocks=max_blocks,
+                block_size=block_size,
+                row_stride_tokens=row_stride_tokens,
+                token_size_k=token_size_k,
+                token_size_v=token_size_v,
+                block_bytes_k=block_bytes_k,
+                block_bytes_v=block_bytes_v,
+                gvas_k_base=gvas_k_base,
+                gvas_v_base=gvas_v_base,
+                addr_k_base=addr_k_base,
+                addr_v_base=addr_v_base,
+            )
+
+    def _sparse_copy_prefix_chunk(
+        self,
+        *,
+        pool_entry: int,
+        req_row: int,
+        token_start: int,
+        token_count: int,
+        block_table_cpu: torch.Tensor,
+        max_blocks: int,
+        block_size: int,
+        row_stride_tokens: int,
+        token_size_k: int,
+        token_size_v: int,
+        block_bytes_k: int,
+        block_bytes_v: int,
+        gvas_k_base: int,
+        gvas_v_base: int,
+        addr_k_base: int,
+        addr_v_base: int,
+    ) -> None:
+        gvas = self.gvas_buffer_cpu
+        addr = self.addr_buffer_cpu
+        size = self.size_buffer_cpu
+        num_tokens_buf = self.num_tokens_buffer_cpu
+        gvas.fill_(0)
+        addr.fill_(0)
+        size.fill_(0)
+
+        for i in range(token_count):
+            token = token_start + i
+            slot = token  # identity destination in the hot region
+            block_id = token // block_size
+            offset = token % block_size
+            if block_id < 0 or block_id >= max_blocks:
+                raise RuntimeError(
+                    f"nano prefix init token {token} maps to invalid block_id={block_id}"
+                )
+            block_indice = int(block_table_cpu[req_row, block_id].item())
+            if block_indice < 0:
+                raise RuntimeError(
+                    f"nano prefix init missing DRAM block for token={token}, "
+                    f"req_row={req_row}, block_id={block_id}"
+                )
+            gvas_k = gvas_k_base + block_indice * block_bytes_k + offset * token_size_k
+            gvas_v = gvas_v_base + block_indice * block_bytes_v + offset * token_size_v
+            addr_k = addr_k_base + (pool_entry * row_stride_tokens + slot) * token_size_k
+            addr_v = addr_v_base + (pool_entry * row_stride_tokens + slot) * token_size_v
+            gvas[i] = gvas_k
+            gvas[token_count + i] = gvas_v
+            addr[i] = addr_k
+            addr[token_count + i] = addr_v
+            size[i] = token_size_k
+            size[token_count + i] = token_size_v
+
+        num_tokens_buf[0] = token_count * 2
+        self.sparse_copy_args_buffer_npu.copy_(self.sparse_copy_args_buffer_cpu, non_blocking=False)
+        if self.tp_size > 1:
+            self.tp_group.broadcast(torch.empty([], dtype=torch.int8, device="npu"), src=0)
+        result = offload.sparse_copy(
+            self.gvas_buffer_npu,
+            self.addr_buffer_npu,
+            self.size_buffer_npu,
+            self.num_tokens_buffer_npu,
+            self.topk_buffers_k[0].device,
+        )
+        if result not in (None, 0):
+            raise RuntimeError(
+                f"memfabric H2D sparse_copy for nano prefix init failed with result={result}"
+            )
+
+    def get_lim_output_buffers(self, batch_size: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if batch_size <= 0 or batch_size > self.max_num_topk_rows:
+            raise ValueError(
+                f"LIM batch_size out of range: {batch_size}, capacity={self.max_num_topk_rows}"
+            )
+        return (
+            self.lim_topk_src_ids[:batch_size],
+            self.lim_topk_dst_slots[:batch_size],
+            self.lim_miss_counts[:batch_size],
+        )
+
+    def mark_lim_outputs_ready(self, batch_size: int) -> None:
+        self._last_lim_batch_size = batch_size
+
+    def require_lim_outputs(self, batch_size: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if self._last_lim_batch_size < batch_size:
+            raise RuntimeError(
+                "nano fused decode shared/skip_topk layer ran before its owner "
+                f"LIM update: need batch_size={batch_size}, "
+                f"have={self._last_lim_batch_size}"
+            )
+        return self.get_lim_output_buffers(batch_size)
+
+    def get_fused_attention_out(self, ql_nope: torch.Tensor) -> torch.Tensor:
+        key = tuple(ql_nope.shape)
+        out = self._fused_attention_out.get(key)
+        if out is None or out.dtype != ql_nope.dtype or out.device != ql_nope.device:
+            out = torch.empty_like(ql_nope)
+            self._fused_attention_out[key] = out
+        return out
+
+    def dram_kv_pair_for_fused(self, layer_name: str) -> tuple[torch.Tensor, torch.Tensor]:
+        """DRAM CKV/KPE as ``[blocks, block_size, dim]`` for fused_copy_sfa."""
+        layer_id = self._get_offload_layer_id(layer_name)
+        if layer_id >= len(self.k_caches_dram) or layer_id >= len(self.v_caches_dram):
+            raise RuntimeError(
+                "nano fused_copy_sfa requires NPU-tagged DRAM KV views on all TP ranks, "
+                f"layer={layer_name}, tp_rank={self.tp_rank}"
+            )
+        k_dram = self.k_caches_dram[layer_id]
+        v_dram = self.v_caches_dram[layer_id]
+        if k_dram.ndim == 4 and k_dram.size(2) == 1:
+            k_dram = k_dram.squeeze(2)
+        if v_dram.ndim == 4 and v_dram.size(2) == 1:
+            v_dram = v_dram.squeeze(2)
+        if k_dram.ndim != 3 or v_dram.ndim != 3:
+            raise RuntimeError(
+                "nano DRAM KV must be 3D after squeeze, "
+                f"got k={tuple(k_dram.shape)}, v={tuple(v_dram.shape)}"
+            )
+        if not k_dram.is_contiguous() or not v_dram.is_contiguous():
+            raise RuntimeError("nano DRAM KV views must stay contiguous non-owning aliases")
+        return k_dram, v_dram
+
+    def hbm_kv_pair_for_fused(self, layer_name: str) -> tuple[torch.Tensor, torch.Tensor]:
+        """Paged HBM views ``[blocks, block_size, 1, dim]`` over topk_buffer(+tail)."""
+        layer_id = self._get_offload_layer_id(layer_name)
+        buffer_k = self.topk_buffers_k[layer_id]
+        buffer_v = self.topk_buffers_v[layer_id]
+        block_size = self.block_size
+        if buffer_k.size(-3) % block_size != 0:
+            raise RuntimeError(
+                "topk_buffer token dim must be divisible by block_size for "
+                f"fused_copy_sfa, got {buffer_k.shape} block_size={block_size}"
+            )
+        hbm_k = buffer_k.view(-1, block_size, buffer_k.size(-2), buffer_k.size(-1))
+        hbm_v = buffer_v.view(-1, block_size, buffer_v.size(-2), buffer_v.size(-1))
+        return hbm_k, hbm_v
 
     def allocate_topk_buffer_slots(self, new_req_ids: list[str]):
         return self.topk_buffer_slot_manager.allocate_topk_buffer_slots(new_req_ids)
@@ -1205,7 +1556,10 @@ def get_sparse_kv_offload_manager():
 
 CACHE_STATE_NO_OFFLOAD = -3
 CACHE_STATE_OFFLOAD_INIT = -2
-CACHE_SLOTS_POOL_INVALID_ID = -65536
+CACHE_STATE_OFFLOAD_READY = 0
+# fused_li_manage treats negative entries as "not resident"; use -1 to match
+# the nano LIM contract (not a sentinel outside int16-ish ranges).
+CACHE_SLOTS_POOL_INVALID_ID = -1
 
 
 def update_sparse_kv_offload_metadata(
@@ -1261,6 +1615,8 @@ def update_sparse_kv_offload_metadata(
     offload_token_to_req.copy_to_gpu(num_tokens_padded)
 
     if sparse_kv_offload_config.fused_op_type == "nano":
+        manager = get_sparse_kv_offload_manager()
+        manager.clear_nano_init_step()
         num_decode_reqs = (num_scheduled_tokens_np <= decode_threshold).sum()
         if num_decode_reqs <= 0:
             return
@@ -1269,7 +1625,7 @@ def update_sparse_kv_offload_metadata(
 
         # req_topk_buffer_slots
         decode_req_ids = req_ids[:num_decode_reqs]
-        topk_buffer_slots, first_allocate = get_sparse_kv_offload_manager().allocate_topk_buffer_slots(decode_req_ids)
+        topk_buffer_slots, first_allocate = manager.allocate_topk_buffer_slots(decode_req_ids)
         offload_req_topk_buffer_slots.np[:num_decode_reqs] = np.array(topk_buffer_slots)
         offload_req_topk_buffer_slots.copy_to_gpu()
 
@@ -1311,15 +1667,22 @@ def update_sparse_kv_offload_metadata(
         # cache_states and cache_slots_pool
         # NOTE Since we only need to update slots of new(first decode) requests and leave the other slots unchanged,
         # can't call copy_to_gpu here, manually async copy the specific slot instead.
-        new_req_slot_ids = np.array(topk_buffer_slots)[first_allocate]
+        first_allocate_flags = np.asarray(first_allocate, dtype=bool)
+        new_req_slot_ids = np.asarray(topk_buffer_slots, dtype=np.int32)[first_allocate_flags]
+        new_req_rows = np.nonzero(first_allocate_flags)[0].astype(np.int32)
+        if new_req_slot_ids.size > 0:
+            manager.set_nano_init_step(
+                req_rows=[int(x) for x in new_req_rows.tolist()],
+                pool_entries=[int(x) for x in new_req_slot_ids.tolist()],
+            )
         for new_req_slot_id in new_req_slot_ids:
             offload_cache_state.cpu[new_req_slot_id] = CACHE_STATE_OFFLOAD_INIT
             offload_cache_state.gpu[new_req_slot_id].copy_(
                 offload_cache_state.cpu[new_req_slot_id],
                 non_blocking=True,
             )
-            offload_cache_slots_pool.cpu[new_req_slot_id][:topk_buffer_size] = -(torch.arange(topk_buffer_size) + 1)
-            offload_cache_slots_pool.cpu[new_req_slot_id][topk_buffer_size:].fill_(CACHE_SLOTS_POOL_INVALID_ID)
+            # Cold start: no HBM slot is occupied yet. Prefix init + LIM fill this row.
+            offload_cache_slots_pool.cpu[new_req_slot_id].fill_(CACHE_SLOTS_POOL_INVALID_ID)
             offload_cache_slots_pool.gpu[new_req_slot_id].copy_(
                 offload_cache_slots_pool.cpu[new_req_slot_id],
                 non_blocking=True,

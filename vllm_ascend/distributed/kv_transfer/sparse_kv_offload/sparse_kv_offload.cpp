@@ -328,11 +328,22 @@ int32_t compute_lru_resident_addrs(const at::Tensor& miss_count, const at::Tenso
 }
 
 at::Tensor restore_tensor(uintptr_t ptr_val, const std::vector<int64_t>& shape,
-                          torch::ScalarType dtype = torch::kBFloat16) {
+                          torch::ScalarType dtype = torch::kBFloat16,
+                          bool as_privateuse1 = false,
+                          int64_t device_index = 0) {
   if (ptr_val == 0) {
     return at::Tensor();
   }
-  auto options = torch::TensorOptions().dtype(dtype).device(torch::kCPU);
+  torch::TensorOptions options;
+  if (as_privateuse1) {
+    // Host-mapped GVA presented as an NPU tensor so fused_copy_sfa device
+    // checks accept DRAM inputs that share the same physical host storage.
+    options = torch::TensorOptions()
+                  .dtype(dtype)
+                  .device(c10::Device(c10::DeviceType::PrivateUse1, device_index));
+  } else {
+    options = torch::TensorOptions().dtype(dtype).device(torch::kCPU);
+  }
   return torch::from_blob(reinterpret_cast<void*>(ptr_val), shape, options);
 }
 
@@ -344,9 +355,14 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         "Compute sparse H2D metadata for compact LRU resident miss loads");
   m.def(
       "restore_bfloat16_tensor",
-      [](uintptr_t ptr_val, const std::vector<int64_t>& shape) {
+      [](uintptr_t ptr_val, const std::vector<int64_t>& shape, bool as_privateuse1,
+         int64_t device_index) {
         TORCH_CHECK(ptr_val != 0, "restore_bfloat16_tensor requires a non-zero pointer");
-        return restore_tensor(ptr_val, shape, torch::kBFloat16);
+        return restore_tensor(ptr_val, shape, torch::kBFloat16, as_privateuse1, device_index);
       },
-      "Create a non-owning CPU bfloat16 tensor view for a shared GVA");
+      py::arg("ptr_val"),
+      py::arg("shape"),
+      py::arg("as_privateuse1") = false,
+      py::arg("device_index") = 0,
+      "Create a non-owning bfloat16 tensor view for a shared GVA");
 }
