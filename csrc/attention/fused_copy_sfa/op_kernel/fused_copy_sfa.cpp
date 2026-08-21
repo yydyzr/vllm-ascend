@@ -1,9 +1,9 @@
 #include "kernel_operator.h"
 #include "../../fused_copy_sfa/op_kernel/sfa_impl/sparse_tail_attention_template_tiling_key.h"
 
-// The fused tiling payload starts with the complete production SFA payload.
+// The fused tiling payload starts with the complete production STA payload.
 // The source-aware gather changes live in a private kernel fork so the
-// standalone SFA baseline remains byte-identical to nano-vLLM.
+// standalone STA baseline remains byte-identical to nano-vLLM.
 using SparseTailAttentionTilingDataMla =
     FusedCopySfaTilingData;
 
@@ -35,11 +35,11 @@ __aicore__ inline void RunSourceAwareAttention(
     __gm__ uint8_t *tiling,
     TPipe *pipe)
 {
-    using FusedType = SFAType<
+    using FusedType = STAType<
         T, T, T, FLASH_DECODE,
-        static_cast<SFA_LAYOUT>(LAYOUT_T),
-        static_cast<SFA_LAYOUT>(KV_LAYOUT_T),
-        TEMPLATE_MODE, SFA_STAGE_NORMAL, true>;
+        static_cast<STA_LAYOUT>(LAYOUT_T),
+        static_cast<STA_LAYOUT>(KV_LAYOUT_T),
+        TEMPLATE_MODE, STA_STAGE_NORMAL, true>;
     SparseTailAttentionMla<FusedType> op;
     const auto *attentionTiling =
         reinterpret_cast<

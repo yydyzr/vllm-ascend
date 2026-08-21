@@ -83,7 +83,7 @@ def build_case(*, device, heads, batch_size, seq_len, cache_tokens_value,
 
 
 def call_fused_li_manage(case):
-    torch.ops._C_ascend.npu_fused_li_manage.default(
+    torch.ops._C_ascend.npu_fused_li_manage(
         case["query"], case["weights"], case["key"], case["block_table"],
         case["candidate_lens"], case["cache_tokens"], case["req_entries"],
         case["cache_slots"], case["source_ids"], case["destination_slots"],

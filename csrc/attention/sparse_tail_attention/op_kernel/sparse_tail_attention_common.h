@@ -21,44 +21,44 @@
 #include "lib/matrix/matmul/tiling.h"
 
 using namespace AscendC;
-constexpr SoftmaxConfig SFA_SOFTMAX_FLASHV2_CFG_WITHOUT_BRC = {false, 0, 0, SoftmaxMode::SOFTMAX_OUTPUT_WITHOUT_BRC};
-constexpr uint32_t SFA_OFFLOAD_SPARSE_INDICES_CAPACITY = 2048;
-constexpr uint32_t SFA_OFFLOAD_SPARSE_COMPUTE_COUNT = 2048;
-constexpr uint32_t SFA_MTP3_QUERY_COUNT = 4;
+constexpr SoftmaxConfig STA_SOFTMAX_FLASHV2_CFG_WITHOUT_BRC = {false, 0, 0, SoftmaxMode::SOFTMAX_OUTPUT_WITHOUT_BRC};
+constexpr uint32_t STA_OFFLOAD_SPARSE_INDICES_CAPACITY = 2048;
+constexpr uint32_t STA_OFFLOAD_SPARSE_COMPUTE_COUNT = 2048;
+constexpr uint32_t STA_MTP3_QUERY_COUNT = 4;
 
-enum class SFA_LAYOUT
+enum class STA_LAYOUT
 {
     BSND = 0,
     TND = 1,
     PA_BSND = 2,
 };
 
-enum SFA_STAGE_MODE
+enum STA_STAGE_MODE
 {
-    SFA_STAGE_NORMAL = 0,
-    SFA_STAGE_STAGE1 = 1,
-    SFA_STAGE_STAGE2 = 2,
+    STA_STAGE_NORMAL = 0,
+    STA_STAGE_STAGE1 = 1,
+    STA_STAGE_STAGE2 = 2,
 };
 
 template <typename Q_T, typename KV_T, typename OUT_T, const bool FLASH_DECODE = false,
-	  SFA_LAYOUT LAYOUT_T = SFA_LAYOUT::BSND, SFA_LAYOUT KV_LAYOUT_T = SFA_LAYOUT::BSND,
-          const int TEMPLATE_MODE = C_TEMPLATE, const int STAGE_MODE = SFA_STAGE_NORMAL,
+	  STA_LAYOUT LAYOUT_T = STA_LAYOUT::BSND, STA_LAYOUT KV_LAYOUT_T = STA_LAYOUT::BSND,
+          const int TEMPLATE_MODE = C_TEMPLATE, const int STAGE_MODE = STA_STAGE_NORMAL,
           const bool MTP3_MODE = false, typename... Args>
-struct SFAType {
+struct STAType {
     using queryType = Q_T;
     using kvType = KV_T;
     using outputType = OUT_T;
     static constexpr bool flashDecode = FLASH_DECODE;
-    static constexpr SFA_LAYOUT layout = LAYOUT_T;
-    static constexpr SFA_LAYOUT kvLayout = KV_LAYOUT_T;
+    static constexpr STA_LAYOUT layout = LAYOUT_T;
+    static constexpr STA_LAYOUT kvLayout = KV_LAYOUT_T;
     static constexpr int templateMode = TEMPLATE_MODE;
     static constexpr int stageMode = STAGE_MODE;
     static constexpr bool mtp3Mode = MTP3_MODE;
-    static constexpr bool pageAttention = (KV_LAYOUT_T == SFA_LAYOUT::PA_BSND);
+    static constexpr bool pageAttention = (KV_LAYOUT_T == STA_LAYOUT::PA_BSND);
 };
 
 // ================================Util functions==================================
-template <typename T> __aicore__ inline T SFAAlign(T num, T rnd)
+template <typename T> __aicore__ inline T STAAlign(T num, T rnd)
 {
     return (((rnd) == 0) ? 0 : (((num) + (rnd) - 1) / (rnd) * (rnd)));
 }
@@ -129,7 +129,7 @@ struct RunInfo {
 };
 
 struct ConstInfo {
-    static constexpr uint32_t SFA_SYNC_MODE2 = 2;
+    static constexpr uint32_t STA_SYNC_MODE2 = 2;
     static constexpr uint32_t BUFFER_SIZE_BYTE_32B = 32;
     static constexpr uint32_t BUFFER_SIZE_BYTE_64B = 64;
     static constexpr uint32_t BUFFER_SIZE_BYTE_256B = 256;
@@ -166,7 +166,7 @@ struct ConstInfo {
     int64_t kvCacheBlockSize = 0;
     uint32_t maxBlockNumPerBatch = 0;
     uint32_t splitKVNum = 0U;
-    SFA_LAYOUT outputLayout;
+    STA_LAYOUT outputLayout;
     uint32_t sparseMode = 0;
     bool needInit = false;
 

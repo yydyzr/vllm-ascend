@@ -99,7 +99,7 @@ def _make_case(device, batch, heads, source_len, cache_tokens, tail_tokens, seed
 
 
 def _launch_fused(case):
-    torch.ops._C_ascend.npu_fused_copy_sfa.default(
+    torch.ops._C_ascend.npu_fused_copy_sfa(
         case["query_rope"], case["query"], case["actual_q"], case["actual_kv"],
         case["cache_tokens_t"], case["sparse_slots"], case["source_token_ids"],
         case["copy_counts"], case["hbm_table"], case["dram_table"],

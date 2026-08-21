@@ -8,7 +8,6 @@
 #include "register/op_def_registry.h"
 
 namespace optiling {
-using namespace sta;
 namespace {
 
 constexpr uint32_t QUERY = 0;
@@ -196,9 +195,9 @@ ge::graphStatus CheckFusedInputs(
 ge::graphStatus TilingFusedCopySfaMtp(
     gert::TilingContext *context)
 {
-    SFATilingInfo sfaInfo;
-    SFAInfoParser parser(context);
-    if (parser.Parse(sfaInfo) != ge::GRAPH_SUCCESS) {
+    STATilingInfo staInfo;
+    STAInfoParser parser(context);
+    if (parser.Parse(staInfo) != ge::GRAPH_SUCCESS) {
         return ge::GRAPH_FAILED;
     }
 
@@ -209,19 +208,19 @@ ge::graphStatus TilingFusedCopySfaMtp(
         return ge::GRAPH_FAILED;
     }
 
-    SFATilingCheck checker(sfaInfo);
+    STATilingCheck checker(staInfo);
     if (checker.Process() != ge::GRAPH_SUCCESS) {
         return ge::GRAPH_FAILED;
     }
 
-    SFAMlaTiling sfaTiling(context);
-    if (sfaTiling.DoOpTiling(&sfaInfo) != ge::GRAPH_SUCCESS) {
+    STAMlaTiling staTiling(context);
+    if (staTiling.DoOpTiling(&staInfo) != ge::GRAPH_SUCCESS) {
         return ge::GRAPH_FAILED;
     }
 
-    // The shared SFA tiler serializes the payload we need, but its generic
+    // The shared STA tiler serializes the payload we need, but its generic
     // template key (578 for the GLM MTP3 shape) belongs to the standalone
-    // SFA kernel.  The fused MTP operator has one fixed specialization,
+    // STA kernel.  The fused MTP operator has one fixed specialization,
     // matching sparse_tail_attention_mtp, and is compiled under key 1.
     context->SetTilingKey(1U);
 
@@ -236,7 +235,7 @@ ge::graphStatus TilingFusedCopySfaMtp(
     OPS_ERR_IF(fusedSize != baseSize + fusedSuffixSize ||
                    raw->GetCapacity() < fusedSize,
                OPS_LOG_E(context->GetNodeName(),
-                         "Unexpected SFA/fused-MTP tiling layout: base=%zu, fused=%zu, capacity=%zu.",
+                         "Unexpected STA/fused-MTP tiling layout: base=%zu, fused=%zu, capacity=%zu.",
                          baseSize, fusedSize, raw->GetCapacity()),
                return ge::GRAPH_FAILED);
     auto *payload = static_cast<uint8_t *>(raw->GetData());

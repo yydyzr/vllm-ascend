@@ -1,10 +1,9 @@
-#ifndef FUSED_COPY_SFA_MTP_TILING_H
-#define FUSED_COPY_SFA_MTP_TILING_H
+#ifndef FUSED_COPY_STA_MTP_TILING_H
+#define FUSED_COPY_STA_MTP_TILING_H
 
 #include "../../sparse_tail_attention/op_host/sparse_tail_attention_tiling.h"
 
 namespace optiling {
-using namespace sta;
 
 // Keep the production sparse Attention payload as an exact prefix.  The
 // kernel reinterprets that prefix as SparseTailAttentionTilingDataMla

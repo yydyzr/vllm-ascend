@@ -8,7 +8,6 @@
 #include "register/op_def_registry.h"
 
 namespace optiling {
-using namespace sta;
 namespace {
 
 constexpr uint32_t QUERY = 0;
@@ -160,9 +159,9 @@ ge::graphStatus CheckFusedInputs(
 ge::graphStatus TilingFusedCopySfa(
     gert::TilingContext *context)
 {
-    SFATilingInfo sfaInfo;
-    SFAInfoParser parser(context);
-    if (parser.Parse(sfaInfo) != ge::GRAPH_SUCCESS) {
+    STATilingInfo staInfo;
+    STAInfoParser parser(context);
+    if (parser.Parse(staInfo) != ge::GRAPH_SUCCESS) {
         return ge::GRAPH_FAILED;
     }
 
@@ -177,16 +176,16 @@ ge::graphStatus TilingFusedCopySfa(
         return ge::GRAPH_FAILED;
     }
 
-    SFATilingCheck checker(sfaInfo);
+    STATilingCheck checker(staInfo);
     if (checker.Process() != ge::GRAPH_SUCCESS) {
         return ge::GRAPH_FAILED;
     }
 
-    // Reuse the unmodified production SFA tiler. Its serialized payload is
+    // Reuse the unmodified production STA tiler. Its serialized payload is
     // exactly the prefix of the fused payload; the two fused-only uint32
     // fields are appended below without changing the baseline implementation.
-    SFAMlaTiling sfaTiling(context);
-    if (sfaTiling.DoOpTiling(&sfaInfo) != ge::GRAPH_SUCCESS) {
+    STAMlaTiling staTiling(context);
+    if (staTiling.DoOpTiling(&staInfo) != ge::GRAPH_SUCCESS) {
         return ge::GRAPH_FAILED;
     }
 
@@ -201,7 +200,7 @@ ge::graphStatus TilingFusedCopySfa(
     OPS_ERR_IF(fusedSize != baseSize + fusedSuffixSize ||
                    raw->GetCapacity() < fusedSize,
         OPS_LOG_E(context->GetNodeName(),
-                  "Unexpected SFA/fused tiling layout: base=%zu, fused=%zu, capacity=%zu.",
+                  "Unexpected STA/fused tiling layout: base=%zu, fused=%zu, capacity=%zu.",
                   baseSize, fusedSize, raw->GetCapacity()),
         return ge::GRAPH_FAILED);
     auto *payload = static_cast<uint8_t *>(raw->GetData());

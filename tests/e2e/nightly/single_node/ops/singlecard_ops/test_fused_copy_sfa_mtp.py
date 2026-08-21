@@ -148,7 +148,7 @@ def launch_fused(*, case, device, query, query_rope, actual_q, actual_kv,
                  scale, hbm_table, dram_table, dram_kpe, dram_ckv,
                  cache_slots, hbm_kpe, hbm_ckv, lim_buffers, attention_output):
     lim_outputs = _lim_mod.call_mtp_with_buffers(case, cache_slots, *lim_buffers)
-    torch.ops._C_ascend.npu_fused_copy_sfa_mtp.default(
+    torch.ops._C_ascend.npu_fused_copy_sfa_mtp(
         query_rope, query, actual_q, actual_kv, case.cache_tokens,
         lim_outputs[0], lim_outputs[1], lim_outputs[2], lim_outputs[3],
         lim_outputs[4], hbm_table, dram_table,

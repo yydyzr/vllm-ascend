@@ -23,7 +23,6 @@
 #include "exe_graph/runtime/tiling_context.h"
 
 namespace optiling {
-namespace sta {
 // Inputs Index
 constexpr uint32_t QUERY_INPUT_INDEX = 0;
 constexpr uint32_t KEY_INPUT_INDEX = 1;
@@ -54,18 +53,18 @@ constexpr uint32_t NUM_BYTES_FLOAT = 4;
 constexpr uint32_t NUM_BYTES_FLOAT16 = 2;
 constexpr uint32_t NUM_BYTES_BF16 = 2;
 constexpr uint32_t BYTE_BLOCK = 32;
-const uint32_t SFA_MAX_AIC_CORE_NUM = 26;
+const uint32_t STA_MAX_AIC_CORE_NUM = 26;
 constexpr uint32_t OFFLOAD_SPARSE_INDICES_CAPACITY = 2048;
 constexpr uint32_t OFFLOAD_SPARSE_COMPUTE_COUNT = 2048;
 constexpr uint32_t OFFLOAD_MTP3_QUERY_COUNT = 4;
 
-enum class SFALayout : uint32_t {
+enum class STALayout : uint32_t {
     BSND = 0,
     TND = 1,
     PA_BSND = 2
 };
 
-struct SFATilingShapeCompareParam {
+struct STATilingShapeCompareParam {
     int64_t B = 1;
     int64_t S = 1;
     int64_t N = 1;
@@ -81,12 +80,12 @@ enum class KvStorageMode : uint32_t {
     PAGE_ATTENTION = 1
 };
 
-enum class SFAPerfMode : uint32_t {
+enum class STAPerfMode : uint32_t {
     C_TEMPLATE_MODE = 0,
     V_TEMPLATE_MODE
 };
 
-enum class SFAAxis : uint32_t {
+enum class STAAxis : uint32_t {
     B = 0,
     S = 1,
     N = 2,
@@ -97,28 +96,28 @@ enum class SFAAxis : uint32_t {
     Bs = 7, // block size
 };
 
-struct SFARequiredParaInfo {
+struct STARequiredParaInfo {
     const gert::CompileTimeTensorDesc *desc;
     const gert::StorageShape *shape;
 };
 
-struct SFAOptionalParaInfo {
+struct STAOptionalParaInfo {
     const gert::CompileTimeTensorDesc *desc;
     const gert::Tensor *tensor;
 };
 
-struct SFAParaInfo {
-    SFARequiredParaInfo query = {nullptr, nullptr};
-    SFARequiredParaInfo key = {nullptr, nullptr};
-    SFARequiredParaInfo value = {nullptr, nullptr};
-    SFARequiredParaInfo sparseIndices = {nullptr, nullptr};
-    SFARequiredParaInfo cacheTokens = {nullptr, nullptr};
-    SFAOptionalParaInfo blockTable = {nullptr, nullptr};
-    SFAOptionalParaInfo actualSeqLengthsQ = {nullptr, nullptr};
-    SFAOptionalParaInfo actualSeqLengths = {nullptr, nullptr};
-    SFAOptionalParaInfo queryRope = {nullptr, nullptr};
-    SFAOptionalParaInfo keyRope = {nullptr, nullptr};
-    SFARequiredParaInfo attenOut = {nullptr, nullptr};
+struct STAParaInfo {
+    STARequiredParaInfo query = {nullptr, nullptr};
+    STARequiredParaInfo key = {nullptr, nullptr};
+    STARequiredParaInfo value = {nullptr, nullptr};
+    STARequiredParaInfo sparseIndices = {nullptr, nullptr};
+    STARequiredParaInfo cacheTokens = {nullptr, nullptr};
+    STAOptionalParaInfo blockTable = {nullptr, nullptr};
+    STAOptionalParaInfo actualSeqLengthsQ = {nullptr, nullptr};
+    STAOptionalParaInfo actualSeqLengths = {nullptr, nullptr};
+    STAOptionalParaInfo queryRope = {nullptr, nullptr};
+    STAOptionalParaInfo keyRope = {nullptr, nullptr};
+    STARequiredParaInfo attenOut = {nullptr, nullptr};
 
     const char *layoutQuery = nullptr;
     const char *layoutKV = nullptr;
@@ -189,7 +188,7 @@ template <typename T> inline T Align(T num, T rnd)
 }
 
 template <typename T>
-std::string SFAShape2String(const T &shape)
+std::string STAShape2String(const T &shape)
 {
     std::ostringstream oss;
     oss << "[";
@@ -204,15 +203,15 @@ std::string SFAShape2String(const T &shape)
 }
 
 static std::string GetShapeStr(gert::Shape shape);
-static std::string SFADataTypeToSerialString(ge::DataType type);
-std::string SFATensorDesc2String(const gert::StorageShape *shape, const gert::CompileTimeTensorDesc *tensor);
-std::string SFADebugTilingContext(const gert::TilingContext *context);
-std::string SFALayoutToSerialString(SFALayout layout);
+static std::string STADataTypeToSerialString(ge::DataType type);
+std::string STATensorDesc2String(const gert::StorageShape *shape, const gert::CompileTimeTensorDesc *tensor);
+std::string STADebugTilingContext(const gert::TilingContext *context);
+std::string STALayoutToSerialString(STALayout layout);
 
-struct SFATilingInfo {
+struct STATilingInfo {
     const char *opName = nullptr;
     fe::PlatFormInfos *platformInfo = nullptr;
-    SFAParaInfo opParamInfo;
+    STAParaInfo opParamInfo;
 
     // Base Param
     platform_ascendc::SocVersion socVersion = platform_ascendc::SocVersion::ASCEND910B;
@@ -256,10 +255,10 @@ struct SFATilingInfo {
 
     KvStorageMode kvStorageMode = KvStorageMode::BATCH_CONTINUOUS;
 
-    SFALayout qLayout = SFALayout::BSND;
-    SFALayout topkLayout = SFALayout::BSND;
-    SFALayout outLayout = SFALayout::BSND;
-    SFALayout kvLayout = SFALayout::BSND;
+    STALayout qLayout = STALayout::BSND;
+    STALayout topkLayout = STALayout::BSND;
+    STALayout outLayout = STALayout::BSND;
+    STALayout kvLayout = STALayout::BSND;
 
     ge::DataType inputQRopeType = ge::DT_FLOAT16;
     ge::DataType inputKRopeType = ge::DT_FLOAT16;
@@ -267,10 +266,10 @@ struct SFATilingInfo {
     uint64_t l2CacheSize = 0;
 };
 
-class SFAMlaTiling {
+class STAMlaTiling {
 public:
-    explicit SFAMlaTiling(gert::TilingContext *context) : context_(context) {}
-    ge::graphStatus DoOpTiling(SFATilingInfo *sfaInfo);
+    explicit STAMlaTiling(gert::TilingContext *context) : context_(context) {}
+    ge::graphStatus DoOpTiling(STATilingInfo *staInfo);
 
 private:
     ge::graphStatus SetBlockDim(uint32_t blockDim);
@@ -314,7 +313,7 @@ private:
     bool splitKVFlag_ = false;
 
     uint32_t coreNum_ = 0;
-    SFAPerfMode perfMode_ = SFAPerfMode::V_TEMPLATE_MODE;
+    STAPerfMode perfMode_ = STAPerfMode::V_TEMPLATE_MODE;
     uint32_t kvSplitPart_ = 1;
     size_t mmResUbSize_ = 0;
     size_t bmm2ResUbSize_ = 0;
@@ -342,13 +341,13 @@ private:
     uint32_t mBaseSize_ = 128;
     uint32_t mFdBaseSize_ = 8;
 
-    SFATilingInfo *sfaInfo_ = nullptr;
+    STATilingInfo *staInfo_ = nullptr;
 };
 
-class SFATilingCheck {
+class STATilingCheck {
 public:
-    explicit SFATilingCheck(const SFATilingInfo &sfaInfo) : sfaInfo_(sfaInfo) {};
-    ~SFATilingCheck() = default;
+    explicit STATilingCheck(const STATilingInfo &staInfo) : staInfo_(staInfo) {};
+    ~STATilingCheck() = default;
     virtual ge::graphStatus Process();
 private:
     void Init();
@@ -362,15 +361,15 @@ private:
         const T &actualValue, const std::string &name) const;
     ge::graphStatus CheckDimNumSupport(const gert::StorageShape *shape,
         const std::vector<size_t> &expectDimNumList, const std::string &name) const;
-    ge::graphStatus CheckDimNumInLayoutSupport(const SFALayout &layout,
+    ge::graphStatus CheckDimNumInLayoutSupport(const STALayout &layout,
         const gert::StorageShape *shape, const std::string &name) const;
-    void LogErrorLayoutSupport(const std::vector<SFALayout> &expectLayoutList,
-        const SFALayout &actualLayout, const std::string &name) const;
+    void LogErrorLayoutSupport(const std::vector<STALayout> &expectLayoutList,
+        const STALayout &actualLayout, const std::string &name) const;
     ge::graphStatus GetExpectedShape(gert::Shape &shapeExpected,
-    const SFATilingShapeCompareParam &param, const SFALayout &layout) const;
-    ge::graphStatus CompareShape(SFATilingShapeCompareParam &param,
-        const gert::Shape &shape, const SFALayout &layout, const std::string &name) const;
-    ge::graphStatus CheckLayoutSupport(const SFALayout &actualLayout, const std::string &name) const;
+    const STATilingShapeCompareParam &param, const STALayout &layout) const;
+    ge::graphStatus CompareShape(STATilingShapeCompareParam &param,
+        const gert::Shape &shape, const STALayout &layout, const std::string &name) const;
+    ge::graphStatus CheckLayoutSupport(const STALayout &actualLayout, const std::string &name) const;
     ge::graphStatus CheckSingleParaQuery() const;
     ge::graphStatus CheckSingleParaKey() const;
     ge::graphStatus CheckSingleParaValue() const;
@@ -399,8 +398,8 @@ private:
     ge::graphStatus CheckParaExistenceMla() const;
     ge::graphStatus CheckParaExistence();
     ge::graphStatus GetActualSeqLenSize(uint32_t &size, const gert::Tensor *tensor,
-        const SFALayout &layout, const std::string &name);
-    void SetSFAShapeCompare();
+        const STALayout &layout, const std::string &name);
+    void SetSTAShapeCompare();
     ge::graphStatus CheckQRope();
     ge::graphStatus CheckQRopeShape();
     ge::graphStatus CheckVAndKRopeShapeForBatchContinuous();
@@ -436,8 +435,8 @@ private:
 private:
     const char *opName_;
     fe::PlatFormInfos *platformInfo_;
-    SFAParaInfo opParamInfo_;
-    const SFATilingInfo &sfaInfo_;
+    STAParaInfo opParamInfo_;
+    const STATilingInfo &staInfo_;
 
     uint32_t bSize_ = 0;
     uint32_t n1Size_ = 0;
@@ -454,10 +453,10 @@ private:
     uint32_t sparseBlockCount_ = 0;
     int64_t sparseBlockSize_ = 0;
 
-    SFALayout qLayout_ = SFALayout::BSND;
-    SFALayout topkLayout_ = SFALayout::BSND;
-    SFALayout outLayout_ = SFALayout::BSND;
-    SFALayout kvLayout_ = SFALayout::BSND;
+    STALayout qLayout_ = STALayout::BSND;
+    STALayout topkLayout_ = STALayout::BSND;
+    STALayout outLayout_ = STALayout::BSND;
+    STALayout kvLayout_ = STALayout::BSND;
 
     uint32_t maxBlockNumPerBatch_ = 0;
     int64_t blockSize_ = 0;
@@ -482,17 +481,17 @@ private:
     gert::Shape attenOutShapeCmp_{};
 };
 
-class SFAInfoParser {
+class STAInfoParser {
 public:
-    explicit SFAInfoParser(const gert::TilingContext *context) : context_(context) {}
-    ~SFAInfoParser() = default;
+    explicit STAInfoParser(const gert::TilingContext *context) : context_(context) {}
+    ~STAInfoParser() = default;
 
     ge::graphStatus CheckRequiredInOutExistence() const;
     ge::graphStatus CheckRequiredAttrExistence() const;
     ge::graphStatus CheckRequiredParaExistence() const;
 
     ge::graphStatus GetActualSeqLenSize(uint32_t &size, const gert::Tensor *tensor,
-        SFALayout &layout, const std::string &name);
+        STALayout &layout, const std::string &name);
     ge::graphStatus GetActualSeqLenQSize(uint32_t &size);
     ge::graphStatus GetOpName();
     ge::graphStatus GetNpuInfo();
@@ -511,7 +510,7 @@ public:
     ge::graphStatus GetS1Size();
     ge::graphStatus GetKvStorageMode();
     ge::graphStatus GetKvLayout();
-    void SetSFAShape();
+    void SetSTAShape();
     ge::graphStatus GetS2SizeForBatchContinuous();
     ge::graphStatus GetMaxBlockNumPerBatch();
     ge::graphStatus GetBlockSize();
@@ -526,19 +525,19 @@ public:
     ge::graphStatus GetGSize();
     ge::graphStatus GetSparseBlockCount();
     ge::graphStatus GetActualseqInfo();
-    void GenerateInfo(SFATilingInfo &sfaInfo);
-    ge::graphStatus Parse(SFATilingInfo &sfaInfo);
+    void GenerateInfo(STATilingInfo &staInfo);
+    ge::graphStatus Parse(STATilingInfo &staInfo);
 
 public:
-    bool HasAxis(const SFAAxis &axis, const SFALayout &layout, const gert::Shape &shape) const;
-    size_t GetAxisIdx(const SFAAxis &axis, const SFALayout &layout) const;
-    uint32_t GetAxisNum(const gert::Shape &shape, const SFAAxis &axis,const SFALayout &layout) const;
+    bool HasAxis(const STAAxis &axis, const STALayout &layout, const gert::Shape &shape) const;
+    size_t GetAxisIdx(const STAAxis &axis, const STALayout &layout) const;
+    uint32_t GetAxisNum(const gert::Shape &shape, const STAAxis &axis,const STALayout &layout) const;
 
     const gert::TilingContext *context_ = nullptr;
 
     const char *opName_;
     fe::PlatFormInfos *platformInfo_;
-    SFAParaInfo opParamInfo_;
+    STAParaInfo opParamInfo_;
     static constexpr int64_t invalidDimValue_ = std::numeric_limits<int64_t>::min();
 
     uint32_t bSize_ = 0;
@@ -555,10 +554,10 @@ public:
     KvStorageMode kvStorageMode_ = KvStorageMode::BATCH_CONTINUOUS;
     uint32_t sparseBlockCount_ = 0;
 
-    SFALayout qLayout_ = SFALayout::BSND;
-    SFALayout topkLayout_ = SFALayout::BSND;
-    SFALayout outLayout_ = SFALayout::BSND;
-    SFALayout kvLayout_ = SFALayout::BSND;
+    STALayout qLayout_ = STALayout::BSND;
+    STALayout topkLayout_ = STALayout::BSND;
+    STALayout outLayout_ = STALayout::BSND;
+    STALayout kvLayout_ = STALayout::BSND;
 
     uint32_t maxBlockNumPerBatch_ = 0;
     uint32_t blockSize_ = 0;
@@ -588,6 +587,5 @@ public:
     gert::Shape keyRopeShape_{};
 };
 
-} // namespace sta
 } // namespace optiling
 #endif // SPARSE_TAIL_ATTENTION_TILING_H

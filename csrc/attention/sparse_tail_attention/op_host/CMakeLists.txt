@@ -2,12 +2,12 @@ add_op_to_compiled_list()
 
 if (BUILD_OPEN_PROJECT)
     target_sources(op_host_aclnn PRIVATE
-        fused_copy_sfa_mtp_def.cpp
+        sparse_tail_attention_def.cpp
     )
 endif()
 
 add_ops_compile_options(
-    OP_NAME FusedCopySfaMtp
+    OP_NAME SparseTailAttention
     OPTIONS
         --cce-auto-sync=off
         -Wno-deprecated-declarations
@@ -17,10 +17,8 @@ add_ops_compile_options(
 )
 
 if (NOT BUILD_OPS_RTY_KERNEL)
-    set(fused_copy_sfa_mtp_depends "attention/fused_copy_sfa" CACHE INTERNAL "")
-    add_modules_sources(OPTYPE fused_copy_sfa_mtp ACLNNTYPE aclnn)
+    add_modules_sources(OPTYPE sparse_tail_attention ACLNNTYPE aclnn)
     target_include_directories(${OPHOST_NAME}_tiling_obj PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}
-        ${CMAKE_CURRENT_SOURCE_DIR}/../../sparse_tail_attention/op_host
     )
 endif()

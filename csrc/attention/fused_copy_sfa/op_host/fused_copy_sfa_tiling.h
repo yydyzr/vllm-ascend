@@ -1,10 +1,9 @@
-#ifndef FUSED_COPY_SFA_TILING_H
-#define FUSED_COPY_SFA_TILING_H
+#ifndef FUSED_COPY_STA_TILING_H
+#define FUSED_COPY_STA_TILING_H
 
 #include "../../sparse_tail_attention/op_host/sparse_tail_attention_tiling.h"
 
 namespace optiling {
-using namespace sta;
 
 BEGIN_TILING_DATA_DEF(FusedCopySfaTilingData)
 TILING_DATA_FIELD_DEF_STRUCT(SparseTailAttentionBaseParamsMla, baseParams);

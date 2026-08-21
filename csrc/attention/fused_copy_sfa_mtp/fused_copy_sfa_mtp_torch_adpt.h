@@ -1,5 +1,5 @@
-#ifndef FUSED_COPY_SFA_MTP_TORCH_ADPT_H
-#define FUSED_COPY_SFA_MTP_TORCH_ADPT_H
+#ifndef FUSED_COPY_STA_MTP_TORCH_ADPT_H
+#define FUSED_COPY_STA_MTP_TORCH_ADPT_H
 
 namespace vllm_ascend {
 

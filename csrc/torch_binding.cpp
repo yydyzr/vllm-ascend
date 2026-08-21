@@ -52,6 +52,7 @@
 #include "attention/fused_copy_sfa_mtp/fused_copy_sfa_mtp_torch_adpt.h"
 #include "attention/fused_li_manage/fused_li_manage_torch_adpt.h"
 #include "attention/fused_copy_sfa/fused_copy_sfa_torch_adpt.h"
+#include "attention/sparse_tail_attention/sparse_tail_attention_torch_adpt.h"
 #include <c10/core/Device.h>
 #include <c10/core/Scalar.h>
 #include <c10/util/Exception.h>
@@ -2579,6 +2580,17 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
     );
     ops.impl("npu_fused_copy_sfa", torch::kPrivateUse1,
              &vllm_ascend::npu_fused_copy_sfa);
+
+    // sparse_tail_attention
+    ops.def(
+        "npu_sparse_tail_attention(Tensor query_rope, Tensor query, "
+        "Tensor actual_seq_lengths_query, Tensor actual_seq_lengths_kv, "
+        "Tensor num_cache_tokens, Tensor topk_dst_slots, "
+        "Tensor hbm_block_table, Tensor hbm_k_rope, Tensor hbm_kv_cache, "
+        "float scale_value, Tensor(a!) attention_out) -> ()"
+    );
+    ops.impl("npu_sparse_tail_attention", torch::kPrivateUse1,
+             &vllm_ascend::npu_sparse_tail_attention);
 
     ops.def(
         "npu_sparse_attention_score("

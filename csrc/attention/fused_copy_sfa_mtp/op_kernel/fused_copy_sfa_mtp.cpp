@@ -1,11 +1,11 @@
 #include "kernel_operator.h"
 #define C_TEMPLATE 0
 #define V_TEMPLATE 1
-#define SFA_CANONICAL_SOURCE_TILES 1
+#define STA_CANONICAL_SOURCE_TILES 1
 
 // OPC generates only this operator's tiling class.  The fused payload has the
-// complete production SFA payload as its prefix, so expose it under the type
-// name expected by the shared SFA implementation (the same pattern used by
+// complete production STA payload as its prefix, so expose it under the type
+// name expected by the shared STA implementation (the same pattern used by
 // the non-MTP fused_copy_sfa kernel).
 using SparseTailAttentionTilingDataMla =
     FusedCopySfaMtpTilingData;
@@ -39,15 +39,15 @@ __aicore__ inline void RunFusedMtp(
     __gm__ uint8_t *tiling,
     TPipe *pipe)
 {
-    // The source-aware SFA path reuses each query-level DRAM gather for the
+    // The source-aware STA path reuses each query-level DRAM gather for the
     // persistent HBM update.  Compact union metadata remains part of the ABI
     // for metadata/COPYSFA composition but needs no separate pre-copy pass.
     (void)missSourceIds;
     (void)missDestinationSlots;
 
-    using MtpType = SFAType<
-        T, T, T, false, SFA_LAYOUT::TND, SFA_LAYOUT::PA_BSND,
-        V_TEMPLATE, SFA_STAGE_NORMAL, true, true>;
+    using MtpType = STAType<
+        T, T, T, false, STA_LAYOUT::TND, STA_LAYOUT::PA_BSND,
+        V_TEMPLATE, STA_STAGE_NORMAL, true, true>;
     SparseTailAttentionMla<MtpType> attention;
     const auto *attentionTiling = reinterpret_cast<
         const SparseTailAttentionTilingDataMla *>(fusedTiling);

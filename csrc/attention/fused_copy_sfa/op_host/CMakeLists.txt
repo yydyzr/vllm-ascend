@@ -23,7 +23,4 @@ if (NOT BUILD_OPS_RTY_KERNEL)
         ${CMAKE_CURRENT_SOURCE_DIR}
         ${CMAKE_CURRENT_SOURCE_DIR}/../../sparse_tail_attention/op_host
     )
-    target_sources(${OPHOST_NAME}_tiling_obj PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/../../sparse_tail_attention/op_host/sparse_tail_attention_tiling.cpp
-    )
 endif()

@@ -554,7 +554,7 @@ def call_mtp_with_buffers(
     miss_destination_slots: torch.Tensor,
     miss_counts: torch.Tensor,
 ):
-    torch.ops._C_ascend.npu_fused_li_manage_mtp.default(
+    torch.ops._C_ascend.npu_fused_li_manage_mtp(
         case.query,
         case.weights,
         case.key,
@@ -907,7 +907,7 @@ def test_meta_check():
         torch.empty(expected_shapes[3], device=meta, dtype=torch.int32),
         torch.empty(expected_shapes[4], device=meta, dtype=torch.int32),
     )
-    result = torch.ops._C_ascend.npu_fused_li_manage_mtp.default(
+    result = torch.ops._C_ascend.npu_fused_li_manage_mtp(
         query,
         weights,
         key,

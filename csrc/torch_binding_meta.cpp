@@ -1487,6 +1487,22 @@ void npu_fused_copy_sfa_meta(
     return;
 }
 
+void npu_sparse_tail_attention_meta(
+    const at::Tensor &query_rope,
+    const at::Tensor &query,
+    const at::Tensor &actual_seq_lengths_query,
+    const at::Tensor &actual_seq_lengths_kv,
+    const at::Tensor &num_cache_tokens,
+    const at::Tensor &topk_dst_slots,
+    const at::Tensor &hbm_block_table,
+    const at::Tensor &hbm_k_rope,
+    const at::Tensor &hbm_kv_cache,
+    double scale_value,
+    at::Tensor attention_out)
+{
+    return;
+}
+
 } // namespace meta
 } // namespace vllm_ascend
 
@@ -1596,6 +1612,8 @@ TORCH_LIBRARY_IMPL_EXPAND(CONCAT(_C, _ascend), Meta, ops) {
     ops.impl("npu_fused_li_manage", &vllm_ascend::meta::npu_fused_li_manage_meta);
     // fused_copy_sfa
     ops.impl("npu_fused_copy_sfa", &vllm_ascend::meta::npu_fused_copy_sfa_meta);
+    // sparse_tail_attention
+    ops.impl("npu_sparse_tail_attention", &vllm_ascend::meta::npu_sparse_tail_attention_meta);
 }
 }
 #endif

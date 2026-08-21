@@ -19,9 +19,9 @@
 
 using namespace AscendC;
 
-#define SFA_OP_IMPL(templateClass, tilingdataClass, ...)                                          \
+#define STA_OP_IMPL(templateClass, tilingdataClass, ...)                                          \
     do {                                                                                          \
-        templateClass<SFAType<__VA_ARGS__, SFA_STAGE_NORMAL, false>> op;                           \
+        templateClass<STAType<__VA_ARGS__, STA_STAGE_NORMAL, false>> op;                           \
         GET_TILING_DATA_WITH_STRUCT(tilingdataClass, tiling_data_in, tiling);                     \
         const tilingdataClass *__restrict tiling_data = &tiling_data_in;                          \
         op.Init(query, key, value, sparseIndices, cacheTokens, nullptr, actualSeqLengthsQuery, actualSeqLengthsKV, \
@@ -45,10 +45,10 @@ sparse_tail_attention(__gm__ uint8_t *query, __gm__ uint8_t *key, __gm__ uint8_t
 
     if constexpr (ORIG_DTYPE_QUERY == DT_FLOAT16 && ORIG_DTYPE_KEY == DT_FLOAT16 &&
                   ORIG_DTYPE_ATTENTION_OUT == DT_FLOAT16) {
-        SFA_OP_IMPL(SparseTailAttentionMla, SparseTailAttentionTilingDataMla, half, half, half,
-            FLASH_DECODE, static_cast<SFA_LAYOUT>(LAYOUT_T), static_cast<SFA_LAYOUT>(KV_LAYOUT_T), TEMPLATE_MODE);
+        STA_OP_IMPL(SparseTailAttentionMla, SparseTailAttentionTilingDataMla, half, half, half,
+            FLASH_DECODE, static_cast<STA_LAYOUT>(LAYOUT_T), static_cast<STA_LAYOUT>(KV_LAYOUT_T), TEMPLATE_MODE);
     } else { // bf16
-        SFA_OP_IMPL(SparseTailAttentionMla, SparseTailAttentionTilingDataMla, bfloat16_t, bfloat16_t, bfloat16_t,
-            FLASH_DECODE, static_cast<SFA_LAYOUT>(LAYOUT_T), static_cast<SFA_LAYOUT>(KV_LAYOUT_T), TEMPLATE_MODE);
+        STA_OP_IMPL(SparseTailAttentionMla, SparseTailAttentionTilingDataMla, bfloat16_t, bfloat16_t, bfloat16_t,
+            FLASH_DECODE, static_cast<STA_LAYOUT>(LAYOUT_T), static_cast<STA_LAYOUT>(KV_LAYOUT_T), TEMPLATE_MODE);
     }
 }
