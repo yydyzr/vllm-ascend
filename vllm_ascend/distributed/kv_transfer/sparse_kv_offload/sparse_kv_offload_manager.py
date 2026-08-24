@@ -481,20 +481,8 @@ class SparseKVOffloadManager:
     def _use_nano_fused_op(self) -> bool:
         return self.sparse_kv_offload_config.fused_op_type == "nano"
 
-    def _restore_bfloat16_tensor(
-        self,
-        ptr: int,
-        shape: list[int],
-        *,
-        as_privateuse1: bool = False,
-    ) -> torch.Tensor:
-        device_index = int(torch_npu.npu.current_device()) if as_privateuse1 else 0
-        view = self.sparse_kv_offload_cpp.restore_bfloat16_tensor(
-            ptr,
-            shape,
-            as_privateuse1,
-            device_index,
-        )
+    def _restore_bfloat16_tensor(self, ptr: int, shape: list[int]) -> torch.Tensor:
+        view = self.sparse_kv_offload_cpp.restore_bfloat16_tensor(ptr, shape)
         if int(view.data_ptr()) != int(ptr):
             raise RuntimeError(
                 "restore_bfloat16_tensor returned a tensor with unexpected data_ptr: "
@@ -644,12 +632,9 @@ class SparseKVOffloadManager:
                 )
             )
 
-        # fused_copy_sfa needs a DRAM tensor on every TP rank. TP0 owns the
-        # shared host pool; other ranks only wrap the broadcast GVA.
-        # Additionally build NPU-tagged views of the same GVA for fused_copy_sfa
-        # device checks (D2H still uses the CPU-tagged owner/view via data_ptr).
-        self.k_caches_dram: list[torch.Tensor] = []
-        self.v_caches_dram: list[torch.Tensor] = []
+        # fused_copy_sfa reads DRAM KV from host tensors on every TP rank.
+        # TP0 owns the shared host pool; other ranks wrap the broadcast GVA as
+        # CPU views (same physical storage).
         if use_nano:
             if self.tp_rank != 0:
                 cpu_k_shape = [int(x) for x in shape_k_tensor.tolist()]
@@ -677,24 +662,6 @@ class SparseKVOffloadManager:
                     self.num_layers,
                     cpu_k_shape,
                     cpu_v_shape,
-                )
-            # NPU-tagged host views for fused_copy_sfa (same physical GVA).
-            for layer_id in range(self.num_layers):
-                k_cpu = self.k_caches_cpu[layer_id]
-                v_cpu = self.v_caches_cpu[layer_id]
-                self.k_caches_dram.append(
-                    self._restore_bfloat16_tensor(
-                        int(k_cpu.data_ptr()),
-                        list(k_cpu.shape),
-                        as_privateuse1=True,
-                    )
-                )
-                self.v_caches_dram.append(
-                    self._restore_bfloat16_tensor(
-                        int(v_cpu.data_ptr()),
-                        list(v_cpu.shape),
-                        as_privateuse1=True,
-                    )
                 )
 
         gvas_buffer_offset = 0
@@ -1172,15 +1139,15 @@ class SparseKVOffloadManager:
         return out
 
     def dram_kv_pair_for_fused(self, layer_name: str) -> tuple[torch.Tensor, torch.Tensor]:
-        """DRAM CKV/KPE as ``[blocks, block_size, dim]`` for fused_copy_sfa."""
+        """Host DRAM CKV/KPE as ``[blocks, block_size, dim]`` for fused_copy_sfa."""
         layer_id = self._get_offload_layer_id(layer_name)
-        if layer_id >= len(self.k_caches_dram) or layer_id >= len(self.v_caches_dram):
+        if layer_id >= len(self.k_caches_cpu) or layer_id >= len(self.v_caches_cpu):
             raise RuntimeError(
-                "nano fused_copy_sfa requires NPU-tagged DRAM KV views on all TP ranks, "
+                "nano fused_copy_sfa requires host DRAM KV views on all TP ranks, "
                 f"layer={layer_name}, tp_rank={self.tp_rank}"
             )
-        k_dram = self.k_caches_dram[layer_id]
-        v_dram = self.v_caches_dram[layer_id]
+        k_dram = self.k_caches_cpu[layer_id]
+        v_dram = self.v_caches_cpu[layer_id]
         if k_dram.ndim == 4 and k_dram.size(2) == 1:
             k_dram = k_dram.squeeze(2)
         if v_dram.ndim == 4 and v_dram.size(2) == 1:

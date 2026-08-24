@@ -23,10 +23,13 @@ namespace vllm_ascend {
 //   dram_block_table        - int32 [B, DRAM_MAX_BLOCKS], read-only, DRAM block table
 //   hbm_k_rope              - bf16/fp16 [HBM_BLOCKS, 128, 1, 64], read-write, HBM KV cache (rope), attention input and copy dest
 //   hbm_kv_cache            - bf16/fp16 [HBM_BLOCKS, 128, 1, 512], read-write, HBM KV cache (nope), attention input and copy dest
-//   dram_k_rope             - bf16/fp16 [DRAM_BLOCKS, 128, 64], read-only, DRAM KV cache (rope), copy source
-//   dram_kv_cache           - bf16/fp16 [DRAM_BLOCKS, 128, 512], read-only, DRAM KV cache (nope), copy source
+//   dram_k_rope             - bf16/fp16 [DRAM_BLOCKS, 128, 64], read-only, host DRAM KV (rope)
+//   dram_kv_cache           - bf16/fp16 [DRAM_BLOCKS, 128, 512], read-only, host DRAM KV (nope)
 //   scale_value             - float, read-only, attention scale
 //   attention_out           - bf16/fp16 [B*4, N, 512], write-only, 4-way causal sparse attention result
+//
+// Offloaded DRAM KV sources (dram_k_rope / dram_kv_cache) may reside on host
+// or on the query NPU device. All other tensors must be on the query NPU.
 inline void npu_fused_copy_sfa_mtp(
     const at::Tensor& query_rope,
     const at::Tensor& query,
@@ -139,19 +142,21 @@ inline void npu_fused_copy_sfa_mtp(
   }
 
   const auto device = query.device();
+  // Offloaded DRAM KV may reside on host or NPU; everything else must match query.
   for (const at::Tensor* tensor :
-       std::array<const at::Tensor*, 17>{
+       std::array<const at::Tensor*, 15>{
            &query_rope, &query, &actual_seq_lengths_query,
            &actual_seq_lengths_kv, &num_cache_tokens, &topk_dst_slots,
            &topk_src_ids, &miss_src_ids, &miss_dst_slots, &miss_counts,
            &hbm_block_table, &dram_block_table, &hbm_k_rope,
-           &hbm_kv_cache, &dram_k_rope, &dram_kv_cache,
-           &attention_out}) {
+           &hbm_kv_cache, &attention_out}) {
     TORCH_CHECK(tensor->device() == device,
-                "All fused MTP tensors must be on the same NPU.");
+                "All non-DRAM fused MTP tensors must be on the same NPU.");
     TORCH_CHECK(tensor->is_contiguous(),
                 "All fused MTP tensors must be contiguous.");
   }
+  TORCH_CHECK(dram_k_rope.is_contiguous() && dram_kv_cache.is_contiguous(),
+              "DRAM fused MTP tensors must be contiguous.");
 
   std::string query_layout = "TND";
   std::string kv_layout = "PA_BSND";

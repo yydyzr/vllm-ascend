@@ -841,19 +841,8 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
 
         # HBM: buffer_k = CKV (kv_lora), buffer_v = KPE (rope)
         hbm_kv_cache, hbm_k_rope = manager.hbm_kv_pair_for_fused(layer_name)
-        # DRAM: k_cpu = CKV, v_cpu = KPE
+        # DRAM: host-side offload pool (k_cpu = CKV, v_cpu = KPE)
         dram_kv_cache, dram_k_rope = manager.dram_kv_pair_for_fused(layer_name)
-
-        # Adapter requires DRAM tensors on the same NPU device as query.
-        # Shared GVA views restored as CPU must be NPU-tagged host tensors once
-        # the custom op is installed; fail clearly until then.
-        if dram_kv_cache.device != q.device or dram_k_rope.device != q.device:
-            raise RuntimeError(
-                "nano fused_copy_sfa requires DRAM KV tensors on the query NPU device "
-                f"(got dram_ckv={dram_kv_cache.device}, query={q.device}). "
-                "Provide NPU-visible host/swapped views of the shared GVA when "
-                "registering fused_copy_sfa under torch.ops._C_ascend."
-            )
 
         offload_lens = attn_metadata.offload_seq_lengths_key[:num_decodes].to(dtype=torch.int32)
         seq_lens = actual_seq_lengths_key[:num_decodes].to(dtype=torch.int32)

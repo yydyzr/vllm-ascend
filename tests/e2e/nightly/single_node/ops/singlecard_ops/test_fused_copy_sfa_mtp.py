@@ -60,11 +60,9 @@ def _apply_scatter_reference(
         expected_ckv[dst_blocks, dst_offsets] = dram_ckv[src_blocks, src_offsets]
 
 
-def _swapped_from_cpu(cpu, device):
-    tensor = torch_npu.empty_with_swapped_memory(cpu.shape, dtype=cpu.dtype, device=device)
-    tensor.fill_(0)
-    tensor.add_(cpu.to(device))
-    return tensor
+def _host_from_cpu(cpu):
+    """Offloaded DRAM KV stays on host for fused_copy_sfa_mtp."""
+    return cpu.contiguous()
 
 
 def _random_block_table(batch_size, blocks_per_request, generator):
@@ -232,8 +230,8 @@ def test_fused_copy_sfa_mtp_chain(device, batch_size, heads, source_len,
                                  generator=generator, dtype=torch.float32).mul_(0.25).to(torch.bfloat16)
     query = query_cpu.to(device)
     query_rope = query_rope_cpu.to(device)
-    dram_kpe = _swapped_from_cpu(dram_kpe_cpu, device)
-    dram_ckv = _swapped_from_cpu(dram_ckv_cpu, device)
+    dram_kpe = _host_from_cpu(dram_kpe_cpu)
+    dram_ckv = _host_from_cpu(dram_ckv_cpu)
     dram_table = dram_table_cpu.to(device)
     hbm_table = hbm_table_cpu.to(device)
     actual_q = torch.arange(QUERY_COUNT, batch_size * QUERY_COUNT + 1,
@@ -306,8 +304,8 @@ def test_fused_copy_sfa_mtp_graph(device, batch_size, heads, source_len,
                                  generator=generator, dtype=torch.float32).mul_(0.25).to(torch.bfloat16)
     query = query_cpu.to(device)
     query_rope = query_rope_cpu.to(device)
-    dram_kpe = _swapped_from_cpu(dram_kpe_cpu, device)
-    dram_ckv = _swapped_from_cpu(dram_ckv_cpu, device)
+    dram_kpe = _host_from_cpu(dram_kpe_cpu)
+    dram_ckv = _host_from_cpu(dram_ckv_cpu)
     dram_table = dram_table_cpu.to(device)
     hbm_table = hbm_table_cpu.to(device)
     actual_q = torch.arange(QUERY_COUNT, batch_size * QUERY_COUNT + 1,

@@ -28,11 +28,9 @@ KPE_DIM = 64
 SPARSE_COUNT = 2048
 
 
-def _swapped_from_cpu(cpu, device):
-    tensor = torch_npu.empty_with_swapped_memory(cpu.shape, dtype=cpu.dtype, device=device)
-    tensor.fill_(0)
-    tensor.add_(cpu.to(device))
-    return tensor
+def _host_from_cpu(cpu):
+    """Offloaded DRAM KV stays on host for fused_copy_sfa."""
+    return cpu.contiguous()
 
 
 def _logical_rows(cache, block_table, request, logical_slots):
@@ -68,8 +66,8 @@ def _make_case(device, batch, heads, source_len, cache_tokens, tail_tokens, seed
     dram_table = dram_table_cpu.to(device)
     dram_kpe_cpu = torch.randn(batch * source_blocks, BLOCK_SIZE, KPE_DIM, dtype=torch.float32).mul_(0.25).to(torch.bfloat16)
     dram_ckv_cpu = torch.randn(batch * source_blocks, BLOCK_SIZE, CKV_DIM, dtype=torch.float32).mul_(0.25).to(torch.bfloat16)
-    dram_kpe = _swapped_from_cpu(dram_kpe_cpu, device)
-    dram_ckv = _swapped_from_cpu(dram_ckv_cpu, device)
+    dram_kpe = _host_from_cpu(dram_kpe_cpu)
+    dram_ckv = _host_from_cpu(dram_ckv_cpu)
     total_hbm_blocks = batch * cache_blocks
     initial_kpe = torch.zeros(total_hbm_blocks, BLOCK_SIZE, 1, KPE_DIM, dtype=torch.bfloat16, device=device)
     initial_ckv = torch.zeros(total_hbm_blocks, BLOCK_SIZE, 1, CKV_DIM, dtype=torch.bfloat16, device=device)
