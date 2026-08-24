@@ -48,6 +48,11 @@
 #include "attention/sparse_attention_score/sparse_attention_score_torch_adpt.h"
 #include "attention/store_kv_block/store_kv_block_torch_adpt.h"
 #include "attention/store_kv_block_metadata/store_kv_block_metadata_torch_adpt.cpp"
+#include "attention/fused_li_manage_mtp/fused_li_manage_mtp_torch_adpt.h"
+#include "attention/fused_copy_sfa_mtp/fused_copy_sfa_mtp_torch_adpt.h"
+#include "attention/fused_li_manage/fused_li_manage_torch_adpt.h"
+#include "attention/fused_copy_sfa/fused_copy_sfa_torch_adpt.h"
+#include "attention/sparse_tail_attention/sparse_tail_attention_torch_adpt.h"
 #include <c10/core/Device.h>
 #include <c10/core/Scalar.h>
 #include <c10/util/Exception.h>
@@ -2524,6 +2529,68 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
         "store_kv_block(Tensor key_in, Tensor key_cache_in, Tensor group_len, Tensor group_key_idx,Tensor group_key_cache_idx, int block_size=0) -> ()"
     );
     ops.impl("store_kv_block", torch::kPrivateUse1, &vllm_ascend::store_kv_block);
+
+    // fused_li_manage_mtp
+    ops.def(
+        "npu_fused_li_manage_mtp(Tensor query, Tensor index_weights, Tensor index_key_cache, "
+        "Tensor index_block_table, Tensor num_candidate_tokens, Tensor num_cache_tokens, "
+        "Tensor req_pool_entries, Tensor(a!) cache_slots_pool, Tensor(b!) topk_src_ids, "
+        "Tensor(c!) topk_dst_slots, Tensor(d!) miss_src_ids, Tensor(e!) miss_dst_slots, "
+        "Tensor(f!) miss_counts) -> ()"
+    );
+    ops.impl("npu_fused_li_manage_mtp", torch::kPrivateUse1,
+             &vllm_ascend::npu_fused_li_manage_mtp);
+
+    // fused_copy_sfa_mtp
+    ops.def(
+        "npu_fused_copy_sfa_mtp(Tensor query_rope, Tensor query, "
+        "Tensor actual_seq_lengths_query, Tensor actual_seq_lengths_kv, "
+        "Tensor num_cache_tokens, Tensor topk_dst_slots, Tensor topk_src_ids, "
+        "Tensor miss_src_ids, Tensor miss_dst_slots, Tensor miss_counts, "
+        "Tensor hbm_block_table, Tensor dram_block_table, "
+        "Tensor(a!) hbm_k_rope, Tensor(b!) hbm_kv_cache, "
+        "Tensor dram_k_rope, Tensor dram_kv_cache, float scale_value, "
+        "Tensor(c!) attention_out) -> ()"
+    );
+    ops.impl("npu_fused_copy_sfa_mtp", torch::kPrivateUse1,
+             &vllm_ascend::npu_fused_copy_sfa_mtp);
+
+    // fused_li_manage
+    ops.def(
+        "npu_fused_li_manage(Tensor query, Tensor index_weights, "
+        "Tensor index_key_cache, Tensor index_block_table, "
+        "Tensor num_candidate_tokens, Tensor num_cache_tokens, "
+        "Tensor req_pool_entries, Tensor(a!) cache_slots_pool, "
+        "Tensor(b!) topk_src_ids, Tensor(c!) topk_dst_slots, "
+        "Tensor(d!) miss_counts) -> ()"
+    );
+    ops.impl("npu_fused_li_manage", torch::kPrivateUse1,
+             &vllm_ascend::npu_fused_li_manage);
+
+    // fused_copy_sfa
+    ops.def(
+        "npu_fused_copy_sfa(Tensor query_rope, Tensor query, "
+        "Tensor actual_seq_lengths_query, Tensor actual_seq_lengths_kv, "
+        "Tensor num_cache_tokens, Tensor topk_dst_slots, "
+        "Tensor topk_src_ids, Tensor miss_counts, "
+        "Tensor hbm_block_table, Tensor dram_block_table, "
+        "Tensor(a!) hbm_k_rope, Tensor(b!) hbm_kv_cache, "
+        "Tensor dram_k_rope, Tensor dram_kv_cache, float scale_value, "
+        "Tensor(c!) attention_out) -> ()"
+    );
+    ops.impl("npu_fused_copy_sfa", torch::kPrivateUse1,
+             &vllm_ascend::npu_fused_copy_sfa);
+
+    // sparse_tail_attention
+    ops.def(
+        "npu_sparse_tail_attention(Tensor query_rope, Tensor query, "
+        "Tensor actual_seq_lengths_query, Tensor actual_seq_lengths_kv, "
+        "Tensor num_cache_tokens, Tensor topk_dst_slots, "
+        "Tensor hbm_block_table, Tensor hbm_k_rope, Tensor hbm_kv_cache, "
+        "float scale_value, Tensor(a!) attention_out) -> ()"
+    );
+    ops.impl("npu_sparse_tail_attention", torch::kPrivateUse1,
+             &vllm_ascend::npu_sparse_tail_attention);
 
     ops.def(
         "npu_sparse_attention_score("

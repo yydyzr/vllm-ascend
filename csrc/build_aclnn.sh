@@ -128,6 +128,11 @@ elif [[ "$SOC_VERSION" =~ ^ascend910b ]]; then
         "store_kv_block"
         "store_kv_block_metadata"
         "sparse_attention_score"
+        "fused_li_manage_mtp"
+        "fused_copy_sfa_mtp"
+        "fused_li_manage"
+        "fused_copy_sfa"
+        "sparse_tail_attention"
     )
 
     CUSTOM_OPS=$(IFS=';'; echo "${CUSTOM_OPS_ARRAY[*]}")
@@ -174,6 +179,11 @@ elif [[ "$SOC_VERSION" =~ ^ascend910_93 ]]; then
         "store_kv_block"
         "store_kv_block_metadata"
         "sparse_attention_score"
+        "fused_li_manage_mtp"
+        "fused_copy_sfa_mtp"
+        "fused_li_manage"
+        "fused_copy_sfa"
+        "sparse_tail_attention"
     )
     CUSTOM_OPS=$(IFS=';'; echo "${CUSTOM_OPS_ARRAY[*]}")
     SOC_ARG="ascend910_93"
