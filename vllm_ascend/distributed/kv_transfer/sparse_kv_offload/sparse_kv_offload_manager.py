@@ -1584,10 +1584,10 @@ def update_sparse_kv_offload_metadata(
     if sparse_kv_offload_config.fused_op_type == "nano":
         manager = get_sparse_kv_offload_manager()
         manager.clear_nano_init_step()
-        num_decode_reqs = (num_scheduled_tokens_np <= decode_threshold).sum()
+        num_decode_reqs = int((num_scheduled_tokens_np <= decode_threshold).sum())
         if num_decode_reqs <= 0:
             return
-        num_decode_tokens = num_scheduled_tokens_np[:num_decode_reqs].sum()
+        num_decode_tokens = int(num_scheduled_tokens_np[:num_decode_reqs].sum())
         tail_block_num = 2
 
         # req_topk_buffer_slots
