@@ -258,7 +258,8 @@ class AscendCommonAttentionMetadata(CommonAttentionMetadata):
     # slot_mapping & block_table corresponding to device kv cache (topk_buffer + 2 tail blocks)
     device_slot_mapping: torch.Tensor | None = None
     device_block_table: torch.Tensor | None = None
-    # seq_len of offloaded full blocks (tail_length = actual_seq_len_key - offload_seq_lengths_key)
+    # tokens before this step's dense-start block (LIM candidates);
+    # dense_tail_len = actual_seq_len_key - offload_seq_lengths_key
     offload_seq_lengths_key: torch.Tensor | None = None
     # history hot kv record for fused_li_manage operator hot kv reuse
     cache_state: torch.Tensor | None = None

@@ -1607,14 +1607,36 @@ def update_sparse_kv_offload_metadata(
         offload_device_slot_mapping.np[:num_decode_tokens] = device_slot_mapping
         offload_device_slot_mapping.copy_to_gpu()
 
+        # Dense = blocks touched by this step's new tokens (MTP may span 2).
+        # Earlier complete blocks are LIM candidates. Non-MTP (1 token) is the
+        # same rule with span 0. Physical circular capacity stays ``tail_block_num``.
+        decode_query_lens = query_lens[:num_decode_reqs]
+        start_positions = positions_np[query_start_loc.np[:num_decode_reqs]]
+        end_positions = start_positions + decode_query_lens - 1
+        dense_start_block = (start_positions // block_size).astype(np.int64, copy=False)
+        dense_end_block = (end_positions // block_size).astype(np.int64, copy=False)
+        dense_span = dense_end_block - dense_start_block
+        if np.any(dense_span >= tail_block_num):
+            raise RuntimeError(
+                "nano dense tail exceeds circular capacity: "
+                f"dense_span={dense_span.tolist()}, tail_block_num={tail_block_num}, "
+                f"start_positions={start_positions.tolist()}, "
+                f"end_positions={end_positions.tolist()}"
+            )
+        offloaded_block_num = dense_start_block
+        offload_seq_lengths_key.cpu[:num_decode_reqs] = offloaded_block_num * block_size
+        offload_seq_lengths_key.copy_to_gpu()
+
         # device_block_table
+        # Hot region: identity blocks [0, C/block_size).
+        # Dense tail columns: chronological physical blocks starting at
+        # ``dense_start_block % tail_block_num`` (writes use ``pos % (2*bs)``).
         device_block_table_np = offload_device_block_table.np[:num_decode_reqs]
         device_block_table_np.fill(0)
         topk_buffer_block_num = topk_buffer_size // block_size
         device_block_table_np[..., :topk_buffer_block_num] = \
             np.expand_dims(np.arange(topk_buffer_block_num), axis=0).repeat(num_decode_reqs, axis=0)
-        start_positions = positions_np[query_start_loc.np[:num_decode_reqs]]
-        device_block_table_np[..., topk_buffer_block_num] = (start_positions // block_size) % tail_block_num
+        device_block_table_np[..., topk_buffer_block_num] = dense_start_block % tail_block_num
         for tail_block_offset in range(1, tail_block_num):
             device_block_table_np[..., topk_buffer_block_num + tail_block_offset] = \
                 (device_block_table_np[..., topk_buffer_block_num + tail_block_offset - 1] + 1) % tail_block_num
@@ -1624,12 +1646,6 @@ def update_sparse_kv_offload_metadata(
         block_offset_of_req = block_offset_of_req.repeat(topk_buffer_block_num + tail_block_num, axis=1)
         device_block_table_np[..., :topk_buffer_block_num + tail_block_num] += block_offset_of_req
         offload_device_block_table.copy_to_gpu()
-
-        # offload_seq_lengths_key
-        total_block_num = cdiv(seq_lens_cpu_tensor[:num_decode_reqs], block_size)
-        offloaded_block_num = (total_block_num - tail_block_num).clamp(0)
-        offload_seq_lengths_key.cpu[:num_decode_reqs] = offloaded_block_num * block_size
-        offload_seq_lengths_key.copy_to_gpu()
 
         # cache_states and cache_slots_pool
         # NOTE Since we only need to update slots of new(first decode) requests and leave the other slots unchanged,
