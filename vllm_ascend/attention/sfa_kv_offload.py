@@ -356,8 +356,8 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
         return k_nope, k_pe
 
     def _pd_decode_consumer(self) -> bool:
-        # Prefix topk fill is for PD-disaggregated decode only; colocate/mixed
-        # first-decode init is intentionally out of scope for now.
+        # Kept for callers that distinguish PD-disagg decode; nano prefix
+        # init itself is no longer gated on this (colocate also needs it).
         return bool(self.is_kv_consumer and not self.is_kv_producer)
 
     def _maybe_nano_prefix_init(
@@ -368,11 +368,9 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
     ) -> None:
         if not manager.has_nano_init_step():
             return
-        if not self._pd_decode_consumer():
-            return
         if self._in_graph_runtime():
             raise RuntimeError(
-                "nano PD first-decode topk-buffer prefix init must remain eager"
+                "nano first-decode topk-buffer prefix init must remain eager"
             )
         num_decodes = int(attn_metadata.num_decodes or 0)
         if (
@@ -899,7 +897,9 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
         offload_lens = attn_metadata.offload_seq_lengths_key[:num_decodes].to(dtype=torch.int32)
         seq_lens = actual_seq_lengths_key[:num_decodes].to(dtype=torch.int32)
         tail_lens = (seq_lens - offload_lens).clamp_min(0)
-        # No LIM candidates => dense-tail only; do not attend the empty hot region.
+        # No LIM candidates => dense-tail only (num_cache_tokens=0). Metadata
+        # places dense physical blocks at the front of device_block_table for
+        # those rows so the kernel's tailSlotStart=0 maps to real KV.
         num_cache_tokens = torch.where(
             offload_lens > 0,
             manager.lim_num_cache_tokens[:num_decodes],
