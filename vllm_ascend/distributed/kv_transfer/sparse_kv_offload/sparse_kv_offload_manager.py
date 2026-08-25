@@ -1624,8 +1624,11 @@ def update_sparse_kv_offload_metadata(
                 f"end_positions={end_positions.tolist()}"
             )
         offloaded_block_num = dense_start_block
-        offload_seq_lengths_key.cpu[:num_decode_reqs] = offloaded_block_num * block_size
-        offload_seq_lengths_key.copy_to_gpu()
+        # Write via the numpy view: assigning ndarray into torch ``.cpu`` fails.
+        offload_seq_lengths_key.np[:num_decode_reqs] = (
+            offloaded_block_num * block_size
+        ).astype(offload_seq_lengths_key.np.dtype, copy=False)
+        offload_seq_lengths_key.copy_to_gpu(num_decode_reqs)
 
         # device_block_table
         # Hot region: identity blocks [0, C/block_size).
