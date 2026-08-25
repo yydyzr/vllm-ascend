@@ -684,6 +684,16 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
                         buffer_v,
                         dst_slots,
                     )
+                    if manager.nano_debug_enabled() and not manager._nano_debug_prefill_logged:
+                        manager._nano_debug_prefill_logged = True
+                        logger.info(
+                            "nano debug prefill dual-write layer=%s n_tail=%s "
+                            "dst_slot[0]=%s src_slot[0]=%s",
+                            layer_name,
+                            int(dst_slots.numel()),
+                            int(dst_slots[0].item()),
+                            int(src_slots[0].item()),
+                        )
         return result
 
     def _execute_sparse_flash_attention_process(
@@ -907,6 +917,28 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
         )
         actual_seq_lengths_kv = num_cache_tokens + tail_lens
         actual_seq_lengths_query = manager.lim_query_lens[:num_decodes]
+
+        if manager.nano_debug_enabled() and not manager._nano_debug_decode_logged:
+            manager._nano_debug_decode_logged = True
+            miss_cpu = miss_counts.detach().to(device="cpu")
+            offload_cpu = offload_lens.detach().to(device="cpu")
+            seq_cpu = seq_lens.detach().to(device="cpu")
+            tail_cpu = tail_lens.detach().to(device="cpu")
+            cache_cpu = num_cache_tokens.detach().to(device="cpu")
+            logger.info(
+                "nano debug fused_copy layer=%s skip_topk=%s prefix_init=%s "
+                "offload=%s seq=%s tail=%s C=%s miss=%s src0=%s dst0=%s",
+                layer_name,
+                self.skip_topk,
+                manager.has_nano_init_step(),
+                offload_cpu.tolist(),
+                seq_cpu.tolist(),
+                tail_cpu.tolist(),
+                cache_cpu.tolist(),
+                miss_cpu.tolist(),
+                topk_src_ids[0, 0, :8].detach().to(device="cpu").tolist(),
+                topk_dst_slots[0, 0, :8].detach().to(device="cpu").tolist(),
+            )
 
         attention_out = manager.get_fused_attention_out(q)
         torch.ops._C_ascend.npu_fused_copy_sfa(

@@ -100,6 +100,11 @@ env_variables: dict[str, Callable[[], Any]] = {
     # Control the aclrtMemcpyBatchAsync compile path for KV cache offloading.
     # "1": force enable, "0": force disable, None: auto-detect from CANN headers.
     "VLLM_ASCEND_ENABLE_BATCH_MEMCPY": lambda: os.getenv("VLLM_ASCEND_ENABLE_BATCH_MEMCPY", None),
+    # One-shot nano sparse-KV decode snapshot for accuracy bounding.
+    # Logs offload_len / C / tail / miss / prefix-init. Default 0 (off).
+    "VLLM_ASCEND_SPARSE_KV_OFFLOAD_DEBUG": lambda: bool(
+        int(os.getenv("VLLM_ASCEND_SPARSE_KV_OFFLOAD_DEBUG", "0"))
+    ),
 }
 
 # end-env-vars-definition

@@ -906,12 +906,26 @@ class SparseKVOffloadManager:
         self._nano_init_req_rows: list[int] = []
         self._nano_init_slots_written = False
         self._nano_init_h2d_layers: set[str] = set()
+        self._offload_cache_state_cpu: torch.Tensor | None = None
+        self._nano_debug_decode_logged = False
+        self._nano_debug_prefix_logged = False
+        self._nano_debug_meta_logged = False
+        self._nano_debug_prefill_logged = False
+
+    def nano_debug_enabled(self) -> bool:
+        from vllm_ascend import envs as ascend_envs
+
+        return bool(ascend_envs.VLLM_ASCEND_SPARSE_KV_OFFLOAD_DEBUG)
 
     def clear_nano_init_step(self) -> None:
         self._nano_init_pool_entries = []
         self._nano_init_req_rows = []
         self._nano_init_slots_written = False
         self._nano_init_h2d_layers = set()
+        self._nano_debug_decode_logged = False
+        self._nano_debug_prefix_logged = False
+        self._nano_debug_meta_logged = False
+        self._nano_debug_prefill_logged = False
 
     def set_nano_init_step(self, req_rows: list[int], pool_entries: list[int]) -> None:
         if len(req_rows) != len(pool_entries):
@@ -937,16 +951,11 @@ class SparseKVOffloadManager:
         *,
         write_slots: bool,
     ) -> None:
-        """First-decode: fill topk buffer with tokens ``0..C-1`` and update slots.
+        """First-decode: fill hot slots ``0..C-1`` and align ``cache_slots``.
 
-        LIM assumes the hot topk buffer is already full. On the first decode
-        that has enough offloaded candidates (colocate after local prefill, or
-        PD-disagg after KV pull) we identity-map the leading ``topk_buffer_size``
-        DRAM tokens into HBM slots ``0..C-1`` and record
-        ``cache_slots_pool[token]=slot``.
-
-        Shared IndexShare layers pass ``write_slots=False`` and only H2D into
-        their own layer buffers using the owner's slot table.
+        LIM plus fused_copy_sfa will rescore and H2D misses, so the initial
+        resident set need not be the true top-C. It only needs to be full and
+        consistent with ``cache_slots_pool`` (identity ``token i -> slot i``).
         """
         if not self._nano_init_pool_entries:
             return
@@ -956,7 +965,6 @@ class SparseKVOffloadManager:
         layer_id = self._get_offload_layer_id(layer_name)
         cache_tokens = self.topk_buffer_size
         block_size = self.block_size
-        # nano topk_buffer row layout: hot region + 2-block dense tail
         row_stride_tokens = cache_tokens + 2 * block_size
         token_size_k = self.token_size_bytes_k
         token_size_v = self.token_size_bytes_v
@@ -968,7 +976,6 @@ class SparseKVOffloadManager:
         addr_v_base = self.addr_v_bases[layer_id]
         max_blocks = block_table.size(1)
 
-        # Validate every init row has enough offloaded candidates to fill C.
         offload_lens_cpu = offload_seq_lengths_key.detach().to(device="cpu", dtype=torch.int32)
         for req_row, pool_entry in zip(self._nano_init_req_rows, self._nano_init_pool_entries):
             candidate_tokens = int(offload_lens_cpu[req_row].item())
@@ -985,7 +992,6 @@ class SparseKVOffloadManager:
                 )
 
         if write_slots and not self._nano_init_slots_written:
-            # cache_slots[token] = hbm_slot  (identity for the leading C tokens)
             for pool_entry in self._nano_init_pool_entries:
                 slots_row = cache_slots_pool[pool_entry]
                 slots_row.fill_(CACHE_SLOTS_POOL_INVALID_ID)
@@ -996,19 +1002,19 @@ class SparseKVOffloadManager:
                 )
                 if cache_state is not None:
                     cache_state[pool_entry] = CACHE_STATE_OFFLOAD_READY
+                if self._offload_cache_state_cpu is not None:
+                    self._offload_cache_state_cpu[pool_entry] = CACHE_STATE_OFFLOAD_READY
             self._nano_init_slots_written = True
 
         if layer_name in self._nano_init_h2d_layers:
             return
         self._nano_init_h2d_layers.add(layer_name)
 
-        # Chunked H2D through the existing sparse_copy descriptor buffers.
         max_tokens_per_copy = self.max_num_topk_rows * self.topk
         if max_tokens_per_copy <= 0:
             raise RuntimeError("sparse_copy descriptor capacity is zero")
 
         pending: list[tuple[int, int, int, int]] = []
-        # (pool_entry, req_row, token_start, token_count)
         for req_row, pool_entry in zip(self._nano_init_req_rows, self._nano_init_pool_entries):
             remaining = cache_tokens
             token_start = 0
@@ -1037,6 +1043,18 @@ class SparseKVOffloadManager:
                 gvas_v_base=gvas_v_base,
                 addr_k_base=addr_k_base,
                 addr_v_base=addr_v_base,
+            )
+        if self.nano_debug_enabled() and not self._nano_debug_prefix_logged:
+            self._nano_debug_prefix_logged = True
+            logger.info(
+                "nano debug prefix-init layer=%s write_slots=%s pools=%s "
+                "rows=%s C=%s candidates=%s",
+                layer_name,
+                write_slots,
+                self._nano_init_pool_entries,
+                self._nano_init_req_rows,
+                cache_tokens,
+                [int(offload_lens_cpu[r].item()) for r in self._nano_init_req_rows],
             )
 
     def _sparse_copy_prefix_chunk(
@@ -1069,7 +1087,7 @@ class SparseKVOffloadManager:
 
         for i in range(token_count):
             token = token_start + i
-            slot = token  # identity destination in the hot region
+            slot = token
             block_id = token // block_size
             offset = token % block_size
             if block_id < 0 or block_id >= max_blocks:
@@ -1586,6 +1604,7 @@ def update_sparse_kv_offload_metadata(
     if sparse_kv_offload_config.fused_op_type == "nano":
         manager = get_sparse_kv_offload_manager()
         manager.clear_nano_init_step()
+        manager._offload_cache_state_cpu = offload_cache_state.cpu
         tail_block_num = 2
         topk_buffer_size = sparse_kv_offload_config.topk_buffer_size
 
@@ -1749,4 +1768,23 @@ def update_sparse_kv_offload_metadata(
                 manager.set_nano_init_step(
                     req_rows=[int(x) for x in decode_new_rows.tolist()],
                     pool_entries=[int(x) for x in decode_new_slot_ids.tolist()],
+                )
+            if manager.nano_debug_enabled() and not manager._nano_debug_meta_logged:
+                manager._nano_debug_meta_logged = True
+                dense_cols = device_block_table_np[
+                    0, topk_buffer_block_num : topk_buffer_block_num + tail_block_num
+                ].tolist()
+                logger.info(
+                    "nano debug meta decode_reqs=%s C=%s offload_lens=%s "
+                    "start_pos=%s dense_start_block=%s prefix_init=%s "
+                    "pools=%s device_bt_dense0=%s first_allocate=%s",
+                    num_decode_reqs,
+                    int(topk_buffer_size),
+                    offload_lens_np.tolist(),
+                    start_positions.tolist(),
+                    dense_start_block.tolist(),
+                    bool(decode_new_slot_ids.size > 0),
+                    [int(x) for x in decode_slots_i32.tolist()],
+                    dense_cols,
+                    [bool(x) for x in first_allocate_flags[:num_decode_reqs].tolist()],
                 )
