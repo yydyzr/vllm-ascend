@@ -1584,90 +1584,147 @@ def update_sparse_kv_offload_metadata(
     if sparse_kv_offload_config.fused_op_type == "nano":
         manager = get_sparse_kv_offload_manager()
         manager.clear_nano_init_step()
-        num_decode_reqs = int((num_scheduled_tokens_np <= decode_threshold).sum())
-        if num_decode_reqs <= 0:
-            return
-        num_decode_tokens = int(num_scheduled_tokens_np[:num_decode_reqs].sum())
         tail_block_num = 2
-
-        # req_topk_buffer_slots
-        decode_req_ids = req_ids[:num_decode_reqs]
-        topk_buffer_slots, first_allocate = manager.allocate_topk_buffer_slots(decode_req_ids)
-        offload_req_topk_buffer_slots.np[:num_decode_reqs] = np.array(topk_buffer_slots)
-        offload_req_topk_buffer_slots.copy_to_gpu()
-
-        # device_slot_mapping
-        decode_positions_np = positions_np[:num_decode_tokens]
         topk_buffer_size = sparse_kv_offload_config.topk_buffer_size
-        offset_in_tail_blocks = decode_positions_np % (tail_block_num * block_size)
-        offset_of_topk_buffer = np.repeat(topk_buffer_size, num_decode_tokens)
-        offset_of_req = np.repeat(topk_buffer_slots, query_lens[:num_decode_reqs]) * \
-            (topk_buffer_size + tail_block_num * block_size)
-        device_slot_mapping = offset_of_req + offset_of_topk_buffer + offset_in_tail_blocks
-        offload_device_slot_mapping.np[:num_decode_tokens] = device_slot_mapping
-        offload_device_slot_mapping.copy_to_gpu()
 
-        # Dense = blocks touched by this step's new tokens (MTP may span 2).
-        # Earlier complete blocks are LIM candidates. Non-MTP (1 token) is the
-        # same rule with span 0. Physical circular capacity stays ``tail_block_num``.
-        decode_query_lens = query_lens[:num_decode_reqs]
-        start_positions = positions_np[query_start_loc.np[:num_decode_reqs]]
-        end_positions = start_positions + decode_query_lens - 1
-        dense_start_block = (start_positions // block_size).astype(np.int64, copy=False)
-        dense_end_block = (end_positions // block_size).astype(np.int64, copy=False)
-        dense_span = dense_end_block - dense_start_block
-        if np.any(dense_span >= tail_block_num):
+        # Allocate pool rows for every request in the step. Decode-only PD
+        # disagg batches are unchanged (all reqs are decode). Colocate also
+        # allocates during prefill so dual-write and later decode share one row.
+        all_req_ids = list(req_ids[:effective_num_reqs])
+        topk_buffer_slots, first_allocate = manager.allocate_topk_buffer_slots(all_req_ids)
+        offload_req_topk_buffer_slots.np[:effective_num_reqs] = np.asarray(
+            topk_buffer_slots, dtype=offload_req_topk_buffer_slots.np.dtype
+        )
+        offload_req_topk_buffer_slots.copy_to_gpu(effective_num_reqs)
+
+        # device_slot_mapping for all tokens: dense-tail slot within each pool row.
+        # Used by decode append and by colocate prefill dual-write; PD-disagg D
+        # still uses the same mapping for decode token writes into the tail that
+        # arrived from P.
+        token_pool_entries = np.repeat(
+            np.asarray(topk_buffer_slots, dtype=np.int64),
+            query_lens[:effective_num_reqs],
+        )
+        if token_pool_entries.shape[0] < num_tokens:
             raise RuntimeError(
-                "nano dense tail exceeds circular capacity: "
-                f"dense_span={dense_span.tolist()}, tail_block_num={tail_block_num}, "
-                f"start_positions={start_positions.tolist()}, "
-                f"end_positions={end_positions.tolist()}"
+                "KV offload device_slot_mapping metadata is shorter than the "
+                f"scheduled token batch: metadata={token_pool_entries.shape[0]}, "
+                f"tokens={num_tokens}"
             )
-        offloaded_block_num = dense_start_block
-        # Write via the numpy view: assigning ndarray into torch ``.cpu`` fails.
-        offload_seq_lengths_key.np[:num_decode_reqs] = (
-            offloaded_block_num * block_size
-        ).astype(offload_seq_lengths_key.np.dtype, copy=False)
-        offload_seq_lengths_key.copy_to_gpu(num_decode_reqs)
+        token_pool_entries = token_pool_entries[:num_tokens]
+        positions = positions_np[:num_tokens].astype(np.int64, copy=False)
+        offset_in_tail_blocks = positions % (tail_block_num * block_size)
+        row_stride = topk_buffer_size + tail_block_num * block_size
+        device_slot_mapping = (
+            token_pool_entries * row_stride + topk_buffer_size + offset_in_tail_blocks
+        )
 
-        # device_block_table
-        # Hot region: identity blocks [0, C/block_size).
-        # Dense tail columns: chronological physical blocks starting at
-        # ``dense_start_block % tail_block_num`` (writes use ``pos % (2*bs)``).
-        device_block_table_np = offload_device_block_table.np[:num_decode_reqs]
-        device_block_table_np.fill(0)
-        topk_buffer_block_num = topk_buffer_size // block_size
-        device_block_table_np[..., :topk_buffer_block_num] = \
-            np.expand_dims(np.arange(topk_buffer_block_num), axis=0).repeat(num_decode_reqs, axis=0)
-        device_block_table_np[..., topk_buffer_block_num] = dense_start_block % tail_block_num
-        for tail_block_offset in range(1, tail_block_num):
-            device_block_table_np[..., topk_buffer_block_num + tail_block_offset] = \
-                (device_block_table_np[..., topk_buffer_block_num + tail_block_offset - 1] + 1) % tail_block_num
-        device_block_table_np[..., topk_buffer_block_num : topk_buffer_block_num + tail_block_num] += \
-            topk_buffer_block_num
-        block_offset_of_req = np.expand_dims(topk_buffer_slots, axis=1) * (topk_buffer_block_num + tail_block_num)
-        block_offset_of_req = block_offset_of_req.repeat(topk_buffer_block_num + tail_block_num, axis=1)
-        device_block_table_np[..., :topk_buffer_block_num + tail_block_num] += block_offset_of_req
-        offload_device_block_table.copy_to_gpu()
+        # Prefill dual-write / P→D tail transfer only needs the single incomplete
+        # last block (at most block_size tokens). Complete blocks stay on DRAM.
+        # Decode tokens always keep a valid dense-tail slot for append.
+        num_decode_reqs = int((num_scheduled_tokens_np[:effective_num_reqs] <= decode_threshold).sum())
+        num_decode_tokens = (
+            int(query_lens[:num_decode_reqs].sum()) if num_decode_reqs > 0 else 0
+        )
+        seq_lens_np = np.asarray(
+            seq_lens_cpu_tensor[:effective_num_reqs].numpy(), dtype=np.int64
+        )
+        incomplete_start = (seq_lens_np // block_size) * block_size
+        token_req = token_to_req[:num_tokens].astype(np.int64, copy=False)
+        token_incomplete_start = incomplete_start[token_req]
+        keep_dense = positions >= token_incomplete_start
+        if num_decode_tokens > 0:
+            keep_dense[:num_decode_tokens] = True
+        device_slot_mapping = np.where(keep_dense, device_slot_mapping, -1)
 
-        # cache_states and cache_slots_pool
-        # NOTE Since we only need to update slots of new(first decode) requests and leave the other slots unchanged,
-        # can't call copy_to_gpu here, manually async copy the specific slot instead.
+        offload_device_slot_mapping.np[:num_tokens] = device_slot_mapping.astype(
+            offload_device_slot_mapping.np.dtype, copy=False
+        )
+        if num_tokens_padded > num_tokens:
+            offload_device_slot_mapping.np[num_tokens:num_tokens_padded].fill(0)
+        offload_device_slot_mapping.copy_to_gpu(num_tokens_padded)
+
+        # Reset cache_slots for newly allocated pool rows (prefill or decode).
         first_allocate_flags = np.asarray(first_allocate, dtype=bool)
         new_req_slot_ids = np.asarray(topk_buffer_slots, dtype=np.int32)[first_allocate_flags]
-        new_req_rows = np.nonzero(first_allocate_flags)[0].astype(np.int32)
-        if new_req_slot_ids.size > 0:
-            manager.set_nano_init_step(
-                req_rows=[int(x) for x in new_req_rows.tolist()],
-                pool_entries=[int(x) for x in new_req_slot_ids.tolist()],
+
+        if num_decode_reqs > 0:
+            # Decode-only metadata: LIM candidates / device block table / PD init.
+            decode_query_lens = query_lens[:num_decode_reqs]
+            start_positions = positions_np[query_start_loc.np[:num_decode_reqs]]
+            end_positions = start_positions + decode_query_lens - 1
+            dense_start_block = (start_positions // block_size).astype(np.int64, copy=False)
+            dense_end_block = (end_positions // block_size).astype(np.int64, copy=False)
+            dense_span = dense_end_block - dense_start_block
+            if np.any(dense_span >= tail_block_num):
+                raise RuntimeError(
+                    "nano dense tail exceeds circular capacity: "
+                    f"dense_span={dense_span.tolist()}, tail_block_num={tail_block_num}, "
+                    f"start_positions={start_positions.tolist()}, "
+                    f"end_positions={end_positions.tolist()}"
+                )
+            offloaded_block_num = dense_start_block
+            # Write via the numpy view: assigning ndarray into torch ``.cpu`` fails.
+            offload_seq_lengths_key.np[:num_decode_reqs] = (
+                offloaded_block_num * block_size
+            ).astype(offload_seq_lengths_key.np.dtype, copy=False)
+            offload_seq_lengths_key.copy_to_gpu(num_decode_reqs)
+
+            # device_block_table
+            # Hot region: identity blocks [0, C/block_size).
+            # Dense tail columns: chronological physical blocks starting at
+            # ``dense_start_block % tail_block_num`` (writes use ``pos % (2*bs)``).
+            device_block_table_np = offload_device_block_table.np[:num_decode_reqs]
+            device_block_table_np.fill(0)
+            topk_buffer_block_num = topk_buffer_size // block_size
+            device_block_table_np[..., :topk_buffer_block_num] = np.expand_dims(
+                np.arange(topk_buffer_block_num), axis=0
+            ).repeat(num_decode_reqs, axis=0)
+            device_block_table_np[..., topk_buffer_block_num] = dense_start_block % tail_block_num
+            for tail_block_offset in range(1, tail_block_num):
+                device_block_table_np[..., topk_buffer_block_num + tail_block_offset] = (
+                    device_block_table_np[..., topk_buffer_block_num + tail_block_offset - 1] + 1
+                ) % tail_block_num
+            device_block_table_np[..., topk_buffer_block_num : topk_buffer_block_num + tail_block_num] += (
+                topk_buffer_block_num
             )
+            decode_slots = np.asarray(topk_buffer_slots[:num_decode_reqs], dtype=np.int64)
+            block_offset_of_req = np.expand_dims(decode_slots, axis=1) * (
+                topk_buffer_block_num + tail_block_num
+            )
+            block_offset_of_req = block_offset_of_req.repeat(
+                topk_buffer_block_num + tail_block_num, axis=1
+            )
+            device_block_table_np[..., : topk_buffer_block_num + tail_block_num] += block_offset_of_req
+            offload_device_block_table.copy_to_gpu()
+
+            # PD-disagg first-decode hot-region init: only when this decode step
+            # newly owns the pool row AND there are enough offloaded candidates
+            # to fill C. Dense-tail-only rows (offload_len==0) skip init — disagg
+            # already received the incomplete tail from P; colocate already
+            # dual-wrote it during prefill.
+            decode_first_allocate = first_allocate_flags[:num_decode_reqs]
+            offload_lens_np = offload_seq_lengths_key.np[:num_decode_reqs]
+            need_prefix_init = decode_first_allocate & (offload_lens_np >= topk_buffer_size)
+            decode_new_slot_ids = np.asarray(topk_buffer_slots[:num_decode_reqs], dtype=np.int32)[
+                need_prefix_init
+            ]
+            decode_new_rows = np.nonzero(need_prefix_init)[0].astype(np.int32)
+            if decode_new_slot_ids.size > 0:
+                manager.set_nano_init_step(
+                    req_rows=[int(x) for x in decode_new_rows.tolist()],
+                    pool_entries=[int(x) for x in decode_new_slot_ids.tolist()],
+                )
+
+        # NOTE Since we only need to update slots of new requests and leave the
+        # other slots unchanged, can't call copy_to_gpu here; manually async
+        # copy the specific slot instead.
         for new_req_slot_id in new_req_slot_ids:
             offload_cache_state.cpu[new_req_slot_id] = CACHE_STATE_OFFLOAD_INIT
             offload_cache_state.gpu[new_req_slot_id].copy_(
                 offload_cache_state.cpu[new_req_slot_id],
                 non_blocking=True,
             )
-            # Cold start: no HBM slot is occupied yet. Prefix init + LIM fill this row.
             offload_cache_slots_pool.cpu[new_req_slot_id].fill_(CACHE_SLOTS_POOL_INVALID_ID)
             offload_cache_slots_pool.gpu[new_req_slot_id].copy_(
                 offload_cache_slots_pool.cpu[new_req_slot_id],

@@ -9,7 +9,11 @@ Data plane (see zsc-sfa-kv-offload-merge-plan.md):
 - prefill (debug intermediate state, only reachable with
   ``keep_device_kv_cache=True``): ``exec_kv`` writes the NPU paged main
   cache as usual, then the layer's cache rows are committed D2H
-  (``cache_cpu[slot] = cache_npu[slot]``) through the manager;
+  (  ``cache_cpu[slot] = cache_npu[slot]``) through the manager. With
+  ``fused_op_type=nano`` and ``keep_device_kv_cache`` (PD colocate), tokens
+  are also dual-written into the topk buffer dense-tail slots
+  (``pos % (2*block_size)``). PD-disagg D does not prefill here — its
+  incomplete-block dense tail is transferred from P;
 - decode (``fused_op_type=default``): no NPU main K/V cache at all
   (indexer K cache only). The current token's K/V is produced compute-only
   and committed D2H directly; top-k misses are loaded H2D into the resident
@@ -17,7 +21,9 @@ Data plane (see zsc-sfa-kv-offload-merge-plan.md):
 - decode (``fused_op_type=nano``): write the current token into the two
   HBM tail blocks of the topk buffer, then D2H from those tail slots into
   the CPU paged pool; decode attention uses ``npu_fused_li_manage`` +
-  ``npu_fused_copy_sfa`` (``torch.ops._C_ascend``).
+  ``npu_fused_copy_sfa`` (``torch.ops._C_ascend``). When there are no
+  offloaded LIM candidates (``offload_seq_lengths_key==0``), attention is
+  dense-tail only (``num_cache_tokens=0``) for both colocate and disagg.
 """
 
 from typing import Any, TypeVar
@@ -116,10 +122,18 @@ class AscendSFAKVOffloadMetadataBuilder(AscendSFAMetadataBuilder):
         metadata.req_ids_tensor = common_attn_metadata.req_ids_tensor
         metadata.token_to_req = common_attn_metadata.token_to_req
         if get_ascend_config().sparse_kv_offload_config.fused_op_type == "nano":
-            metadata.req_topk_buffer_slots = common_attn_metadata.req_topk_buffer_slots[:num_decodes]
-            metadata.device_slot_mapping = common_attn_metadata.device_slot_mapping[:num_decode_tokens]
-            metadata.device_block_table = common_attn_metadata.device_block_table[:num_decodes]
-            metadata.offload_seq_lengths_key = common_attn_metadata.offload_seq_lengths_key[:num_decodes]
+            num_reqs = int(common_attn_metadata.num_reqs)
+            num_actual_tokens = int(common_attn_metadata.num_actual_tokens)
+            # Pool rows / device_slot_mapping cover the whole step so both
+            # PD-disagg decode and colocate prefill+decode share one layout.
+            metadata.req_topk_buffer_slots = common_attn_metadata.req_topk_buffer_slots[:num_reqs]
+            metadata.device_slot_mapping = common_attn_metadata.device_slot_mapping[:num_actual_tokens]
+            metadata.device_block_table = (
+                common_attn_metadata.device_block_table[:num_decodes] if num_decodes > 0 else None
+            )
+            metadata.offload_seq_lengths_key = (
+                common_attn_metadata.offload_seq_lengths_key[:num_decodes] if num_decodes > 0 else None
+            )
             metadata.cache_state = common_attn_metadata.cache_state
             metadata.cache_slots_pool = common_attn_metadata.cache_slots_pool
         return metadata
@@ -448,6 +462,17 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
         layer_name = self._offload_layer_name()
         self._maybe_nano_prefix_init(attn_metadata, manager, layer_name)
 
+        topk_src_ids, topk_dst_slots, miss_counts = manager.get_lim_output_buffers(num_decodes)
+        offload_lens = attn_metadata.offload_seq_lengths_key[:num_decodes]
+        # No complete offloaded blocks yet: dense-tail only (typical short
+        # colocate prompt). Skip LIM and leave miss_counts at 0.
+        if bool(torch.all(offload_lens <= 0).item()):
+            topk_src_ids.zero_()
+            topk_dst_slots.zero_()
+            miss_counts.zero_()
+            manager.mark_lim_outputs_ready(num_decodes)
+            return topk_src_ids
+
         kw, _ = self.wk_weights_proj(x)
         weights = kw[:, self.head_dim :]
         if isinstance(q_c, tuple):
@@ -501,8 +526,6 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
                 f"nano fused_li_manage expects head_dim=128, got {q_li.shape[-1]}"
             )
 
-        topk_src_ids, topk_dst_slots, miss_counts = manager.get_lim_output_buffers(num_decodes)
-
         index_key = kv_cache[self.kv_cache_indexer_k_idx]
         block_size = manager.block_size
         # LIM requires [blocks, 128, 1, 128].
@@ -521,9 +544,7 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
             )
 
         # Candidates = fully offloaded blocks only; dense tail is attended by SFA.
-        num_candidate_tokens = attn_metadata.offload_seq_lengths_key[:num_decodes].to(
-            dtype=torch.int32
-        )
+        num_candidate_tokens = offload_lens.to(dtype=torch.int32)
         num_cache_tokens = manager.lim_num_cache_tokens[:num_decodes]
         req_pool_entries = attn_metadata.req_topk_buffer_slots[:num_decodes].to(dtype=torch.int32)
 
@@ -617,7 +638,9 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
 
         # Prefill / mixed batch (colocate debug only): stage in the NPU paged
         # main cache as usual, then commit the written rows D2H into the
-        # shared CPU pool.
+        # shared CPU pool. Complete blocks live on DRAM for later LIM. Nano
+        # colocate additionally dual-writes into the dense tail below;
+        # PD-disagg D never enters this path (no local prefill).
         _check_device_kv_cache_exist()
         result = super().exec_kv(kv_no_split, cos, sin, kv_cache, slots, attn_metadata)
         manager = get_sparse_kv_offload_manager()
@@ -634,6 +657,35 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
             has_prefill=True,
             capturing=self._in_graph_runtime(),
         )
+        if self._use_nano_fused_op() and get_ascend_config().sparse_kv_offload_config.keep_device_kv_cache:
+            # Colocate only: dual-write the single incomplete last block into
+            # dense tail. Complete-block tokens have device_slot_mapping=-1.
+            # PD-disagg D gets that one-block tail from P (not handled here).
+            device_slots = attn_metadata.device_slot_mapping
+            if device_slots is None:
+                raise RuntimeError(
+                    "nano colocate prefill requires device_slot_mapping for dense-tail dual-write"
+                )
+            token_count = min(int(slots.numel()), int(device_slots.numel()))
+            if token_count > 0:
+                src_slots = slots.reshape(-1)[:token_count].to(dtype=torch.int64)
+                dst_slots = device_slots.reshape(-1)[:token_count]
+                tail_mask = dst_slots >= 0
+                if bool(tail_mask.any().item()):
+                    src_slots = src_slots[tail_mask]
+                    dst_slots = dst_slots[tail_mask]
+                    buffer_k, buffer_v = self._topk_buffer_pair(manager, layer_name)
+                    k_dim = buffer_k.shape[-1]
+                    v_dim = buffer_v.shape[-1]
+                    k_rows = kv_cache[0].reshape(-1, k_dim).index_select(0, src_slots)
+                    v_rows = kv_cache[1].reshape(-1, v_dim).index_select(0, src_slots)
+                    self._scatter_kv_to_device_slots(
+                        k_rows,
+                        v_rows,
+                        buffer_k,
+                        buffer_v,
+                        dst_slots,
+                    )
         return result
 
     def _execute_sparse_flash_attention_process(
@@ -847,9 +899,14 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
         offload_lens = attn_metadata.offload_seq_lengths_key[:num_decodes].to(dtype=torch.int32)
         seq_lens = actual_seq_lengths_key[:num_decodes].to(dtype=torch.int32)
         tail_lens = (seq_lens - offload_lens).clamp_min(0)
-        actual_seq_lengths_kv = manager.lim_num_cache_tokens[:num_decodes] + tail_lens
+        # No LIM candidates => dense-tail only; do not attend the empty hot region.
+        num_cache_tokens = torch.where(
+            offload_lens > 0,
+            manager.lim_num_cache_tokens[:num_decodes],
+            torch.zeros_like(offload_lens),
+        )
+        actual_seq_lengths_kv = num_cache_tokens + tail_lens
         actual_seq_lengths_query = manager.lim_query_lens[:num_decodes]
-        num_cache_tokens = manager.lim_num_cache_tokens[:num_decodes]
 
         attention_out = manager.get_fused_attention_out(q)
         torch.ops._C_ascend.npu_fused_copy_sfa(
