@@ -16,8 +16,8 @@ Data plane (see zsc-sfa-kv-offload-merge-plan.md):
   (topk) buffer and a single resident SFA attention runs.
 - decode (``fused_op_type=nano``): write the current token into the two
   HBM tail blocks of the topk buffer, then D2H from those tail slots into
-  the CPU paged pool; decode attention uses ``fused_li_manage`` +
-  ``fused_copy_sfa`` (``torch.ops._C_ascend``).
+  the CPU paged pool; decode attention uses ``npu_fused_li_manage`` +
+  ``npu_fused_copy_sfa`` (``torch.ops._C_ascend``).
 """
 
 from typing import Any, TypeVar
@@ -538,7 +538,7 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
         if not index_key_cache.is_contiguous():
             index_key_cache = index_key_cache.contiguous()
 
-        torch.ops._C_ascend.fused_li_manage(
+        torch.ops._C_ascend.npu_fused_li_manage(
             q_li.contiguous(),
             weights.contiguous(),
             index_key_cache,
@@ -852,7 +852,7 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
         num_cache_tokens = manager.lim_num_cache_tokens[:num_decodes]
 
         attention_out = manager.get_fused_attention_out(q)
-        torch.ops._C_ascend.fused_copy_sfa(
+        torch.ops._C_ascend.npu_fused_copy_sfa(
             q_rope.contiguous(),
             q.contiguous(),
             actual_seq_lengths_query.contiguous(),
