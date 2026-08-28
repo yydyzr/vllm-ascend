@@ -15,7 +15,8 @@
 
 import math
 import os
-from types import SimpleNamespace
+import sys
+from types import ModuleType, SimpleNamespace
 from unittest import mock
 
 import pytest
@@ -254,6 +255,24 @@ class TestUtils(TestBase):
         utils.vllm_version_is("1.0.0")
         hits = utils.vllm_version_is.cache_info().hits
         self.assertEqual(hits, 1)
+
+    def test_vllm_version_is_ignores_empty_device_suffix(self):
+        with mock.patch.dict(os.environ):
+            os.environ.pop("VLLM_VERSION", None)
+            with mock.patch("vllm.__version__", "0.27.1+empty"):
+                self.assertTrue(utils.vllm_version_is.__wrapped__("0.27.1"))
+                self.assertFalse(utils.vllm_version_is.__wrapped__("0.26.0"))
+
+    def test_vllm_version_is_reads_setuptools_scm_module(self):
+        fake_vllm = ModuleType("vllm")
+        fake_version = ModuleType("vllm._version")
+        fake_version.__version__ = "0.27.1+empty"
+        fake_vllm._version = fake_version
+        with mock.patch.dict(os.environ):
+            os.environ.pop("VLLM_VERSION", None)
+            with mock.patch.dict(sys.modules, {"vllm": fake_vllm, "vllm._version": fake_version}):
+                self.assertTrue(utils.vllm_version_is.__wrapped__("0.27.1"))
+                self.assertFalse(utils.vllm_version_is.__wrapped__("0.26.0"))
 
     def test_get_max_hidden_layers(self):
         from transformers import PretrainedConfig

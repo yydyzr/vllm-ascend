@@ -23,6 +23,7 @@ import functools
 import json
 import math
 import os
+import sys
 from contextlib import nullcontext
 from functools import lru_cache
 from typing import TYPE_CHECKING, Any
@@ -572,16 +573,63 @@ def setup_ascend_local_comm_res(local_rank: int, kv_transfer_config: Any | None)
     os.environ["ASCEND_LOCAL_COMM_RES"] = json.dumps(data, ensure_ascii=False, separators=(",", ":"))
 
 
-@functools.cache
-def vllm_version_is(target_vllm_version: str):
+def _module_version_string(module: Any) -> str | None:
+    for attr in ("__version__", "version"):
+        value = getattr(module, attr, None)
+        if isinstance(value, str) and value:
+            return value
+    return None
+
+
+def _resolve_vllm_version() -> str:
     if envs_ascend.VLLM_VERSION is not None:
-        vllm_version = envs_ascend.VLLM_VERSION
-    else:
+        return envs_ascend.VLLM_VERSION
+
+    # fused_moe and other modules call this at import time. During a partial
+    # ``import vllm`` (or a PEP 420 namespace package), ``vllm.__version__``
+    # may be missing while setuptools-scm's ``vllm._version`` is already loaded.
+    vllm_mod = sys.modules.get("vllm")
+    if vllm_mod is not None:
+        version = _module_version_string(vllm_mod)
+        if version:
+            return version
+        for name in ("version", "_version"):
+            sub = getattr(vllm_mod, name, None) or sys.modules.get(f"vllm.{name}")
+            if sub is not None:
+                version = _module_version_string(sub)
+                if version:
+                    return version
+
+    try:
+        from importlib.metadata import version as pkg_version
+
+        return pkg_version("vllm")
+    except Exception:
+        pass
+
+    try:
         import vllm
 
-        vllm_version = vllm.__version__
+        version = _module_version_string(vllm)
+        if version:
+            return version
+    except Exception:
+        pass
+
+    raise ValueError(
+        "Unable to determine the installed vLLM version. A source or "
+        "partially-initialized vLLM package is installed probably. Set the "
+        "environment variable VLLM_VERSION to control it by hand. And please "
+        "make sure the value follows the format of x.y.z."
+    )
+
+
+@functools.cache
+def vllm_version_is(target_vllm_version: str):
+    vllm_version = _resolve_vllm_version()
     try:
-        return Version(vllm_version) == Version(target_vllm_version)
+        # Ignore local suffixes such as +empty from VLLM_TARGET_DEVICE=empty.
+        return Version(vllm_version).public == Version(target_vllm_version).public
     except InvalidVersion:
         raise ValueError(
             f"Invalid vllm version {vllm_version} found. A dev version of vllm "
