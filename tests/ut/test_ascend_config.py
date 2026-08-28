@@ -1045,7 +1045,25 @@ class TestTopLevelSwitchTypeValidation(TestBase):
         vc = VllmConfig()
         vc.additional_config = {"enable_fused_mc2": 1}
 
-        self.assertEqual(init_ascend_config(vc).enable_fused_mc2, 0)
+        with patch(
+            "vllm_ascend.device.device_config.get_ascend_device_type",
+            return_value=AscendDeviceType.A3,
+        ):
+            self.assertEqual(init_ascend_config(vc).enable_fused_mc2, 0)
+
+    @_clean_up
+    @patch("vllm_ascend.ascend_config._MEGA_MOE_SUPPORTED", True)
+    @patch.object(AscendConfig, "_is_megamoe_supported_by_config", return_value=False)
+    @patch("vllm_ascend.platform.NPUPlatform.check_and_update_config")
+    def test_fused_mc2_stays_enabled_on_a5_without_checkpoint_metadata(self, mock_fix, mock_megamoe_supported):
+        vc = VllmConfig()
+        vc.additional_config = {"enable_fused_mc2": 1}
+
+        with patch(
+            "vllm_ascend.device.device_config.get_ascend_device_type",
+            return_value=AscendDeviceType.A5,
+        ):
+            self.assertEqual(init_ascend_config(vc).enable_fused_mc2, 1)
 
     @_clean_up
     @patch("vllm_ascend.platform.NPUPlatform.check_and_update_config")
