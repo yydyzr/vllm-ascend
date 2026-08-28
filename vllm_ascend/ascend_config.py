@@ -555,11 +555,18 @@ class AscendConfig:
                 "enable_fused_mc2 and multistream_overlap_shared_expert "
                 "cannot be enabled at the same time. Setting multistream_overlap_shared_expert to False."
             )
-        if self.enable_fused_mc2 == 1 and _MEGA_MOE_SUPPORTED and not self._is_megamoe_supported_by_config(vc):
-            self.enable_fused_mc2 = 0
-            logger.warning_once(
-                "MegaMoe is not supported for this model config; additional_config.enable_fused_mc2 will be set to 0."
-            )
+        if self.enable_fused_mc2 == 1 and _MEGA_MOE_SUPPORTED:
+            from vllm_ascend.device.device_config import AscendDeviceType, get_ascend_device_type
+
+            # A5 MegaMoe is selected from instantiated layer capabilities, not
+            # checkpoint metadata. Keep the user switch on and let the adapter
+            # decide whether FUSED_MC2 is used.
+            if get_ascend_device_type() != AscendDeviceType.A5 and not self._is_megamoe_supported_by_config(vc):
+                self.enable_fused_mc2 = 0
+                logger.warning_once(
+                    "MegaMoe is not supported for this model config; "
+                    "additional_config.enable_fused_mc2 will be set to 0."
+                )
 
         # mlapo_keep_prefill_weights preconditions: the prefill weights are only
         # freed by MLAPO in the MLA attention path, so the keep switch is only
