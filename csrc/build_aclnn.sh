@@ -131,6 +131,7 @@ elif [[ "$SOC_VERSION" =~ ^ascend910b ]]; then
         "fused_li_manage_mtp"
         "fused_copy_sfa_mtp"
         "fused_li_manage"
+        "fused_li_manage_c8"
         "fused_copy_sfa"
         "sparse_tail_attention"
     )
@@ -182,6 +183,7 @@ elif [[ "$SOC_VERSION" =~ ^ascend910_93 ]]; then
         "fused_li_manage_mtp"
         "fused_copy_sfa_mtp"
         "fused_li_manage"
+        "fused_li_manage_c8"
         "fused_copy_sfa"
         "sparse_tail_attention"
     )
