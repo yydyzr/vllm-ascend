@@ -948,10 +948,11 @@ class SparseKVOffloadManager:
         cache_slots_pool: torch.Tensor,
         cache_state: torch.Tensor | None,
         offload_seq_lengths_key: torch.Tensor,
+        seq_lengths_key: torch.Tensor,
         *,
         write_slots: bool,
     ) -> None:
-        """First-decode: fill hot slots ``0..C-1`` and align ``cache_slots``.
+        """First-decode: fill hot slots ``0..C-1`` and dense tail blocks.
 
         LIM plus fused_copy_sfa will rescore and H2D misses, so the initial
         resident set need not be the true top-C. It only needs to be full and
@@ -977,6 +978,7 @@ class SparseKVOffloadManager:
         max_blocks = block_table.size(1)
 
         offload_lens_cpu = offload_seq_lengths_key.detach().to(device="cpu", dtype=torch.int32)
+        seq_lens_cpu = seq_lengths_key.detach().to(device="cpu", dtype=torch.int32)
         for req_row, pool_entry in zip(self._nano_init_req_rows, self._nano_init_pool_entries):
             candidate_tokens = int(offload_lens_cpu[req_row].item())
             if candidate_tokens < cache_tokens:
@@ -992,7 +994,7 @@ class SparseKVOffloadManager:
                 )
 
         if write_slots and not self._nano_init_slots_written:
-            for pool_entry in self._nano_init_pool_entries:
+            for req_row, pool_entry in zip(self._nano_init_req_rows, self._nano_init_pool_entries):
                 slots_row = cache_slots_pool[pool_entry]
                 slots_row.fill_(CACHE_SLOTS_POOL_INVALID_ID)
                 slots_row[:cache_tokens] = torch.arange(
@@ -1000,6 +1002,16 @@ class SparseKVOffloadManager:
                     dtype=torch.int32,
                     device=slots_row.device,
                 )
+                offload_len = int(offload_lens_cpu[req_row].item())
+                seq_len = int(seq_lens_cpu[req_row].item())
+                if seq_len > offload_len:
+                    tail_tokens = torch.arange(
+                        offload_len,
+                        seq_len,
+                        dtype=torch.int32,
+                        device=slots_row.device,
+                    )
+                    slots_row[offload_len:seq_len] = cache_tokens + (tail_tokens % (2 * block_size))
                 if cache_state is not None:
                     cache_state[pool_entry] = CACHE_STATE_OFFLOAD_READY
                 if self._offload_cache_state_cpu is not None:
@@ -1014,23 +1026,39 @@ class SparseKVOffloadManager:
         if max_tokens_per_copy <= 0:
             raise RuntimeError("sparse_copy descriptor capacity is zero")
 
-        pending: list[tuple[int, int, int, int]] = []
+        pending: list[tuple[int, int, int, int, int, int | None]] = []
+        # Hot region: tokens 0..C-1 -> identity slots 0..C-1.
         for req_row, pool_entry in zip(self._nano_init_req_rows, self._nano_init_pool_entries):
             remaining = cache_tokens
             token_start = 0
             while remaining > 0:
                 chunk = min(remaining, max_tokens_per_copy)
-                pending.append((pool_entry, req_row, token_start, chunk))
+                pending.append((pool_entry, req_row, token_start, chunk, 0, None))
                 token_start += chunk
                 remaining -= chunk
+            # Dense tail: tokens [offload_len, seq_len) -> slots C + (t % (2*block_size)).
+            offload_len = int(offload_lens_cpu[req_row].item())
+            seq_len = int(seq_lens_cpu[req_row].item())
+            if seq_len > offload_len:
+                remaining = seq_len - offload_len
+                token_start = offload_len
+                while remaining > 0:
+                    chunk = min(remaining, max_tokens_per_copy)
+                    pending.append(
+                        (pool_entry, req_row, token_start, chunk, cache_tokens, 2 * block_size)
+                    )
+                    token_start += chunk
+                    remaining -= chunk
 
         block_table_cpu = block_table.detach().to(device="cpu", dtype=torch.int32)
-        for pool_entry, req_row, token_start, chunk in pending:
+        for pool_entry, req_row, token_start, chunk, slot_base, slot_mod in pending:
             self._sparse_copy_prefix_chunk(
                 pool_entry=pool_entry,
                 req_row=req_row,
                 token_start=token_start,
                 token_count=chunk,
+                slot_base=slot_base,
+                slot_mod=slot_mod,
                 block_table_cpu=block_table_cpu,
                 max_blocks=max_blocks,
                 block_size=block_size,
@@ -1048,13 +1076,40 @@ class SparseKVOffloadManager:
             self._nano_debug_prefix_logged = True
             logger.info(
                 "nano debug prefix-init layer=%s write_slots=%s pools=%s "
-                "rows=%s C=%s candidates=%s",
+                "rows=%s C=%s candidates=%s seqs=%s",
                 layer_name,
                 write_slots,
                 self._nano_init_pool_entries,
                 self._nano_init_req_rows,
                 cache_tokens,
                 [int(offload_lens_cpu[r].item()) for r in self._nano_init_req_rows],
+                [int(seq_lens_cpu[r].item()) for r in self._nano_init_req_rows],
+            )
+            _pe = self._nano_init_pool_entries[0]
+            _rr = self._nano_init_req_rows[0]
+            _buf_k = self.topk_buffers_k[layer_id]
+            _hot = _buf_k[_pe, 0:cache_tokens]
+            _off_len = int(offload_lens_cpu[_rr].item())
+            _seq_len = int(seq_lens_cpu[_rr].item())
+            _tail_len = max(_seq_len - _off_len, 0)
+            _tail = _buf_k[_pe, cache_tokens : cache_tokens + _tail_len]
+            _tail_full = _buf_k[_pe, cache_tokens : cache_tokens + 2 * block_size]
+            _cpu_nz = -1.0
+            if self.tp_rank == 0 and self.k_caches_cpu:
+                _cpu_nz = float((self.k_caches_cpu[layer_id] != 0).float().mean().item())
+            logger.info(
+                "nano debug prefix-data layer=%s pool=%s hot_nz=%.4f hot_abs=%.2f "
+                "tail_len=%d tail_nz=%.4f tail_abs=%.2f tail_full_nz=%.4f cpu_nz=%.4f k_shape=%s",
+                layer_name,
+                _pe,
+                float((_hot != 0).float().mean().item()),
+                float(_hot.float().abs().sum().item()),
+                _tail_len,
+                float((_tail != 0).float().mean().item()) if _tail.numel() else -1.0,
+                float(_tail.float().abs().sum().item()) if _tail.numel() else -1.0,
+                float((_tail_full != 0).float().mean().item()),
+                _cpu_nz,
+                tuple(_buf_k.shape),
             )
 
     def _sparse_copy_prefix_chunk(
@@ -1064,6 +1119,8 @@ class SparseKVOffloadManager:
         req_row: int,
         token_start: int,
         token_count: int,
+        slot_base: int = 0,
+        slot_mod: int | None = None,
         block_table_cpu: torch.Tensor,
         max_blocks: int,
         block_size: int,
@@ -1087,7 +1144,10 @@ class SparseKVOffloadManager:
 
         for i in range(token_count):
             token = token_start + i
-            slot = token
+            if slot_mod is None:
+                slot = token  # hot region: identity destination
+            else:
+                slot = slot_base + (token % slot_mod)  # dense tail: ring slot
             block_id = token // block_size
             offset = token % block_size
             if block_id < 0 or block_id >= max_blocks:

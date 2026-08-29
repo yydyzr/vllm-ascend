@@ -38,6 +38,7 @@ from vllm.forward_context import (
 from vllm.logger import logger
 from vllm.triton_utils import HAS_TRITON
 
+import vllm_ascend.vllm_ascend_C  # noqa: E402,F401  (register torch.ops._C_ascend fused LIM/SFA ops)
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
 from vllm_ascend.attention.sfa_v1 import (
@@ -365,6 +366,7 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
         attn_metadata: M,
         manager,
         layer_name: str,
+        seq_lengths_key: torch.Tensor,
     ) -> None:
         if not manager.has_nano_init_step():
             return
@@ -386,6 +388,7 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
             cache_slots_pool=attn_metadata.cache_slots_pool,
             cache_state=attn_metadata.cache_state,
             offload_seq_lengths_key=attn_metadata.offload_seq_lengths_key[:num_decodes],
+            seq_lengths_key=seq_lengths_key[:num_decodes],
             write_slots=not self.skip_topk,
         )
 
@@ -458,7 +461,7 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
 
         manager = get_sparse_kv_offload_manager()
         layer_name = self._offload_layer_name()
-        self._maybe_nano_prefix_init(attn_metadata, manager, layer_name)
+        self._maybe_nano_prefix_init(attn_metadata, manager, layer_name, actual_seq_lengths_key)
 
         topk_src_ids, topk_dst_slots, miss_counts = manager.get_lim_output_buffers(num_decodes)
         offload_lens = attn_metadata.offload_seq_lengths_key[:num_decodes]
@@ -533,6 +536,26 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
             index_key_cache = index_key.view(-1, block_size, 1, self.head_dim)
 
         block_table = attn_metadata.block_table[:num_decodes]
+        _li_layer_id = manager._get_offload_layer_id(layer_name)
+        _li_steps = getattr(manager, "_nano_debug_li_steps", 0)
+        if _li_layer_id == 0 and manager.nano_debug_enabled() and _li_steps < 6:
+            manager._nano_debug_li_steps = _li_steps + 1
+            _idx = index_key_cache.detach()
+            _cand = attn_metadata.offload_seq_lengths_key[:num_decodes].detach().to(
+                device="cpu", dtype=torch.int32
+            ).tolist()
+            _bt = block_table.detach().to(device="cpu", dtype=torch.int32).tolist()
+            logger.info(
+                "nano debug li_indexer layer=%s step=%d indexer_shape=%s nz_ratio=%.4f "
+                "abs_sum=%.2f candidates=%s block_table=%s",
+                layer_name,
+                _li_steps,
+                tuple(index_key_cache.shape),
+                float((_idx != 0).float().mean().item()),
+                float(_idx.float().abs().sum().item()),
+                _cand,
+                _bt,
+            )
         expected_slots_width = block_table.size(1) * block_size
         cache_slots_pool = attn_metadata.cache_slots_pool
         if cache_slots_pool.size(1) != expected_slots_width:
@@ -876,7 +899,7 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
             raise RuntimeError("nano fused_copy_sfa requires offload_seq_lengths_key")
 
         # skip_topk shared layers never enter LIM; still need per-layer H2D fill.
-        self._maybe_nano_prefix_init(attn_metadata, manager, layer_name)
+        self._maybe_nano_prefix_init(attn_metadata, manager, layer_name, actual_seq_lengths_key)
 
         if self.skip_topk:
             topk_src_ids, topk_dst_slots, miss_counts = manager.require_lim_outputs(num_decodes)
