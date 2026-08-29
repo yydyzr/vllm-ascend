@@ -12,7 +12,6 @@ from vllm.forward_context import BatchDescriptor, get_forward_context, set_forwa
 from vllm.logger import logger
 
 from vllm_ascend.ascend_config import _MEGA_MOE_SUPPORTED, get_ascend_config
-from vllm_ascend.ops.fused_moe.mega_moe_adapter import get_model_cann_mega_moe_capability
 from vllm_ascend.utils import (
     AscendDeviceType,
     get_ascend_device_type,
@@ -270,6 +269,12 @@ def _select_a5_moe_comm_method(
 ) -> MoECommType:
     hf_text_config = vllm_config.model_config.hf_text_config
     if cann_mega_moe_supported is None:
+        # Inline import: mega_moe_adapter lives under vllm_ascend.ops, whose
+        # package init loads fused_moe, which imports _EXTRA_CTX from this
+        # module. A top-level import here circular-imports during quant-method
+        # package load (modelslim_config -> w4a8_mxfp4 -> this module).
+        from vllm_ascend.ops.fused_moe.mega_moe_adapter import get_model_cann_mega_moe_capability
+
         cann_mega_moe_supported = get_model_cann_mega_moe_capability(model_instance).supported
     if (
         get_ascend_config().enable_fused_mc2 == 1
