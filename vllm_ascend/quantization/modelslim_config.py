@@ -102,6 +102,19 @@ _MINIMAX_M3_PACKED_MODULES = {
     "experts": ["experts.0.w1", "experts.0.w2", "experts.0.w3"],
 }
 
+# Match vLLM KimiLinearModel.packed_modules_mapping, plus optional g_proj for
+# use_full_rank_gate. Tiny GDN shards (b_proj / f_a_proj) are commonly FLOAT.
+_KIMI_K3_PACKED_MODULES = {
+    "gate_up_proj": ["gate_proj", "up_proj"],
+    "in_proj_qkvgfab": ["q_proj", "k_proj", "v_proj", "g_proj", "b_proj", "f_a_proj"],
+    "conv1d": ["q_conv1d", "k_conv1d", "v_conv1d"],
+    "fused_qkv_a_proj": ["q_a_proj", "kv_a_proj_with_mqa"],
+}
+
+# These fused GEMMs pack wide quantized shards with tiny FLOAT shards. A single
+# MergedColumnParallelLinear cannot mix precisions, so skip the fused module.
+_FUSED_LAYERS_SKIP_ON_MIXED_SHARDS = frozenset({"in_proj_qkvgfab", "conv1d"})
+
 packed_modules_model_mapping: dict[str, dict[str, list[str]]] = {
     "minimax_m3": _MINIMAX_M3_PACKED_MODULES,
     "minimax_m3_vl": _MINIMAX_M3_PACKED_MODULES,
@@ -167,6 +180,8 @@ packed_modules_model_mapping: dict[str, dict[str, list[str]]] = {
         "experts": ["experts.0.gate_proj", "experts.0.up_proj", "experts.0.down_proj"],
         "fused_qkv_a_proj": ["q_a_proj", "kv_a_proj_with_mqa"],
     },
+    "kimi_k3": _KIMI_K3_PACKED_MODULES,
+    "kimi_linear": _KIMI_K3_PACKED_MODULES,
     "deepseek_v32": {
         "gate_up_proj": ["gate_proj", "up_proj"],
         "experts": ["experts.0.gate_proj", "experts.0.up_proj", "experts.0.down_proj"],
@@ -441,6 +456,21 @@ def _is_missing_v_shard(shard_key: str, quant_description: Mapping[str, Any]) ->
     return f"{shard_prefix}q_proj.weight" in quant_description and f"{shard_prefix}k_proj.weight" in quant_description
 
 
+def _is_optional_packed_shard(shard_key: str, quant_description: Mapping[str, Any]) -> bool:
+    """Return whether a missing packed shard can be ignored.
+
+    Kimi K3 GDN only materializes g_proj when use_full_rank_gate is enabled.
+    """
+    if shard_key in quant_description:
+        return False
+    if _is_missing_v_shard(shard_key, quant_description):
+        return True
+    if shard_key.endswith(".g_proj.weight"):
+        shard_prefix = shard_key[: -len("g_proj.weight")]
+        return f"{shard_prefix}q_proj.weight" in quant_description
+    return False
+
+
 def get_linear_quant_type(
     quant_description: dict[str, Any], prefix: str, packed_modules_mapping: dict[str, Any]
 ) -> str | None:
@@ -462,9 +492,9 @@ def get_linear_quant_type(
         ]
         for shard_prefix in shard_prefixes:
             shard_key = shard_prefix + ".weight"
-            # Only Gemma4 k_eq_v is allowed to omit v_proj; other missing
-            # shards fall through to the original dictionary lookup below.
-            if shard_key not in quant_description and _is_missing_v_shard(shard_key, quant_description):
+            # Only known optional shards (Gemma4 k_eq_v, Kimi K3 g_proj) may be
+            # omitted; other missing shards fall through to the original lookup.
+            if _is_optional_packed_shard(shard_key, quant_description):
                 continue
             shard_quant_type = quant_description[shard_key]
 
@@ -800,15 +830,20 @@ class AscendModelSlimConfig(QuantizationConfig):
             is_skipped = None
             for shard_prefix in shard_prefixes:
                 shard_key = shard_prefix + ".weight"
-                # Preserve the original failure behavior except for the known
-                # k_eq_v case where v_proj is replicated from k_proj.
-                if shard_key not in self.quant_description and _is_missing_v_shard(shard_key, self.quant_description):
+                if _is_optional_packed_shard(shard_key, self.quant_description):
                     continue
                 is_shard_skipped = self.quant_description[shard_key] == "FLOAT"
 
                 if is_skipped is None:
                     is_skipped = is_shard_skipped
                 elif is_shard_skipped != is_skipped:
+                    if proj_name in _FUSED_LAYERS_SKIP_ON_MIXED_SHARDS:
+                        logger.warning_once(
+                            "Fused layer %s has mixed quantized/FLOAT shards; "
+                            "loading it unquantized because a single GEMM cannot mix precisions.",
+                            prefix,
+                        )
+                        return True
                     raise ValueError(
                         f"Detected some but not all shards of {prefix} "
                         "are quantized. All shards of fused layers "

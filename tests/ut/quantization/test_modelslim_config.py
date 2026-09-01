@@ -605,6 +605,61 @@ class TestQuantPrefixMapper(TestBase):
 
         self.assertEqual(prefix, "model.layers.0.moe.experts")
 
+    def test_kimi_k3_packed_modules_mapping_covers_gdn_and_mla(self):
+        expected = {
+            "gate_up_proj": ["gate_proj", "up_proj"],
+            "in_proj_qkvgfab": ["q_proj", "k_proj", "v_proj", "g_proj", "b_proj", "f_a_proj"],
+            "conv1d": ["q_conv1d", "k_conv1d", "v_conv1d"],
+            "fused_qkv_a_proj": ["q_a_proj", "kv_a_proj_with_mqa"],
+        }
+        for model_type in ("kimi_k3", "kimi_linear"):
+            with self.subTest(model_type=model_type):
+                self.assertEqual(get_packed_modules_mapping(model_type), expected)
+
+    def test_kimi_k3_in_proj_qkvgfab_mixed_shards_are_skipped(self):
+        prefix = "language_model.model.layers.0.self_attn.in_proj_qkvgfab"
+        packed_mapping = get_packed_modules_mapping("kimi_k3")
+        quant_description = {
+            "language_model.model.layers.0.self_attn.q_proj.weight": "W8A8_DYNAMIC",
+            "language_model.model.layers.0.self_attn.k_proj.weight": "W8A8_DYNAMIC",
+            "language_model.model.layers.0.self_attn.v_proj.weight": "W8A8_DYNAMIC",
+            "language_model.model.layers.0.self_attn.g_proj.weight": "W8A8_DYNAMIC",
+            "language_model.model.layers.0.self_attn.b_proj.weight": "FLOAT",
+            "language_model.model.layers.0.self_attn.f_a_proj.weight": "FLOAT",
+        }
+        config = AscendModelSlimConfig(quant_description)
+
+        self.assertTrue(config.is_layer_skipped_ascend(prefix, packed_mapping))
+
+    def test_kimi_k3_in_proj_qkvgfab_missing_g_proj_is_optional(self):
+        prefix = "language_model.model.layers.0.self_attn.in_proj_qkvgfab"
+        packed_mapping = get_packed_modules_mapping("kimi_k3")
+        quant_description = {
+            "language_model.model.layers.0.self_attn.q_proj.weight": "W8A8_DYNAMIC",
+            "language_model.model.layers.0.self_attn.k_proj.weight": "W8A8_DYNAMIC",
+            "language_model.model.layers.0.self_attn.v_proj.weight": "W8A8_DYNAMIC",
+            "language_model.model.layers.0.self_attn.b_proj.weight": "W8A8_DYNAMIC",
+            "language_model.model.layers.0.self_attn.f_a_proj.weight": "W8A8_DYNAMIC",
+        }
+        config = AscendModelSlimConfig(quant_description)
+
+        self.assertEqual(get_linear_quant_type(quant_description, prefix, packed_mapping), "W8A8_DYNAMIC")
+        self.assertFalse(config.is_layer_skipped_ascend(prefix, packed_mapping))
+
+    def test_kimi_k3_in_proj_qkvgfab_uniform_float_is_skipped(self):
+        prefix = "language_model.model.layers.0.self_attn.in_proj_qkvgfab"
+        packed_mapping = get_packed_modules_mapping("kimi_k3")
+        quant_description = {
+            "language_model.model.layers.0.self_attn.q_proj.weight": "FLOAT",
+            "language_model.model.layers.0.self_attn.k_proj.weight": "FLOAT",
+            "language_model.model.layers.0.self_attn.v_proj.weight": "FLOAT",
+            "language_model.model.layers.0.self_attn.b_proj.weight": "FLOAT",
+            "language_model.model.layers.0.self_attn.f_a_proj.weight": "FLOAT",
+        }
+        config = AscendModelSlimConfig(quant_description)
+
+        self.assertTrue(config.is_layer_skipped_ascend(prefix, packed_mapping))
+
 
 class TestGetKvQuantDtype(TestBase):
     def test_enable_fa_quant(self):
