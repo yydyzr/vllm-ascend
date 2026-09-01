@@ -12,7 +12,21 @@
 #include "chunk_kda_fwd_finalize.h"
 #endif
 
-#if __has_include("../../../gdn/chunk_gdn_fwd/chunk_gated_delta_rule_fwd_h/op_kernel/chunk_gated_delta_rule_fwd_h_struct.h")
+#if __has_include("chunk_gated_delta_rule_fwd_h_struct.h")
+#include "chunk_gated_delta_rule_fwd_h_struct.h"
+#if defined(__CCE_AICORE__) && __CCE_AICORE__ == 310
+#include "arch35/gemm/kernel/gdn_fwd_h_kernel.hpp"
+#else
+#include "gemm/kernel/gdn_fwd_h_kernel.hpp"
+#endif
+#elif __has_include("../../../moe/chunk_gated_delta_rule_fwd_h/op_kernel/chunk_gated_delta_rule_fwd_h_struct.h")
+#include "../../../moe/chunk_gated_delta_rule_fwd_h/op_kernel/chunk_gated_delta_rule_fwd_h_struct.h"
+#if defined(__CCE_AICORE__) && __CCE_AICORE__ == 310
+#include "../../../moe/chunk_gated_delta_rule_fwd_h/op_kernel/arch35/gemm/kernel/gdn_fwd_h_kernel.hpp"
+#else
+#include "../../../moe/chunk_gated_delta_rule_fwd_h/op_kernel/gemm/kernel/gdn_fwd_h_kernel.hpp"
+#endif
+#elif __has_include("../../../gdn/chunk_gdn_fwd/chunk_gated_delta_rule_fwd_h/op_kernel/chunk_gated_delta_rule_fwd_h_struct.h")
 #include "../../../gdn/chunk_gdn_fwd/chunk_gated_delta_rule_fwd_h/op_kernel/chunk_gated_delta_rule_fwd_h_struct.h"
 #if defined(__CCE_AICORE__) && __CCE_AICORE__ == 310
 #include "../../../gdn/chunk_gdn_fwd/chunk_gated_delta_rule_fwd_h/op_kernel/arch35/gemm/kernel/gdn_fwd_h_kernel.hpp"

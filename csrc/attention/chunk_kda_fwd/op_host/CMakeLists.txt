@@ -12,8 +12,13 @@ get_filename_component(COMMON_KERNEL_UTILS_DIR_ABS ${COMMON_KERNEL_UTILS_DIR} AB
 
 add_op_to_compiled_list()
 set(chunk_kda_fwd_depends
-    "attention/kda_gate_cumsum;moe/chunk_gated_delta_rule_fwd_h"
-    CACHE STRING "Kernel source dependencies for chunk_kda_fwd" FORCE)
+    attention/kda_gate_cumsum
+    moe/chunk_gated_delta_rule_fwd_h
+    CACHE INTERNAL "Kernel source dependencies for chunk_kda_fwd" FORCE)
+set(CHUNK_GATED_DELTA_RULE_FWD_H_KERNEL_DIR
+    "${OPS_TRANSFORMER_DIR}/moe/chunk_gated_delta_rule_fwd_h/op_kernel")
+get_filename_component(CHUNK_GATED_DELTA_RULE_FWD_H_KERNEL_DIR_ABS
+    ${CHUNK_GATED_DELTA_RULE_FWD_H_KERNEL_DIR} ABSOLUTE)
 if (BUILD_OPEN_PROJECT)
     target_sources(op_host_aclnnExc PRIVATE
         chunk_kda_fwd_def.cpp
@@ -26,6 +31,7 @@ add_ops_compile_options(
             -Wno-deprecated-declarations
             -I${CATLASS_INCLUDE_DIR_ABS}
             -I${COMMON_KERNEL_UTILS_DIR_ABS}
+            -I${CHUNK_GATED_DELTA_RULE_FWD_H_KERNEL_DIR_ABS}
 )
 if("${ASCEND_COMPUTE_UNIT}" STREQUAL "ascend950")
     add_ops_compile_options(

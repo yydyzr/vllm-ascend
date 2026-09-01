@@ -520,7 +520,7 @@ function(add_bin_compile_target)
                             TARGET_NAME
                             ${_depend_op_target}
                             SRC
-                            ${CMAKE_SOURCE_DIR}/${depend_info}
+                            ${OPS_TRANSFORMER_DIR}/${depend_info}
                             DST
                             ${SRC_OUT_DIR}/${_depend_op_name}
                             COMPUTE_UNIT
