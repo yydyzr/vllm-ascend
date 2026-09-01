@@ -8,6 +8,7 @@ import torch
 
 from vllm_ascend import ascend_forward_context as afc
 from vllm_ascend.ascend_forward_context import MoECommType
+from vllm_ascend.ops.fused_moe.mega_moe_adapter import reset_cann_mega_moe_capability_state
 
 
 @pytest.fixture(autouse=True)
@@ -18,6 +19,7 @@ def reset_mc2_tokens_capacity(monkeypatch):
         "get_ascend_config",
         lambda: SimpleNamespace(enable_prefill_mc2=False, enable_fused_mc2=0),
     )
+    reset_cann_mega_moe_capability_state()
 
 
 def _make_vllm_config(
@@ -391,6 +393,44 @@ def test_select_moe_comm_method_a5(monkeypatch, num_tokens, world_size, top_k_ex
     vllm_config = _make_vllm_config(world_size=world_size, top_k_experts=top_k_experts)
 
     assert afc.select_moe_comm_method(num_tokens, vllm_config) == expected
+
+
+def test_select_moe_comm_method_a5_fused_mc2_when_capability_supported(monkeypatch):
+    _patch_select_moe_comm_method_deps(
+        monkeypatch,
+        device_type=afc.AscendDeviceType.A5,
+        capacity=128,
+        enable_fused_mc2=1,
+    )
+    vllm_config = _make_vllm_config(world_size=8, top_k_experts=8)
+
+    assert (
+        afc.select_moe_comm_method(
+            64,
+            vllm_config,
+            cann_mega_moe_supported=True,
+        )
+        == MoECommType.FUSED_MC2
+    )
+
+
+def test_select_moe_comm_method_a5_keeps_mc2_when_capability_unsupported(monkeypatch):
+    _patch_select_moe_comm_method_deps(
+        monkeypatch,
+        device_type=afc.AscendDeviceType.A5,
+        capacity=128,
+        enable_fused_mc2=1,
+    )
+    vllm_config = _make_vllm_config(world_size=8, top_k_experts=8)
+
+    assert (
+        afc.select_moe_comm_method(
+            64,
+            vllm_config,
+            cann_mega_moe_supported=False,
+        )
+        == MoECommType.MC2
+    )
 
 
 def test_select_moe_comm_method_310p_uses_allgather(monkeypatch):
