@@ -49,6 +49,13 @@ _SWIGLU_ACTIVATIONS = frozenset(
         "moeactivation.swiglu",
     }
 )
+_SITU_ACTIVATIONS = frozenset(
+    {
+        "situ",
+        "situglu",
+        "moeactivation.situ",
+    }
+)
 _COMMON_MEGA_MOE_KEYWORDS = frozenset(
     {
         "activation_clamp",
@@ -125,22 +132,63 @@ def probe_cann_mega_moe_api() -> CannMegaMoeApiCapability:
     )
 
 
-def resolve_cann_mega_moe_activation(activation: Any) -> CannMegaMoeActivation | None:
-    linear_beta = getattr(activation, "linear_beta", None)
-    beta = getattr(activation, "beta", None)
-    # SiTU is represented by an activation config carrying both linear_beta
-    # and beta. Duck-type so this adapter does not depend on a specific class.
-    if linear_beta is not None and beta is not None:
+def _optional_float(value: Any) -> float | None:
+    if value is None:
+        return None
+    return float(value)
+
+
+def _normalized_activation_token(activation: Any) -> str:
+    enum_name = getattr(activation, "name", None)
+    if isinstance(enum_name, str) and enum_name.isupper():
+        return enum_name.lower()
+    raw = getattr(activation, "value", activation)
+    token = str(raw).lower()
+    if token.startswith("moeactivation."):
+        token = token.split(".", 1)[1]
+    return token
+
+
+def resolve_cann_mega_moe_activation(
+    activation: Any,
+    *,
+    situ_beta: float | None = None,
+    situ_linear_beta: float | None = None,
+) -> CannMegaMoeActivation | None:
+    object_linear_beta = getattr(activation, "linear_beta", None)
+    object_beta = getattr(activation, "beta", None)
+    # Legacy duck-type: a config object carrying both SiTU coefficients.
+    if object_linear_beta is not None and object_beta is not None:
         return CannMegaMoeActivation(
             name="situglu",
-            alpha=float(linear_beta),
-            beta=float(beta),
+            alpha=float(object_linear_beta),
+            beta=float(object_beta),
         )
 
-    activation_name = str(getattr(activation, "value", activation)).lower()
+    activation_name = _normalized_activation_token(activation)
+    # K3 stores MoEActivation.SITU on the layer; coefficients live on FusedMoEConfig.
+    if activation_name in _SITU_ACTIVATIONS:
+        linear_beta = object_linear_beta if object_linear_beta is not None else situ_linear_beta
+        beta = object_beta if object_beta is not None else situ_beta
+        return CannMegaMoeActivation(
+            name="situglu",
+            alpha=_optional_float(linear_beta),
+            beta=_optional_float(beta),
+        )
     if activation_name in _SWIGLU_ACTIVATIONS:
         return CannMegaMoeActivation(name="swiglu")
     return None
+
+
+def resolve_layer_cann_mega_moe_activation(
+    activation: Any,
+    moe_config: Any | None = None,
+) -> CannMegaMoeActivation | None:
+    return resolve_cann_mega_moe_activation(
+        activation,
+        situ_beta=None if moe_config is None else getattr(moe_config, "activation_situ_beta", None),
+        situ_linear_beta=None if moe_config is None else getattr(moe_config, "activation_situ_linear_beta", None),
+    )
 
 
 def _unsupported(reason: str, quant_type: QuantType) -> CannMegaMoeLayerCapability:
@@ -196,7 +244,7 @@ def evaluate_cann_mega_moe_layer(
     else:
         return _register_layer_capability(_unsupported(f"MegaMoe is not supported on {device_type}", quant_type))
 
-    resolved_activation = resolve_cann_mega_moe_activation(activation)
+    resolved_activation = resolve_layer_cann_mega_moe_activation(activation, moe_config)
     if resolved_activation is None:
         return _register_layer_capability(_unsupported(f"unsupported MegaMoe activation: {activation}", quant_type))
     if resolved_activation.name == "situglu" and not api_capability.supports_situ:

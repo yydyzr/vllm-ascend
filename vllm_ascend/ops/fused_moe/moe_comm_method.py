@@ -32,7 +32,7 @@ from vllm_ascend.ops.fused_moe.dataclass.prepare_finalize import MoEPrepareOutpu
 from vllm_ascend.ops.fused_moe.dataclass.token_dispatcher import build_token_dispatch_input
 from vllm_ascend.ops.fused_moe.mega_moe_adapter import (
     CannMegaMoeLayerCapability,
-    resolve_cann_mega_moe_activation,
+    resolve_layer_cann_mega_moe_activation,
 )
 from vllm_ascend.ops.fused_moe.moe_mlp import unified_apply_mlp
 from vllm_ascend.ops.fused_moe.prepare_finalize import (
@@ -423,7 +423,10 @@ class FusedMC2CommImpl(MoECommMethod):
             self.mega_moe_symm_buffer.dispatch_quant_mode = dispatch_quant_mode
             self.mega_moe_symm_buffer.dispatch_quant_out_dtype = dispatch_quant_out_dtype
 
-        activation_config = resolve_cann_mega_moe_activation(fused_experts_input.activation)
+        activation_config = resolve_layer_cann_mega_moe_activation(
+            fused_experts_input.activation,
+            self.moe_config,
+        )
         activation = None if activation_config is None else activation_config.name
         activation_clamp = None if activation == "situglu" else self.swiglu_limit if self.swiglu_limit > 0 else None
         x_active_mask = None
@@ -492,7 +495,10 @@ class FusedMC2CommImpl(MoECommMethod):
             "token_dispatcher must be an instance of TokenDispatcherWithMC2."
         )
 
-        runtime_activation = resolve_cann_mega_moe_activation(fused_experts_input.activation)
+        runtime_activation = resolve_layer_cann_mega_moe_activation(
+            fused_experts_input.activation,
+            self.moe_config,
+        )
         a5_need_extra_args = self.token_dispatcher.a5_need_extra_args
         use_cann_mega_moe = self.mega_moe is not None and (
             (
