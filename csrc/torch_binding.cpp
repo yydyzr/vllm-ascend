@@ -2533,11 +2533,14 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
 
     // fused_li_manage_mtp
     ops.def(
-        "npu_fused_li_manage_mtp(Tensor query, Tensor index_weights, Tensor index_key_cache, "
-        "Tensor index_block_table, Tensor num_candidate_tokens, Tensor num_cache_tokens, "
-        "Tensor req_pool_entries, Tensor(a!) cache_slots_pool, Tensor(b!) topk_src_ids, "
-        "Tensor(c!) topk_dst_slots, Tensor(d!) miss_src_ids, Tensor(e!) miss_dst_slots, "
-        "Tensor(f!) miss_counts) -> ()"
+        "npu_fused_li_manage_mtp(Tensor index_weights, Tensor query_dequant_scale, "
+        "Tensor query, Tensor index_key_dequant_scale, Tensor index_key_cache, "
+        "Tensor index_block_table, Tensor actual_seq_lengths_query, "
+        "Tensor actual_seq_lengths_key, Tensor offload_seq_lengths_key, "
+        "Tensor num_cache_tokens, Tensor request_state, Tensor req_pool_entries, "
+        "Tensor(a!) cache_slots_pool, Tensor(b!) topk_src_ids, Tensor(c!) topk_dst_slots, "
+        "Tensor(d!) topk_miss_counts, Tensor(e!) miss_src_ids, Tensor(f!) miss_dst_slots, "
+        "Tensor(g!) miss_counts) -> ()"
     );
     ops.impl("npu_fused_li_manage_mtp", torch::kPrivateUse1,
              &vllm_ascend::npu_fused_li_manage_mtp);
@@ -2547,7 +2550,7 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
         "npu_fused_copy_sfa_mtp(Tensor query_rope, Tensor query, "
         "Tensor actual_seq_lengths_query, Tensor actual_seq_lengths_kv, "
         "Tensor num_cache_tokens, Tensor topk_dst_slots, Tensor topk_src_ids, "
-        "Tensor miss_src_ids, Tensor miss_dst_slots, Tensor miss_counts, "
+        "Tensor topk_miss_counts, Tensor miss_src_ids, Tensor miss_dst_slots, Tensor miss_counts, "
         "Tensor hbm_block_table, Tensor dram_block_table, "
         "Tensor(a!) hbm_k_rope, Tensor(b!) hbm_kv_cache, "
         "Tensor dram_k_rope, Tensor dram_kv_cache, float scale_value, "

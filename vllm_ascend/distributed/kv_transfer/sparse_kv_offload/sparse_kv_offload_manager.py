@@ -389,6 +389,7 @@ class SparseKVOffloadManager:
         self.tp_group.barrier()
 
         self.topk_buffer_slot_manager = TopkBufferSlotManager(self.max_num_reqs)
+        self.nano_mtp_slot_generations: dict[int, int] = {}
 
     def _build_cpp(self):
         os.environ["TORCH_EXTENSIONS_ALWAYS_BUILD"] = "1"
@@ -1673,6 +1674,10 @@ def update_sparse_kv_offload_metadata(
         # allocates during prefill so dual-write and later decode share one row.
         all_req_ids = list(req_ids[:effective_num_reqs])
         topk_buffer_slots, first_allocate = manager.allocate_topk_buffer_slots(all_req_ids)
+        if getattr(sparse_kv_offload_config, "generalized_mtp", False):
+            for slot, allocated in zip(topk_buffer_slots, first_allocate):
+                if allocated:
+                    manager.nano_mtp_slot_generations[slot] = manager.nano_mtp_slot_generations.get(slot, 0) + 1
         offload_req_topk_buffer_slots.np[:effective_num_reqs] = np.asarray(
             topk_buffer_slots, dtype=offload_req_topk_buffer_slots.np.dtype
         )

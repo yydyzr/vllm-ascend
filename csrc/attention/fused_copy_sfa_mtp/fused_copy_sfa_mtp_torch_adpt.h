@@ -1,35 +1,13 @@
-#ifndef FUSED_COPY_STA_MTP_TORCH_ADPT_H
-#define FUSED_COPY_STA_MTP_TORCH_ADPT_H
+#ifndef FUSED_COPY_SFA_MTP_TORCH_ADPT_H
+#define FUSED_COPY_SFA_MTP_TORCH_ADPT_H
 
 namespace vllm_ascend {
 
-// MTP3 (query_len=4) fused source-aware DRAM-to-HBM copy + causal sparse
-// attention in one AscendC launch. HBM caches are mutated in place and the
-// caller owns attention_out; no cache aliases are exposed through the public
-// torch.library schema.
-//
-// Parameters:
-//   query_rope              - bf16/fp16 [B*4, N, 64],  read-only, 4-way attention query (rope part)
-//   query                   - bf16/fp16 [B*4, N, 512], read-only, 4-way attention query (nope part)
-//   actual_seq_lengths_query - int32 [B], read-only, TND cumulative query lengths, values are [4, 8, ..., B*4]
-//   actual_seq_lengths_kv   - int32 [B], read-only, final KV length for the 4th query per request
-//   num_cache_tokens        - int32 [B], read-only, HBM cache token budget C per request
-//   topk_dst_slots          - int32 [B*4, 1, 2048], read-only, 4-way top-2048 HBM logical slots
-//   topk_src_ids            - int32 [B*4, 1, 2048], read-only, 4-way top-2048 source token IDs (HBM hit positions are -1)
-//   miss_src_ids            - int32 [B, 8192], read-only, unique miss source IDs in the 4-way union (first miss_counts valid)
-//   miss_dst_slots          - int32 [B, 8192], read-only, unique miss HBM logical slots (first miss_counts valid)
-//   miss_counts             - int32 [B], read-only, unique union miss token count per request
-//   hbm_block_table         - int32 [B, HBM_MAX_BLOCKS], read-only, HBM block table
-//   dram_block_table        - int32 [B, DRAM_MAX_BLOCKS], read-only, DRAM block table
-//   hbm_k_rope              - bf16/fp16 [HBM_BLOCKS, 128, 1, 64], read-write, HBM KV cache (rope), attention input and copy dest
-//   hbm_kv_cache            - bf16/fp16 [HBM_BLOCKS, 128, 1, 512], read-write, HBM KV cache (nope), attention input and copy dest
-//   dram_k_rope             - bf16/fp16 [DRAM_BLOCKS, 128, 64], read-only, host DRAM KV (rope)
-//   dram_kv_cache           - bf16/fp16 [DRAM_BLOCKS, 128, 512], read-only, host DRAM KV (nope)
-//   scale_value             - float, read-only, attention scale
-//   attention_out           - bf16/fp16 [B*4, N, 512], write-only, 4-way causal sparse attention result
-//
-// Offloaded DRAM KV sources (dram_k_rope / dram_kv_cache) may reside on host
-// or on the query NPU device. All other tensors must be on the query NPU.
+// Variable-width MTP source-aware copy + causal sparse Attention in one
+// AscendC launch. actual_seq_lengths_query is the TND prefix sum and each
+// request contributes between one and sixteen query rows (MTP0..MTP15).
+// HBM caches are mutated in place and the caller owns attention_out; no cache
+// aliases are exposed through the public torch.library schema.
 inline void npu_fused_copy_sfa_mtp(
     const at::Tensor& query_rope,
     const at::Tensor& query,
@@ -38,6 +16,7 @@ inline void npu_fused_copy_sfa_mtp(
     const at::Tensor& num_cache_tokens,
     const at::Tensor& topk_dst_slots,
     const at::Tensor& topk_src_ids,
+    const at::Tensor& topk_miss_counts,
     const at::Tensor& miss_src_ids,
     const at::Tensor& miss_dst_slots,
     const at::Tensor& miss_counts,
@@ -50,40 +29,48 @@ inline void npu_fused_copy_sfa_mtp(
     double scale_value,
     at::Tensor attention_out) {
   constexpr int64_t kBlockSize = 128;
-  constexpr int64_t kQueryCount = 4;
+  constexpr int64_t kMaxQueryCount = 16;
   constexpr int64_t kTopK = 2048;
+  // MTP15 has sixteen query rows and each contributes up to TopK misses.
+  constexpr int64_t kMissCapacity = 32768;
   constexpr int64_t kCkvDim = 512;
   constexpr int64_t kKpeDim = 64;
 
   TORCH_CHECK(query.device().is_privateuseone(),
               "Fused MTP copy+Attention inputs must be on NPU.");
   TORCH_CHECK(query.dim() == 3 && query.size(2) == kCkvDim,
-              "Fused MTP query must be [4B, N, 512].");
+              "Fused MTP query must be [T, N, 512].");
   TORCH_CHECK(num_cache_tokens.dim() == 1 && num_cache_tokens.size(0) > 0,
               "Fused MTP cache_tokens must be [B] with B > 0.");
   const int64_t batch_size = num_cache_tokens.size(0);
-  TORCH_CHECK(query.size(0) == batch_size * kQueryCount,
-              "Fused MTP copy+Attention requires four queries per request.");
+  TORCH_CHECK(query.size(0) >= batch_size &&
+                  query.size(0) <= batch_size * kMaxQueryCount,
+              "Fused MTP T must satisfy B <= T <= 16B (MTP0..MTP15).");
+  TORCH_CHECK(query.size(1) == 8 || query.size(1) == 128,
+              "Fused MTP query head count N must be 8 or 128.");
   TORCH_CHECK(query_rope.dim() == 3 &&
                   query_rope.size(0) == query.size(0) &&
                   query_rope.size(1) == query.size(1) &&
                   query_rope.size(2) == kKpeDim,
-              "Fused MTP query_rope must be [4B, N, 64].");
+              "Fused MTP query_rope must be [T, N, 64].");
   TORCH_CHECK(topk_dst_slots.dim() == 3 &&
                   topk_dst_slots.size(0) == query.size(0) &&
                   topk_dst_slots.size(1) == 1 &&
                   topk_dst_slots.size(2) == kTopK,
-              "Fused MTP topk_slots must be [4B, 1, 2048].");
+              "Fused MTP topk_slots must be [T, 1, 2048].");
   TORCH_CHECK(topk_src_ids.sizes() == topk_dst_slots.sizes(),
               "Fused MTP topk_source_ids must match topk_slots.");
+  TORCH_CHECK(topk_miss_counts.dim() == 1 &&
+                  topk_miss_counts.size(0) == query.size(0),
+              "Fused MTP topk_miss_counts must be [T].");
   TORCH_CHECK(miss_src_ids.dim() == 2 &&
                   miss_src_ids.size(0) == batch_size &&
-                  miss_src_ids.size(1) == kQueryCount * kTopK &&
-                  miss_dst_slots.sizes() == miss_src_ids.sizes(),
-              "Fused MTP compact union misses must be [B, 8192].");
-  TORCH_CHECK(miss_counts.dim() == 1 &&
+                  miss_src_ids.size(1) == kMissCapacity &&
+                  miss_dst_slots.sizes() == miss_src_ids.sizes() &&
+                  miss_counts.dim() == 1 &&
                   miss_counts.size(0) == batch_size,
-              "Fused MTP miss_counts must be [B].");
+              "Fused MTP first-fill metadata must be miss_src_ids/"
+              "miss_dst_slots [B, 32768] and miss_counts [B].");
   TORCH_CHECK(hbm_block_table.dim() == 2 &&
                   hbm_block_table.size(0) == batch_size &&
                   hbm_block_table.size(1) > 0 &&
@@ -131,32 +118,42 @@ inline void npu_fused_copy_sfa_mtp(
                 "All fused MTP floating-point tensors must share one dtype.");
   }
   for (const at::Tensor* tensor :
-       std::array<const at::Tensor*, 10>{
+       std::array<const at::Tensor*, 11>{
            &actual_seq_lengths_query, &actual_seq_lengths_kv,
            &num_cache_tokens, &topk_dst_slots, &topk_src_ids,
-           &miss_src_ids, &miss_dst_slots, &miss_counts,
-           &hbm_block_table,
-           &dram_block_table}) {
+           &topk_miss_counts, &miss_src_ids, &miss_dst_slots,
+           &miss_counts, &hbm_block_table, &dram_block_table}) {
     TORCH_CHECK(tensor->scalar_type() == at::kInt,
                 "All fused MTP metadata tensors must be int32.");
   }
 
   const auto device = query.device();
-  // Offloaded DRAM KV may reside on host or NPU; everything else must match query.
   for (const at::Tensor* tensor :
-       std::array<const at::Tensor*, 15>{
+       std::array<const at::Tensor*, 16>{
            &query_rope, &query, &actual_seq_lengths_query,
            &actual_seq_lengths_kv, &num_cache_tokens, &topk_dst_slots,
-           &topk_src_ids, &miss_src_ids, &miss_dst_slots, &miss_counts,
+           &topk_src_ids, &topk_miss_counts, &miss_src_ids,
+           &miss_dst_slots, &miss_counts,
            &hbm_block_table, &dram_block_table, &hbm_k_rope,
-           &hbm_kv_cache, &attention_out}) {
+           &hbm_kv_cache,
+           &attention_out}) {
     TORCH_CHECK(tensor->device() == device,
-                "All non-DRAM fused MTP tensors must be on the same NPU.");
+                "All fused MTP tensors must be on the same NPU.");
     TORCH_CHECK(tensor->is_contiguous(),
                 "All fused MTP tensors must be contiguous.");
   }
-  TORCH_CHECK(dram_k_rope.is_contiguous() && dram_kv_cache.is_contiguous(),
-              "DRAM fused MTP tensors must be contiguous.");
+
+  // Match the MTP0 offload ABI: the manager owns registered MemFabric GVA
+  // allocations exposed as non-owning CPU tensors. ConvertType passes their
+  // storage pointers directly to ACLNN without copying the history to HBM.
+  // Ordinary CPU allocations are not device-accessible; callers must register
+  // the backing allocation before passing a host view here.
+  for (const at::Tensor* tensor :
+       std::array<const at::Tensor*, 2>{&dram_k_rope, &dram_kv_cache}) {
+    TORCH_CHECK(tensor->device().is_cpu() || tensor->device() == device,
+                "DRAM sources must be registered host views or on the query NPU.");
+    TORCH_CHECK(tensor->is_contiguous(), "DRAM sources must be contiguous.");
+  }
 
   std::string query_layout = "TND";
   std::string kv_layout = "PA_BSND";
@@ -164,10 +161,32 @@ inline void npu_fused_copy_sfa_mtp(
   char* kv_layout_ptr = const_cast<char*>(kv_layout.c_str());
   constexpr int64_t kSparseBlockSize = 1;
   constexpr int64_t kSparseMode = 3;
+  auto first_fill_keepalive = std::make_tuple(
+      hbm_k_rope, hbm_kv_cache, dram_k_rope, dram_kv_cache,
+      hbm_block_table, dram_block_table, miss_src_ids, miss_dst_slots,
+      miss_counts, num_cache_tokens);
+  // This launch is a device-side conditional no-op for steady-state batches.
+  // When any request is first-fill, it copies the request-level miss list to
+  // HBM. The following Attention launch is ordered on the same NPU stream.
+  EXEC_NPU_CMD_ORDERED(
+      aclnnFirstFillScatterCopy,
+      first_fill_keepalive,
+      hbm_k_rope,
+      hbm_kv_cache,
+      dram_k_rope,
+      dram_kv_cache,
+      hbm_block_table,
+      dram_block_table,
+      miss_src_ids,
+      miss_dst_slots,
+      miss_counts,
+      num_cache_tokens);
+
   auto keepalive = std::make_tuple(
       query_rope, query, actual_seq_lengths_query,
       actual_seq_lengths_kv, num_cache_tokens, topk_dst_slots,
-      topk_src_ids, miss_src_ids, miss_dst_slots, miss_counts,
+      topk_src_ids, topk_miss_counts, miss_src_ids, miss_dst_slots,
+      miss_counts,
       hbm_block_table, dram_block_table, hbm_k_rope,
       hbm_kv_cache, dram_k_rope, dram_kv_cache, attention_out);
   EXEC_NPU_CMD_ORDERED(
@@ -187,6 +206,7 @@ inline void npu_fused_copy_sfa_mtp(
       dram_kv_cache,
       dram_block_table,
       topk_src_ids,
+      topk_miss_counts,
       miss_src_ids,
       miss_dst_slots,
       miss_counts,

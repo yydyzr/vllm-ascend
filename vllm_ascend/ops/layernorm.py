@@ -39,9 +39,11 @@ class AscendRMSNorm(RMSNorm):
         self.bias = None
         self.bias_loaded = False
 
-        # quantization with anti_method m4 will generate none-zero norm bias
+        # Quantization with anti_method m4 can add RMSNorm bias. The DSA
+        # indexer's k_norm is a LayerNorm whose native bias is unrelated.
         if vllm_config.quant_config is not None and any(
-            "norm.bias" in name for name in vllm_config.quant_config.quant_description
+            "norm.bias" in name and not name.endswith(".indexer.k_norm.bias")
+            for name in vllm_config.quant_config.quant_description
         ):
             self.bias = torch.nn.Parameter(torch.zeros(hidden_size), requires_grad=False)
             self.bias.weight_loader = self._bias_weight_loader

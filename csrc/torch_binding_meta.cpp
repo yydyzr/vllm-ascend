@@ -1410,16 +1410,22 @@ void store_kv_block(
 }
 
 void npu_fused_li_manage_mtp_meta(
-    const at::Tensor &query,
     const at::Tensor &index_weights,
+    const at::Tensor &query_dequant_scale,
+    const at::Tensor &query,
+    const at::Tensor &index_key_dequant_scale,
     const at::Tensor &index_key_cache,
     const at::Tensor &index_block_table,
-    const at::Tensor &num_candidate_tokens,
+    const at::Tensor &actual_seq_lengths_query,
+    const at::Tensor &actual_seq_lengths_key,
+    const at::Tensor &offload_seq_lengths_key,
     const at::Tensor &num_cache_tokens,
+    const at::Tensor &request_state,
     const at::Tensor &req_pool_entries,
     at::Tensor cache_slots_pool,
     at::Tensor topk_src_ids,
     at::Tensor topk_dst_slots,
+    at::Tensor topk_miss_counts,
     at::Tensor miss_src_ids,
     at::Tensor miss_dst_slots,
     at::Tensor miss_counts)
@@ -1435,6 +1441,7 @@ void npu_fused_copy_sfa_mtp_meta(
     const at::Tensor &num_cache_tokens,
     const at::Tensor &topk_dst_slots,
     const at::Tensor &topk_src_ids,
+    const at::Tensor &topk_miss_counts,
     const at::Tensor &miss_src_ids,
     const at::Tensor &miss_dst_slots,
     const at::Tensor &miss_counts,

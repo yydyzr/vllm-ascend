@@ -1209,6 +1209,17 @@ class SparseKVOffloadConfig:
             raise ValueError(
                 f"fused op type: {self.fused_op_type} is not in supported op list: {self.support_fused_op_types}."
             )
+        self.generalized_mtp = self.fused_op_type == "nano" and vllm_config.speculative_config is not None
+        if self.generalized_mtp:
+            width = 1 + vllm_config.speculative_config.num_speculative_tokens
+            if not 1 <= width <= 7:
+                raise ValueError("Generalized LIM supports at most six speculative tokens (seven query rows)")
+            if not self.keep_device_kv_cache or not vllm_config.model_config.enforce_eager:
+                raise ValueError("Generalized MTP offload currently requires eager colocate with keep_device_kv_cache")
+            if "topk_buffer_size" not in user_config:
+                self.topk_buffer_size = max(self.topk_buffer_size, width * self.topk)
+            if not width * self.topk <= self.topk_buffer_size <= 16256 or self.topk_buffer_size % 128:
+                raise ValueError("Generalized MTP topk_buffer_size must be block aligned and in [Q * 2048, 16256]")
 
 
 _ASCEND_CONFIG: AscendConfig | None = None

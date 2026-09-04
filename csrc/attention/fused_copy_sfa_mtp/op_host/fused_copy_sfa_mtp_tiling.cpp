@@ -24,16 +24,18 @@ constexpr uint32_t DRAM_KEY_ROPE = 10;
 constexpr uint32_t DRAM_KV_CACHE = 11;
 constexpr uint32_t DRAM_BLOCK_TABLE = 12;
 constexpr uint32_t TOPK_SOURCE_IDS = 13;
-constexpr uint32_t MISS_SOURCE_IDS = 14;
-constexpr uint32_t MISS_DESTINATION_SLOTS = 15;
-constexpr uint32_t MISS_COUNTS = 16;
+constexpr uint32_t TOPK_MISS_COUNTS = 14;
+constexpr uint32_t MISS_SOURCE_IDS = 15;
+constexpr uint32_t MISS_DST_SLOTS = 16;
+constexpr uint32_t MISS_COUNTS = 17;
 
 constexpr int64_t BLOCK_SIZE = 128;
 constexpr int64_t CKV_DIM = 512;
 constexpr int64_t KPE_DIM = 64;
-constexpr int64_t QUERY_COUNT = 4;
+constexpr int64_t MAX_QUERY_COUNT = 16;
 constexpr int64_t SPARSE_COUNT = 2048;
-constexpr int64_t MAX_LOCAL_HEADS = 128;
+// MTP15 has sixteen TopK=2048 query rows per request.
+constexpr int64_t MISS_CAPACITY = 32768;
 
 bool IsShape(const gert::Shape &shape, std::initializer_list<int64_t> dims)
 {
@@ -53,6 +55,8 @@ bool IsShape(const gert::Shape &shape, std::initializer_list<int64_t> dims)
 ge::graphStatus CheckFusedInputs(
     gert::TilingContext *context,
     uint32_t &copyCap,
+    uint32_t &missCap,
+    uint32_t &hbmMaxBlocks,
     uint32_t &dramMaxBlocks)
 {
     const auto query = context->GetInputShape(QUERY);
@@ -69,9 +73,9 @@ ge::graphStatus CheckFusedInputs(
     const auto dramKv = context->GetInputShape(DRAM_KV_CACHE);
     const auto dramTable = context->GetInputShape(DRAM_BLOCK_TABLE);
     const auto sourceIds = context->GetInputShape(TOPK_SOURCE_IDS);
+    const auto topkMissCounts = context->GetInputShape(TOPK_MISS_COUNTS);
     const auto missSourceIds = context->GetInputShape(MISS_SOURCE_IDS);
-    const auto missDestinationSlots =
-        context->GetInputShape(MISS_DESTINATION_SLOTS);
+    const auto missDstSlots = context->GetInputShape(MISS_DST_SLOTS);
     const auto missCounts = context->GetInputShape(MISS_COUNTS);
     OPS_ERR_IF(query == nullptr || key == nullptr || value == nullptr ||
                    sparse == nullptr || cacheTokens == nullptr ||
@@ -79,8 +83,8 @@ ge::graphStatus CheckFusedInputs(
                    actualKv == nullptr || queryRope == nullptr ||
                    hbmRope == nullptr || dramRope == nullptr ||
                    dramKv == nullptr || dramTable == nullptr ||
-                   sourceIds == nullptr || missSourceIds == nullptr ||
-                   missDestinationSlots == nullptr ||
+                   sourceIds == nullptr || topkMissCounts == nullptr ||
+                   missSourceIds == nullptr || missDstSlots == nullptr ||
                    missCounts == nullptr,
                OPS_LOG_E(context->GetNodeName(),
                          "A required fused MTP input shape is missing."),
@@ -100,24 +104,31 @@ ge::graphStatus CheckFusedInputs(
     const gert::Shape dramCkv = dramKv->GetStorageShape();
     const gert::Shape dramBt = dramTable->GetStorageShape();
     const gert::Shape sources = sourceIds->GetStorageShape();
-    const gert::Shape compactSources = missSourceIds->GetStorageShape();
-    const gert::Shape compactDestinations =
-        missDestinationSlots->GetStorageShape();
-    const gert::Shape counts = missCounts->GetStorageShape();
+    const gert::Shape queryMissCounts = topkMissCounts->GetStorageShape();
+    const gert::Shape requestMissSourceIds = missSourceIds->GetStorageShape();
+    const gert::Shape requestMissDstSlots = missDstSlots->GetStorageShape();
+    const gert::Shape requestMissCounts = missCounts->GetStorageShape();
 
     OPS_ERR_IF(!IsShape(cache, {-1}) || cache.GetDim(0) <= 0,
                OPS_LOG_E(context->GetNodeName(),
                          "cache_tokens must have shape [B], B > 0."),
                return ge::GRAPH_FAILED);
     const int64_t batchSize = cache.GetDim(0);
-    OPS_ERR_IF(!IsShape(q, {batchSize * QUERY_COUNT, -1, CKV_DIM}) ||
-                   q.GetDim(1) <= 0 || q.GetDim(1) > MAX_LOCAL_HEADS,
+    OPS_ERR_IF(q.GetDimNum() != 3,
                OPS_LOG_E(context->GetNodeName(),
-                         "MTP3 query must be [4B,N,512], 1 <= N <= 128."),
+                         "MTP query must have rank 3."),
                return ge::GRAPH_FAILED);
-    OPS_ERR_IF(!IsShape(qRope, {batchSize * QUERY_COUNT, q.GetDim(1), KPE_DIM}),
+    const int64_t totalQueryTokens = q.GetDim(0);
+    OPS_ERR_IF(!IsShape(q, {-1, -1, CKV_DIM}) ||
+                   totalQueryTokens < batchSize ||
+                   totalQueryTokens > batchSize * MAX_QUERY_COUNT ||
+                   (q.GetDim(1) != 8 && q.GetDim(1) != 128),
                OPS_LOG_E(context->GetNodeName(),
-                         "MTP3 query_rope must be [4B,N,64]."),
+                         "MTP query must be [T,N,512], B <= T <= 16B, N in {8,128}."),
+               return ge::GRAPH_FAILED);
+    OPS_ERR_IF(!IsShape(qRope, {totalQueryTokens, q.GetDim(1), KPE_DIM}),
+               OPS_LOG_E(context->GetNodeName(),
+                         "MTP query_rope must be [T,N,64]."),
                return ge::GRAPH_FAILED);
     OPS_ERR_IF(!IsShape(hbmKv, {-1, BLOCK_SIZE, 1, CKV_DIM}) ||
                    !IsShape(hbmValue, {hbmKv.GetDim(0), BLOCK_SIZE, 1, CKV_DIM}) ||
@@ -130,26 +141,31 @@ ge::graphStatus CheckFusedInputs(
                OPS_LOG_E(context->GetNodeName(),
                          "DRAM CKV/KPE must be [blocks,128,512/64]."),
                return ge::GRAPH_FAILED);
-    OPS_ERR_IF(!IsShape(slots, {batchSize * QUERY_COUNT, 1, SPARSE_COUNT}) ||
+    OPS_ERR_IF(!IsShape(slots, {totalQueryTokens, 1, SPARSE_COUNT}) ||
                    !IsShape(hbmBt, {batchSize, -1}) || hbmBt.GetDim(1) <= 0 ||
                    !IsShape(dramBt, {batchSize, -1}) || dramBt.GetDim(1) <= 0 ||
                    !IsShape(qLens, {batchSize}) ||
                    !IsShape(kvLens, {batchSize}) ||
-                   !IsShape(sources, {batchSize * QUERY_COUNT, 1, SPARSE_COUNT}) ||
-                   !IsShape(compactSources,
-                            {batchSize, QUERY_COUNT * SPARSE_COUNT}) ||
-                   !IsShape(compactDestinations,
-                            {batchSize, QUERY_COUNT * SPARSE_COUNT}) ||
-                   !IsShape(counts, {batchSize}),
+                   !IsShape(sources, {totalQueryTokens, 1, SPARSE_COUNT}) ||
+                   !IsShape(queryMissCounts, {totalQueryTokens}) ||
+                   !IsShape(requestMissSourceIds, {batchSize, MISS_CAPACITY}) ||
+                   !IsShape(requestMissDstSlots, {batchSize, MISS_CAPACITY}) ||
+                   !IsShape(requestMissCounts, {batchSize}),
                OPS_LOG_E(context->GetNodeName(),
                          "MTP slots, lengths, tables, and miss metadata have inconsistent shapes."),
                return ge::GRAPH_FAILED);
 
     copyCap = static_cast<uint32_t>(sources.GetDim(2));
+    missCap = static_cast<uint32_t>(requestMissSourceIds.GetDim(1));
+    hbmMaxBlocks = static_cast<uint32_t>(hbmBt.GetDim(1));
     dramMaxBlocks = static_cast<uint32_t>(dramBt.GetDim(1));
     OPS_ERR_IF(copyCap != SPARSE_COUNT,
                OPS_LOG_E(context->GetNodeName(),
                          "MTP aligned source width must be 2048."),
+               return ge::GRAPH_FAILED);
+    OPS_ERR_IF(missCap != MISS_CAPACITY,
+               OPS_LOG_E(context->GetNodeName(),
+                         "Request-level miss metadata width must be 32768."),
                return ge::GRAPH_FAILED);
 
     const ge::DataType floatingType = context->GetInputDesc(QUERY)->GetDataType();
@@ -167,8 +183,9 @@ ge::graphStatus CheckFusedInputs(
     }
     for (uint32_t idx : {SPARSE_INDICES, CACHE_TOKENS, HBM_BLOCK_TABLE,
                          ACTUAL_SEQ_LENGTHS_QUERY, ACTUAL_SEQ_LENGTHS_KV,
-                         DRAM_BLOCK_TABLE, TOPK_SOURCE_IDS, MISS_SOURCE_IDS,
-                         MISS_DESTINATION_SLOTS, MISS_COUNTS}) {
+                         DRAM_BLOCK_TABLE, TOPK_SOURCE_IDS,
+                         TOPK_MISS_COUNTS, MISS_SOURCE_IDS,
+                         MISS_DST_SLOTS, MISS_COUNTS}) {
         const auto desc = context->GetInputDesc(idx);
         OPS_ERR_IF(desc == nullptr || desc->GetDataType() != ge::DT_INT32,
                    OPS_LOG_E(context->GetNodeName(),
@@ -195,34 +212,36 @@ ge::graphStatus CheckFusedInputs(
 ge::graphStatus TilingFusedCopySfaMtp(
     gert::TilingContext *context)
 {
-    STATilingInfo staInfo;
-    STAInfoParser parser(context);
-    if (parser.Parse(staInfo) != ge::GRAPH_SUCCESS) {
+    CopySfaMtpSFATilingInfo sfaInfo;
+    CopySfaMtpSFAInfoParser parser(context);
+    if (parser.Parse(sfaInfo) != ge::GRAPH_SUCCESS) {
         return ge::GRAPH_FAILED;
     }
 
     uint32_t copyCap = 0;
+    uint32_t missCap = 0;
+    uint32_t hbmMaxBlocks = 0;
     uint32_t dramMaxBlocks = 0;
-    if (CheckFusedInputs(context, copyCap, dramMaxBlocks) !=
+    if (CheckFusedInputs(context, copyCap, missCap, hbmMaxBlocks,
+                         dramMaxBlocks) !=
         ge::GRAPH_SUCCESS) {
         return ge::GRAPH_FAILED;
     }
 
-    STATilingCheck checker(staInfo);
-    if (checker.Process() != ge::GRAPH_SUCCESS) {
+    // CheckFusedInputs owns this operator's variable-width MTP contract. The
+    // shared checker intentionally remains strict for standalone B/4B SFA.
+    CopySfaMtpSFAMlaTiling sfaTiling(context);
+    if (sfaTiling.DoOpTiling(&sfaInfo) != ge::GRAPH_SUCCESS) {
         return ge::GRAPH_FAILED;
     }
 
-    STAMlaTiling staTiling(context);
-    if (staTiling.DoOpTiling(&staInfo) != ge::GRAPH_SUCCESS) {
-        return ge::GRAPH_FAILED;
-    }
-
-    // The shared STA tiler serializes the payload we need, but its generic
+    // The shared SFA tiler serializes the payload we need, but its generic
     // template key (578 for the GLM MTP3 shape) belongs to the standalone
-    // STA kernel.  The fused MTP operator has one fixed specialization,
+    // SFA kernel.  The fused MTP operator has one fixed specialization,
     // matching sparse_tail_attention_mtp, and is compiled under key 1.
     context->SetTilingKey(1U);
+    // Match the MTP sparse-tail scheduler for one AIC plus two AIVs.
+    context->SetScheduleMode(1);
 
     auto raw = context->GetRawTilingData();
     OPS_ERR_IF(raw == nullptr,
@@ -231,16 +250,20 @@ ge::graphStatus TilingFusedCopySfaMtp(
     FusedCopySfaMtpTilingData fusedTiling;
     const size_t baseSize = raw->GetDataSize();
     const size_t fusedSize = fusedTiling.GetDataSize();
-    constexpr size_t fusedSuffixSize = sizeof(uint32_t) * 2U;
+    constexpr size_t fusedSuffixSize = sizeof(uint32_t) * 4U;
     OPS_ERR_IF(fusedSize != baseSize + fusedSuffixSize ||
                    raw->GetCapacity() < fusedSize,
                OPS_LOG_E(context->GetNodeName(),
-                         "Unexpected STA/fused-MTP tiling layout: base=%zu, fused=%zu, capacity=%zu.",
+                         "Unexpected SFA/fused-MTP tiling layout: base=%zu, fused=%zu, capacity=%zu.",
                          baseSize, fusedSize, raw->GetCapacity()),
                return ge::GRAPH_FAILED);
     auto *payload = static_cast<uint8_t *>(raw->GetData());
     std::memcpy(payload + baseSize, &copyCap, sizeof(copyCap));
-    std::memcpy(payload + baseSize + sizeof(copyCap),
+    std::memcpy(payload + baseSize + sizeof(uint32_t),
+                &missCap, sizeof(missCap));
+    std::memcpy(payload + baseSize + sizeof(uint32_t) * 2U,
+                &hbmMaxBlocks, sizeof(hbmMaxBlocks));
+    std::memcpy(payload + baseSize + sizeof(uint32_t) * 3U,
                 &dramMaxBlocks, sizeof(dramMaxBlocks));
     raw->SetDataSize(fusedSize);
 

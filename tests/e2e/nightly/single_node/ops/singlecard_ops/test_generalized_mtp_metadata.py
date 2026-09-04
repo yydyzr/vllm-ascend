@@ -1,0 +1,139 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""NPU checks for serving metadata, cache ownership, and pinned-ABI bridging."""
+
+from types import SimpleNamespace
+
+import pytest
+import torch
+import torch_npu  # noqa: F401
+
+from vllm_ascend.attention.utils import AscendCommonAttentionMetadata
+from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.generalized_mtp import (
+    GeneralizedMtpRuntime,
+    make_mtp_batch,
+)
+
+
+def fixture():
+    device = "npu:0"
+    manager = SimpleNamespace(
+        block_size=128, topk_buffer_size=8192, max_num_reqs=3,
+        topk_buffer_slot_manager=SimpleNamespace(req2slot={"request-a": 2, "request-b": 0}),
+        nano_mtp_slot_generations={2: 1, 0: 1},
+    )
+    metadata = SimpleNamespace(
+        num_prefills=0, num_decodes=2,
+        cum_query_lens=torch.tensor([1, 5], dtype=torch.int32, device=device),
+        seq_lens=torch.tensor([8450, 8195], dtype=torch.int32, device=device),
+        req_topk_buffer_slots=torch.tensor([2, 0], dtype=torch.int32, device=device),
+        block_table=torch.arange(256, dtype=torch.int32, device=device).reshape(2, 128),
+    )
+    return manager, metadata
+
+
+def test_causal_prefix_variable_budget_and_tail_rollover():
+    manager, metadata = fixture()
+    batch = make_mtp_batch(metadata, manager)
+    assert batch.prefix_lengths == [8448, 8064]
+    assert batch.cache_sizes == [8192, 8064]
+    assert batch.num_tokens == 5
+    # Request B crosses a block boundary with Q=4, so its 131-token tail
+    # occupies both circular blocks after the physically fixed hot arena.
+    assert batch.tail_sources.cpu().tolist() == list(range(8448, 8450)) + list(range(16384 + 8064, 16384 + 8195))
+    stride = 8192 + 256
+    expected = [2 * stride + 8192 + p % 256 for p in range(8448, 8450)]
+    expected += [8192 + p % 256 for p in range(8064, 8195)]
+    assert batch.tail_destinations.cpu().tolist() == expected
+    tables = batch.hbm_block_table.cpu()
+    assert tables[0, 64:66].tolist() == [196, 197]
+    assert tables[1, 63:65].tolist() == [65, 64]
+    metadata.seq_lens[1] = 1000
+    assert make_mtp_batch(metadata, manager) is None
+
+
+def test_layer_ownership_request_reuse_and_abi_bridge():
+    manager, metadata = fixture()
+    batch = make_mtp_batch(metadata, manager)
+    runtime = GeneralizedMtpRuntime(manager)
+    map_a, state, outputs = runtime.prepare_lim("owner-a", batch, 16384, metadata.seq_lens.device)
+    assert state.cpu().tolist() == [-2, -2]
+    map_a[2, 17] = 23
+    map_b, state_b, _ = runtime.prepare_lim("owner-b", batch, 16384, metadata.seq_lens.device)
+    assert state_b.cpu().tolist() == [-2, -2]
+    assert map_b[2, 17].item() == -(1 << 31)
+    _, steady, outputs = runtime.prepare_lim("owner-a", batch, 16384, metadata.seq_lens.device)
+    assert steady.cpu().tolist() == [-1, -1]
+    outputs[3].fill_(17)
+    outputs[4].fill_(23)
+    bridged = runtime.copy_metadata(batch)
+    assert bridged[3].shape == (2, 32768) and bridged[3].is_contiguous()
+    assert bridged[4].is_contiguous()
+    torch.testing.assert_close(bridged[3][:, :16384], outputs[3], rtol=0, atol=0)
+    torch.testing.assert_close(bridged[4][:, :16384], outputs[4], rtol=0, atol=0)
+    assert torch.all(bridged[3][:, 16384:] == -1).item()
+    # Even an identical external request ID must first-fill after row reuse.
+    manager.nano_mtp_slot_generations[2] += 1
+    _, reused, _ = runtime.prepare_lim("owner-a", batch, 16384, metadata.seq_lens.device)
+    assert reused.cpu().tolist() == [-2, -1]
+    runtime.invalidate()
+    _, invalidated, _ = runtime.prepare_lim("owner-a", batch, 16384, metadata.seq_lens.device)
+    assert invalidated.cpu().tolist() == [-2, -2]
+
+
+def test_batch_metadata_survives_builder_buffer_reuse():
+    manager, metadata = fixture()
+    batch = make_mtp_batch(metadata, manager)
+    expected_blocks = metadata.block_table.clone()
+    metadata.cum_query_lens.copy_(torch.tensor([1, 2], dtype=torch.int32, device="npu:0"))
+    metadata.seq_lens.zero_()
+    metadata.req_topk_buffer_slots.fill_(1)
+    metadata.block_table.zero_()
+
+    # The queued batch remains internally consistent after the next build
+    # repurposes every source buffer. In particular, final prefix still T.
+    assert batch.query_ends.cpu().tolist() == [1, 5]
+    assert batch.num_tokens == 5
+    assert batch.seq_lens.cpu().tolist() == [8450, 8195]
+    assert batch.pool_entries.cpu().tolist() == [2, 0]
+    torch.testing.assert_close(batch.source_block_table, expected_blocks, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("with_offload", [False, True])
+def test_unpadded_metadata_preserves_offload_pool_ownership(with_offload):
+    manager, metadata = fixture()
+    query_start_loc_cpu = torch.tensor([0, 1, 5, 16], dtype=torch.int32)
+    common = AscendCommonAttentionMetadata(
+        query_start_loc=query_start_loc_cpu.to("npu:0"),
+        query_start_loc_cpu=query_start_loc_cpu,
+        seq_lens=torch.cat((metadata.seq_lens, metadata.seq_lens.new_zeros(1))),
+        num_reqs=3,
+        num_actual_tokens=16,
+        num_input_tokens=16,
+        max_query_len=11,
+        max_seq_len=8450,
+        block_table_tensor=torch.cat((
+            metadata.block_table,
+            metadata.block_table.new_zeros((1, metadata.block_table.shape[1])),
+        )),
+        slot_mapping=torch.arange(16, dtype=torch.int64, device="npu:0"),
+        req_topk_buffer_slots=(
+            torch.tensor([2, 0, -1], dtype=torch.int32, device="npu:0")
+            if with_offload else None
+        ),
+    )
+    unpadded = common.unpadded(num_actual_tokens=5, num_actual_reqs=2)
+    if not with_offload:
+        assert unpadded.req_topk_buffer_slots is None
+        return
+
+    # Nontrivial pool order must survive token/request padding removal;
+    # the padded -1 row must never reach the draft's generalized LIM batch.
+    assert unpadded.req_topk_buffer_slots.cpu().tolist() == [2, 0]
+    metadata.cum_query_lens = unpadded.query_start_loc[1:]
+    metadata.seq_lens = unpadded.seq_lens
+    metadata.block_table = unpadded.block_table_tensor
+    metadata.req_topk_buffer_slots = unpadded.req_topk_buffer_slots
+    batch = make_mtp_batch(metadata, manager)
+    assert batch.pool_rows == [2, 0]
+    assert batch.num_tokens == 5

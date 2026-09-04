@@ -5,6 +5,7 @@ import torch
 from vllm.config import set_current_vllm_config
 from vllm.model_executor.layers.layernorm import RMSNorm
 
+from vllm_ascend.ops.layernorm import AscendRMSNorm
 from vllm_ascend.utils import enable_custom_op
 from vllm_ascend.utils import is_310p as is_310p_hw
 
@@ -38,6 +39,35 @@ def default_vllm_config():
 
     with set_current_vllm_config(mock_config):
         yield mock_config
+
+
+@pytest.mark.parametrize(
+    "description, has_bias",
+    [
+        ({}, False),
+        ({"model.layers.78.self_attn.indexer.k_norm.bias": "FLOAT"}, False),
+        ({"model.layers.0.input_layernorm.bias": "FLOAT"}, True),
+        (
+            {
+                "model.layers.78.self_attn.indexer.k_norm.bias": "FLOAT",
+                "model.layers.0.input_layernorm.bias": "FLOAT",
+            },
+            True,
+        ),
+    ],
+)
+def test_rms_norm_bias_requires_rms_norm_quantization(description, has_bias, default_vllm_config):
+    default_vllm_config.quant_config.quant_description = description
+    layer = AscendRMSNorm(hidden_size=8)
+    assert ("bias" in dict(layer.named_parameters())) == has_bias
+    if has_bias:
+        bias = torch.arange(8, dtype=layer.bias.dtype)
+        layer._bias_weight_loader(layer.bias, bias)
+        assert layer.bias_loaded
+        torch.testing.assert_close(layer.bias, bias)
+    else:
+        assert layer.bias is None
+        assert not layer.bias_loaded
 
 
 @pytest.mark.skip("Skip as register_kernels has NPU SocName checking in CANN 8.5.0.")

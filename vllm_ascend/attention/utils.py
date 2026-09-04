@@ -321,6 +321,9 @@ class AscendCommonAttentionMetadata(CommonAttentionMetadata):
             group_key_cache_idx=self.group_key_cache_idx,
             req_ids_tensor=_slice_reqs(self.req_ids_tensor),
             token_to_req=(self.token_to_req[:num_actual_tokens] if self.token_to_req is not None else None),
+            # FlashComm padding is removed before MTP drafting. Keep each
+            # remaining request's offload pool ownership through that copy.
+            req_topk_buffer_slots=_slice_reqs(self.req_topk_buffer_slots),
         )
 
 

@@ -173,6 +173,11 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         draft_model_config = getattr(spec_config, "draft_model_config", None)
         draft_hf_config = draft_model_config.hf_config if draft_model_config is not None else None
         self._share_mtp_indices = getattr(draft_hf_config, "index_share_for_mtp_iteration", False)
+        offload_config = get_ascend_config().sparse_kv_offload_config
+        if getattr(offload_config, "generalized_mtp", False):
+            # Each draft iteration has fresh lengths and cache mutation
+            # metadata. Reusing an earlier iteration's misses is unsafe.
+            self._share_mtp_indices = False
 
         # NOTE:
         # `draft_tensor_parallel_size` does not take effect for Eagle:
@@ -1944,6 +1949,7 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             group_key_cache_idx=common_attn_metadata.group_key_cache_idx,
             req_ids_tensor=common_attn_metadata.req_ids_tensor,
             token_to_req=token_to_req,
+            req_topk_buffer_slots=common_attn_metadata.req_topk_buffer_slots,
         )
         return spec_common_attn_metadata, token_indices
 
@@ -2041,6 +2047,7 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             group_key_cache_idx=common_attn_metadata.group_key_cache_idx,
             req_ids_tensor=common_attn_metadata.req_ids_tensor,
             token_to_req=common_attn_metadata.token_to_req,
+            req_topk_buffer_slots=common_attn_metadata.req_topk_buffer_slots,
         )
 
         return spec_common_attn_metadata, token_indices, token_indices_to_sample, num_rejected_tokens_gpu

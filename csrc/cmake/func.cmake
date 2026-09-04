@@ -237,7 +237,9 @@ function(add_ops_info_target)
     set(OPS_INFO_INNER_INI    ${base_aclnn_binary_dir}/inner/aic-${OPINFO_COMPUTE_UNIT}-ops-info.ini)
     set(OPS_INFO_EXCLUDE_INI  ${base_aclnn_binary_dir}/exc/aic-${OPINFO_COMPUTE_UNIT}-ops-info.ini)
 
-    add_custom_command(OUTPUT ${OPS_INFO_JSON}
+    # OpDef generation writes the INI files as side effects. Refresh the
+    # registry after those targets even when a cached JSON already exists.
+    add_custom_target(${OPS_INFO_TARGET} ALL
             COMMAND ${HI_PYTHON} ${ASCENDC_CMAKE_UTIL_DIR}/parse_ini_to_json.py
             ${OPS_INFO_INI}
             ${OPS_INFO_INNER_INI}
@@ -245,10 +247,7 @@ function(add_ops_info_target)
             ${OPS_INFO_JSON}
             COMMAND mkdir -p ${CUSTOM_OPS_INFO_DIR}
             COMMAND cp -f ${OPS_INFO_JSON} ${CUSTOM_OPS_INFO_DIR}
-    )
-
-    add_custom_target(${OPS_INFO_TARGET} ALL
-            DEPENDS ${OPS_INFO_JSON}
+            BYPRODUCTS ${OPS_INFO_JSON}
     )
 
     add_dependencies(${OPS_INFO_TARGET} opbuild_gen_default opbuild_gen_inner opbuild_gen_exc)
@@ -642,12 +641,11 @@ function(add_bin_compile_target)
         set(BINARY_INFO_CONFIG_FILE ${BIN_OUT_DIR}/binary_info_config.json)
         set(RELOCATABLE_KERNEL_INFO_CONFIG_FILE ${BIN_OUT_DIR}/relocatable_kernel_info_config.json)
 
-        add_custom_command(OUTPUT ${BINARY_INFO_CONFIG_FILE}
-                COMMAND ${HI_PYTHON} ${ASCENDC_CMAKE_UTIL_DIR}/ascendc_ops_config.py -p ${BIN_OUT_DIR} -s ${BINARY_COMPUTE_UNIT}
-        )
-
+        # Kernel targets can add binaries to a reused build directory. Their
+        # ordering dependencies alone do not invalidate an existing registry.
         add_custom_target(${OPS_CONFIG_TARGET}
-                DEPENDS ${BINARY_INFO_CONFIG_FILE}
+                COMMAND ${HI_PYTHON} ${ASCENDC_CMAKE_UTIL_DIR}/ascendc_ops_config.py -p ${BIN_OUT_DIR} -s ${BINARY_COMPUTE_UNIT}
+                BYPRODUCTS ${BINARY_INFO_CONFIG_FILE} ${RELOCATABLE_KERNEL_INFO_CONFIG_FILE}
         )
 
         add_dependencies(ops_transformer_config ${OPS_CONFIG_TARGET})

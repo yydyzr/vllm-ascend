@@ -1,73 +1,69 @@
-/**
- * Copyright (c) 2026 Huawei Technologies Co., Ltd.
- */
-
+/** Copyright (c) 2026 Huawei Technologies Co., Ltd. */
 #include <register/op_impl_registry.h>
 #include "error/ops_error.h"
 
 namespace ops {
-constexpr uint32_t QUERY_INDEX = 0;
-constexpr uint32_t REQ_POOL_ENTRIES_INDEX = 3;
-constexpr uint32_t CACHE_SLOTS_INDEX = 4;
+constexpr uint32_t QUERY_INDEX = 2;
+constexpr uint32_t BLOCK_TABLE_INDEX = 5;
+constexpr uint32_t CACHE_POOL_INDEX = 12;
 constexpr int64_t TOPK = 2048;
-constexpr int64_t UNION_CAPACITY = 8192;
+constexpr int64_t MISS_CAPACITY = 16384;
 
-static ge::graphStatus InferShapeFusedLiManageMtp(
-    gert::InferShapeContext *context)
+static ge::graphStatus InferShapeFusedLiManageMtp(gert::InferShapeContext *context)
 {
     OPS_ERR_IF(context == nullptr,
                OPS_LOG_E("FusedLiManageMtp",
                          "InferShapeContext is nullptr."),
                return ge::GRAPH_FAILED);
     const gert::Shape *query = context->GetInputShape(QUERY_INDEX);
-    const gert::Shape *req = context->GetInputShape(REQ_POOL_ENTRIES_INDEX);
-    const gert::Shape *cache = context->GetInputShape(CACHE_SLOTS_INDEX);
+    const gert::Shape *blockTable = context->GetInputShape(BLOCK_TABLE_INDEX);
+    const gert::Shape *cache = context->GetInputShape(CACHE_POOL_INDEX);
     OPS_LOG_E_IF_NULL(context, query, return ge::GRAPH_FAILED);
-    OPS_LOG_E_IF_NULL(context, req, return ge::GRAPH_FAILED);
+    OPS_LOG_E_IF_NULL(context, blockTable, return ge::GRAPH_FAILED);
     OPS_LOG_E_IF_NULL(context, cache, return ge::GRAPH_FAILED);
-    OPS_ERR_IF(query->GetDimNum() != 3 || req->GetDimNum() != 1 ||
-                   cache->GetDimNum() != 2,
-               OPS_LOG_E(context, "invalid MTP LIM input ranks."),
+    OPS_ERR_IF(query->GetDimNum() != 3 || blockTable->GetDimNum() != 2 || cache->GetDimNum() != 2,
+               OPS_LOG_E(context, "invalid fused_li_manage_mtp input ranks."),
                return ge::GRAPH_FAILED);
-
-    gert::Shape *topkSlots = context->GetOutputShape(0);
-    gert::Shape *topkSource = context->GetOutputShape(1);
-    gert::Shape *missSource = context->GetOutputShape(2);
-    gert::Shape *missSlots = context->GetOutputShape(3);
-    gert::Shape *missCounts = context->GetOutputShape(4);
-    gert::Shape *cacheOut = context->GetOutputShape(5);
-    OPS_LOG_E_IF_NULL(context, topkSlots, return ge::GRAPH_FAILED);
-    OPS_LOG_E_IF_NULL(context, topkSource, return ge::GRAPH_FAILED);
-    OPS_LOG_E_IF_NULL(context, missSource, return ge::GRAPH_FAILED);
-    OPS_LOG_E_IF_NULL(context, missSlots, return ge::GRAPH_FAILED);
-    OPS_LOG_E_IF_NULL(context, missCounts, return ge::GRAPH_FAILED);
+    const int64_t t = query->GetDim(0);
+    const int64_t b = blockTable->GetDim(0);
+    gert::Shape *topkSrc = context->GetOutputShape(0);
+    gert::Shape *topkDst = context->GetOutputShape(1);
+    gert::Shape *topkMiss = context->GetOutputShape(2);
+    gert::Shape *missSrc = context->GetOutputShape(3);
+    gert::Shape *missDst = context->GetOutputShape(4);
+    gert::Shape *missCount = context->GetOutputShape(5);
+    gert::Shape *cacheOut = context->GetOutputShape(6);
+    OPS_LOG_E_IF_NULL(context, topkSrc, return ge::GRAPH_FAILED);
+    OPS_LOG_E_IF_NULL(context, topkDst, return ge::GRAPH_FAILED);
+    OPS_LOG_E_IF_NULL(context, topkMiss, return ge::GRAPH_FAILED);
+    OPS_LOG_E_IF_NULL(context, missSrc, return ge::GRAPH_FAILED);
+    OPS_LOG_E_IF_NULL(context, missDst, return ge::GRAPH_FAILED);
+    OPS_LOG_E_IF_NULL(context, missCount, return ge::GRAPH_FAILED);
     OPS_LOG_E_IF_NULL(context, cacheOut, return ge::GRAPH_FAILED);
-
-    topkSlots->SetDimNum(3);
-    topkSlots->SetDim(0, query->GetDim(0));
-    topkSlots->SetDim(1, 1);
-    topkSlots->SetDim(2, TOPK);
-    *topkSource = *topkSlots;
-    missSource->SetDimNum(2);
-    missSource->SetDim(0, req->GetDim(0));
-    missSource->SetDim(1, UNION_CAPACITY);
-    *missSlots = *missSource;
-    missCounts->SetDimNum(1);
-    missCounts->SetDim(0, req->GetDim(0));
+    topkSrc->SetDimNum(3);
+    topkSrc->SetDim(0, t);
+    topkSrc->SetDim(1, 1);
+    topkSrc->SetDim(2, TOPK);
+    *topkDst = *topkSrc;
+    topkMiss->SetDimNum(1);
+    topkMiss->SetDim(0, t);
+    missSrc->SetDimNum(2);
+    missSrc->SetDim(0, b);
+    missSrc->SetDim(1, MISS_CAPACITY);
+    *missDst = *missSrc;
+    missCount->SetDimNum(1);
+    missCount->SetDim(0, b);
     *cacheOut = *cache;
     return ge::GRAPH_SUCCESS;
 }
 
-static ge::graphStatus InferDataTypeFusedLiManageMtp(
-    gert::InferDataTypeContext *context)
+static ge::graphStatus InferDataTypeFusedLiManageMtp(gert::InferDataTypeContext *context)
 {
     OPS_ERR_IF(context == nullptr,
                OPS_LOG_E("FusedLiManageMtp",
                          "InferDataTypeContext is nullptr."),
                return ge::GRAPH_FAILED);
-    for (uint32_t output = 0; output < 6; ++output) {
-        context->SetOutputDataType(output, ge::DT_INT32);
-    }
+    for (uint32_t i = 0; i < 7; ++i) context->SetOutputDataType(i, ge::DT_INT32);
     return ge::GRAPH_SUCCESS;
 }
 

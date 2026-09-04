@@ -257,11 +257,77 @@ python examples/disaggregated_prefill_v1/load_balance_proxy_layerwise_server_exa
 For multi-node deployment, advertise reachable addresses instead of
 `0.0.0.0`. Send inference requests to the proxy port (`9000` in this example).
 
-## 5. Limitations
+## 5. Generalized MTP Colocated Validation
+
+The `nano` backend uses generalized LIM and copy-SFA when speculative decoding
+is enabled. This initial integration requires eager mode and a retained device
+KV cache. It supports up to six speculative tokens (seven query rows per
+request) and BF16/FP16 indexer inputs. The native copy-SFA kernel accepts 8 or
+128 attention heads per rank. The eager adapter pads 1 through 7 heads to 8
+and discards the padded outputs; GLM-5.2 TP16 uses this path with 4 heads.
+
+Install the Decode dependencies above. With the
+`quay.nju.edu.cn/ascend/vllm-ascend:nightly-main-a3` image, preserve its
+vLLM 0.27.1 installation and build/reinstall the updated vLLM-Ascend sources.
+Install matching MemFabric native libraries and Python bindings: the wheel
+alone does not supply `libmf_hybm_accoffload.so`. The recorded validation used
+MemFabric 1.2.1 from commit `0259c97a2fa01022708dbeffe4b5c5672bc424dc`
+in an isolated prefix. Source that installation's `set_env.sh` and ensure its
+Python bindings precede any image-provided version on `PYTHONPATH`.
+Colocated decode offload does not require a Memcache service.
+
+An A3 colocated DP1/TP16/MTP3 configuration is shown below. Adjust the native
+package path if using an isolated prefix. The 64 GiB host pool was validated
+for this sequence length and concurrency; check capacity again when changing
+those settings. Shared-expert DP requires expert parallelism in this branch;
+the service data-parallel size remains 1.
+
+```bash
+source /usr/local/memfabric_hybrid/set_env.sh
+export MEMFABRIC_HYBRID_EXTEND_LIB_PATH=/usr/local/memfabric_hybrid/latest/aarch64-linux/lib64
+export VLLM_ASCEND_SPARSE_KV_OFFLOAD_DEBUG=1
+vllm serve /mnt/weight/GLM-5.2-w4a8/ \
+    --tensor-parallel-size 16 \
+    --data-parallel-size 1 \
+    --enforce-eager \
+    --max-num-seqs 2 \
+    --max-model-len 16384 \
+    --enable-expert-parallel \
+    --speculative-config '{"method":"mtp","num_speculative_tokens":3}' \
+    --additional-config '{
+        "enable_flashcomm1": true,
+        "enable_shared_expert_dp": true,
+        "enable_sparse_li_c8": false,
+        "enable_sparse_sfa_c8": false,
+        "sparse_kv_offload_config": {
+            "enabled": true,
+            "fused_op_type": "nano",
+            "keep_device_kv_cache": true,
+            "topk_buffer_size": 8192,
+            "dram_size_per_dp_GB": 64
+        }
+    }'
+```
+
+This configuration completed repeated short and 10K-plus-token requests with
+generalized LIM and CPU/GVA copy-SFA execution on A3. With FlashComm1 and
+shared-expert DP enabled, all three prompt texts matched the offload-disabled
+baseline exactly across two passes. This is a focused eager validation,
+not a broad model-accuracy or performance result. Short prompts and mixed
+prefill/decode batches use ordinary SFA on the retained device cache. Pure
+decode batches use the generalized operators when every request has at least
+2048 stable, fully offloaded tokens. Test prompts longer than 8192 tokens to
+exercise MTP3 sparse replacement beyond the resident budget, and check
+operator execution as well as generated output. The retained full cache makes
+this a correctness/debug setup; it does not demonstrate memory savings.
+
+## 6. Limitations
 
 - Shared-buffer Layerwise Prefill Offload requires Memcache and eager mode.
 - Context parallelism has not been validated with Layerwise Prefill Offload.
 - Sparse Decode Offload supports DP and TP; CP and PP are not supported.
+- Generalized MTP offload currently requires eager colocated validation;
+  PD-only deployment and model graph replay are not supported by this path.
 - MemFabric is the only supported `SfaRemoteD2HConnector` transfer backend.
 - Layerwise buffer reuse cannot currently be combined with
   `MooncakeLayerwiseConnector` because per-buffer transfer completion gating is

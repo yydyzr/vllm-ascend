@@ -15,38 +15,50 @@
 
 namespace optiling {
 
-struct MtpRequiredTensor {
-    const gert::CompileTimeTensorDesc *desc = nullptr;
-    const gert::StorageShape *shape = nullptr;
+struct MtpRequiredParaInfo {
+    const gert::CompileTimeTensorDesc *desc;
+    const gert::StorageShape *shape;
 };
 
-constexpr uint32_t MTP_QUERY_INDEX = 0;
-constexpr uint32_t MTP_KEY_INDEX = 1;
-constexpr uint32_t MTP_WEIGHTS_INDEX = 2;
-constexpr uint32_t MTP_REQ_POOL_INDEX = 3;
-constexpr uint32_t MTP_CACHE_SLOTS_INDEX = 4;
-constexpr uint32_t MTP_CACHE_TOKENS_INDEX = 5;
-constexpr uint32_t MTP_CANDIDATE_LENS_INDEX = 6;
-constexpr uint32_t MTP_BLOCK_TABLE_INDEX = 7;
+struct MtpTensorParaInfo {
+    const gert::CompileTimeTensorDesc *desc;
+    const gert::StorageShape *shape;
+};
 
-constexpr uint32_t MTP_TOPK_SLOTS_OUT = 0;
-constexpr uint32_t MTP_TOPK_SOURCE_OUT = 1;
-constexpr uint32_t MTP_MISS_SOURCE_OUT = 2;
-constexpr uint32_t MTP_MISS_SLOTS_OUT = 3;
-constexpr uint32_t MTP_MISS_COUNTS_OUT = 4;
-constexpr uint32_t MTP_CACHE_SLOTS_OUT = 5;
+constexpr uint32_t WEIGHTS_INDEX = 0;
+constexpr uint32_t QUERY_DEQUANT_SCALE_INDEX = 1;
+constexpr uint32_t QUERY_INDEX = 2;
+constexpr uint32_t KEY_DEQUANT_SCALE_INDEX = 3;
+constexpr uint32_t KEY_INDEX = 4;
+constexpr uint32_t BLOCK_TABLE_INDEX = 5;
+constexpr uint32_t ACTUAL_SEQ_Q_INDEX = 6;
+constexpr uint32_t ACTUAL_SEQ_K_INDEX = 7;
+constexpr uint32_t OFFLOAD_SEQ_K_INDEX = 8;
+constexpr uint32_t CACHE_TOKENS_INDEX = 9;
+constexpr uint32_t REQUEST_STATE_INDEX = 10;
+constexpr uint32_t REQ_POOL_ENTRIES_INDEX = 11;
+constexpr uint32_t CACHE_SLOTS_INDEX = 12;
+constexpr uint32_t TOPK_INDEX = 0;
+constexpr uint32_t TOPK_SLOTS_INDEX = 1;
+constexpr uint32_t MISS_COUNT_INDEX = 2;
+constexpr uint32_t CACHE_SLOTS_OUT_INDEX = 3;
 
-constexpr uint32_t MTP_QUERY_COUNT = 4;
-constexpr uint32_t MTP_HEADS_MIN = 32;
-constexpr uint32_t MTP_HEADS_MAX = 64;
-constexpr uint32_t MTP_KEY_HEADS = 1;
-constexpr uint32_t MTP_HEAD_DIM = 128;
-constexpr uint32_t MTP_BLOCK_SIZE = 128;
-constexpr uint32_t MTP_TOPK = 2048;
-constexpr uint32_t MTP_UNION_CAPACITY = 8192;
+constexpr uint32_t DIM_IDX_ONE = 1;
+constexpr uint32_t DIM_IDX_TWO = 2;
+constexpr uint32_t DIM_IDX_THREE = 3;
+constexpr uint32_t DIM_NUM_ONE = 1;
+constexpr uint32_t DIM_NUM_TWO = 2;
+constexpr uint32_t DIM_NUM_THREE = 3;
+constexpr uint32_t DIM_NUM_FOUR = 4;
 
-BEGIN_TILING_DATA_DEF(LIUMtpTilingData)
+constexpr uint32_t DECODE_N2 = 1;
+constexpr uint32_t DECODE_HEAD_DIM = 128;
+constexpr uint32_t DECODE_SPARSE_COUNT = 2048;
+constexpr uint32_t DECODE_OUTPUT_CAPACITY = 2048;
+
+BEGIN_TILING_DATA_DEF(FusedLiManageMtpTilingData)
 TILING_DATA_FIELD_DEF(uint32_t, bSize)
+TILING_DATA_FIELD_DEF(uint32_t, tSize)
 TILING_DATA_FIELD_DEF(uint32_t, s2Size)
 TILING_DATA_FIELD_DEF(uint32_t, usedCoreNum)
 TILING_DATA_FIELD_DEF(uint32_t, blockSize)
@@ -54,61 +66,68 @@ TILING_DATA_FIELD_DEF(uint32_t, maxBlockNumPerBatch)
 TILING_DATA_FIELD_DEF(uint32_t, poolSize)
 TILING_DATA_FIELD_DEF(uint32_t, n1Size)
 TILING_DATA_FIELD_DEF(uint32_t, cacheSlotsSize)
+TILING_DATA_FIELD_DEF(uint32_t, scheduleMode)
 END_TILING_DATA_DEF
-REGISTER_TILING_DATA_CLASS(FusedLiManageMtp, LIUMtpTilingData)
+REGISTER_TILING_DATA_CLASS(FusedLiManageMtp, FusedLiManageMtpTilingData)
 
-struct LIUMtpCompileInfo {};
+struct FusedLiManageMtpCompileInfo {};
 
-struct LIUMtpTensors {
-    MtpRequiredTensor query;
-    MtpRequiredTensor key;
-    MtpRequiredTensor weights;
-    MtpRequiredTensor reqPoolEntries;
-    MtpRequiredTensor cacheSlots;
-    MtpRequiredTensor cacheTokens;
-    MtpRequiredTensor candidateLens;
-    MtpRequiredTensor blockTable;
-    MtpRequiredTensor topkSlots;
-    MtpRequiredTensor topkSource;
-    MtpRequiredTensor missSource;
-    MtpRequiredTensor missSlots;
-    MtpRequiredTensor missCounts;
-    MtpRequiredTensor cacheSlotsOut;
+struct FusedLiManageMtpParaInfo {
+    MtpRequiredParaInfo query = {nullptr, nullptr};
+    MtpRequiredParaInfo key = {nullptr, nullptr};
+    MtpRequiredParaInfo weights = {nullptr, nullptr};
+    MtpTensorParaInfo reqPoolEntries = {nullptr, nullptr};
+    MtpRequiredParaInfo cacheSlots = {nullptr, nullptr};
+    MtpTensorParaInfo cacheTokens = {nullptr, nullptr};
+    MtpTensorParaInfo actualSeqLengths = {nullptr, nullptr};
+    MtpTensorParaInfo blockTable = {nullptr, nullptr};
+    MtpRequiredParaInfo topkIndexOut = {nullptr, nullptr};
+    MtpRequiredParaInfo topkSlotsOut = {nullptr, nullptr};
+    MtpRequiredParaInfo topkMissCountOut = {nullptr, nullptr};
+    MtpRequiredParaInfo missCountOut = {nullptr, nullptr};
+    MtpRequiredParaInfo missSrcOut = {nullptr, nullptr};
+    MtpRequiredParaInfo missSlotsOut = {nullptr, nullptr};
+    MtpRequiredParaInfo cacheSlotsOut = {nullptr, nullptr};
 };
 
-class LIUMtpTilingInfo {
+class FusedLiManageMtpTilingInfo {
 public:
     const char *opName = nullptr;
     fe::PlatFormInfos *platformInfo = nullptr;
-    platform_ascendc::SocVersion socVersion =
-        platform_ascendc::SocVersion::ASCEND910B;
-    LIUMtpTensors tensors;
-    uint32_t batchSize = 0;
-    uint32_t tokenRows = 0;
-    uint32_t queryHeads = 0;
-    uint32_t sourceCapacity = 0;
+    platform_ascendc::SocVersion socVersion = platform_ascendc::SocVersion::ASCEND910B;
+    FusedLiManageMtpParaInfo opParamInfo;
+
+    uint32_t bSize = 0;
+    uint32_t tSize = 0;
+    uint32_t n1Size = 32;
+    uint32_t n2Size = DECODE_N2;
+    uint32_t s2Size = 0;
     uint32_t blockSize = 0;
-    uint32_t maxBlocks = 0;
+    uint32_t maxBlockNumPerBatch = 0;
     uint32_t poolSize = 0;
+    uint32_t cacheSlotsSize = 0;
     uint32_t usedCoreNum = 0;
-    ge::DataType queryType = ge::DT_FLOAT16;
+
+    ge::DataType inputQType = ge::DT_FLOAT16;
 };
 
-class LIUMtpTiling {
+class FusedLiManageMtpTiling {
 public:
-    explicit LIUMtpTiling(gert::TilingContext *context) : context_(context) {}
-    ge::graphStatus ParseAndCheck(LIUMtpTilingInfo &info);
-    ge::graphStatus DoTiling(LIUMtpTilingInfo *info);
+    explicit FusedLiManageMtpTiling(gert::TilingContext *context, bool mtp = true)
+        : context_(context), mtp_(mtp) {};
+    ge::graphStatus ParseAndCheck(FusedLiManageMtpTilingInfo &tilingInfo);
+    ge::graphStatus DoTiling(FusedLiManageMtpTilingInfo *tilingInfo);
 
 private:
-    ge::graphStatus GetPlatform(LIUMtpTilingInfo &info) const;
-    ge::graphStatus GetTensors(LIUMtpTilingInfo &info) const;
-    ge::graphStatus CheckDtypes(const LIUMtpTilingInfo &info) const;
-    ge::graphStatus CheckShapes(LIUMtpTilingInfo &info) const;
+    ge::graphStatus GetNpuInfo(FusedLiManageMtpTilingInfo &tilingInfo) const;
+    ge::graphStatus GetTensorInfo(FusedLiManageMtpTilingInfo &tilingInfo) const;
+    ge::graphStatus CheckDtype(const FusedLiManageMtpTilingInfo &tilingInfo) const;
+    ge::graphStatus CheckShape(FusedLiManageMtpTilingInfo &tilingInfo) const;
 
     gert::TilingContext *context_ = nullptr;
-    LIUMtpTilingData tilingData_;
+    FusedLiManageMtpTilingData tilingData_;
+    bool mtp_ = true;
 };
 
 } // namespace optiling
-#endif
+#endif // FUSED_LI_MANAGE_MTP_TILING_H_
