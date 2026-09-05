@@ -26,7 +26,7 @@ Data plane (see zsc-sfa-kv-offload-merge-plan.md):
   dense-tail only (``num_cache_tokens=0``) for both colocate and disagg.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, TypeVar
 
 import torch
@@ -84,6 +84,7 @@ def _mtp_runtime(manager) -> GeneralizedMtpRuntime:
 @dataclass
 class AscendSFAKVOffloadMetadata(AscendSFAMetadata):
     mtp_batch: MtpBatch | None = None
+    mtp_graph_capture: bool = False
 
 
 def _check_device_kv_cache_exist() -> None:
@@ -123,12 +124,28 @@ class AscendSFAKVOffloadMetadataBuilder(AscendSFAMetadataBuilder):
             and kv_transfer_config.is_kv_consumer
             and not kv_transfer_config.is_kv_producer
         )
+        self._mtp_capture_width = (
+            1 + vllm_config.speculative_config.num_speculative_tokens
+            if vllm_config.speculative_config is not None else 1
+        )
 
     def _populate_offload_metadata(
         self,
         metadata: AscendSFAMetadata,
         common_attn_metadata: AscendCommonAttentionMetadata,
+        *,
+        for_graph_capture: bool = False,
+        draft_index: int = 0,
     ) -> AscendSFAMetadata:
+        if _generalized_mtp_enabled() and not for_graph_capture:
+            # FIA/FlashComm padding adds artificial requests. Ownership and
+            # the generalized ABI describe only the scheduled query rows.
+            starts = common_attn_metadata.query_start_loc_cpu[:common_attn_metadata.num_reqs]
+            ends = common_attn_metadata.query_start_loc_cpu[1:common_attn_metadata.num_reqs + 1]
+            actual_reqs = int(((ends > starts) & (ends <= common_attn_metadata.num_actual_tokens)).sum())
+            common_attn_metadata = common_attn_metadata.unpadded(
+                common_attn_metadata.num_actual_tokens, actual_reqs,
+            )
         num_decodes, num_prefills, num_decode_tokens, _ = split_decodes_and_prefills(
             common_attn_metadata,
             decode_threshold=self.decode_threshold,
@@ -149,7 +166,25 @@ class AscendSFAKVOffloadMetadataBuilder(AscendSFAMetadataBuilder):
             # and tail locations are rebuilt after speculative rejection.
             metadata.req_topk_buffer_slots = common_attn_metadata.req_topk_buffer_slots
             manager = get_sparse_kv_offload_manager()
-            metadata.mtp_batch = make_mtp_batch(metadata, manager)
+            _mtp_runtime(manager)
+            if for_graph_capture:
+                from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.generalized_mtp_graph import (
+                    make_capture_batch,
+                )
+
+                metadata.mtp_graph_capture = True
+                metadata.mtp_batch = make_capture_batch(
+                    metadata, manager, self._mtp_capture_width if draft_index == 0 else 1,
+                )
+            else:
+                # The base SFA builder may retain padded prefix buffers.
+                actual = replace(
+                    metadata,
+                    cum_query_lens=common_attn_metadata.query_start_loc[1:],
+                    seq_lens=common_attn_metadata.seq_lens,
+                    block_table=common_attn_metadata.block_table_tensor,
+                )
+                metadata.mtp_batch = make_mtp_batch(actual, manager)
             if metadata.mtp_batch is None:
                 _mtp_runtime(manager).invalidate()
             return metadata
@@ -179,6 +214,20 @@ class AscendSFAKVOffloadMetadataBuilder(AscendSFAMetadataBuilder):
     ) -> AscendSFAMetadata:
         metadata = super().build(common_prefix_len, common_attn_metadata, fast_build, **kwargs)
         return self._populate_offload_metadata(metadata, common_attn_metadata)
+
+    def build_for_cudagraph_capture(self, common_attn_metadata):
+        return self.build_for_graph_capture(common_attn_metadata, common_attn_metadata.attn_state)
+
+    def build_for_graph_capture(self, common_attn_metadata, attn_state, *, draft_index=0):
+        if not _generalized_mtp_enabled():
+            return super().build_for_graph_capture(common_attn_metadata, attn_state)
+        metadata = super()._build(common_attn_metadata)
+        metadata.attn_state = attn_state
+        # Dummy queries must not write the retained device or host history.
+        metadata.slot_mapping.fill_(-1)
+        return self._populate_offload_metadata(
+            metadata, common_attn_metadata, for_graph_capture=True, draft_index=draft_index,
+        )
 
     def build_for_drafting(
         self,
@@ -588,7 +637,11 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
                 mtp_batch.query_ends, mtp_batch.seq_lens, mtp_batch.offload_lens,
                 mtp_batch.cache_tokens, states, mtp_batch.pool_entries, mapping, *outputs,
             )
-            if manager.nano_debug_enabled() and not getattr(manager, "_nano_debug_li_steps", 0):
+            if (
+                mtp_batch.graph_buffers is None
+                and manager.nano_debug_enabled()
+                and not getattr(manager, "_nano_debug_li_steps", 0)
+            ):
                 manager._nano_debug_li_steps = 1
                 logger.info(
                     "generalized MTP LIM executed: layer=%s T=%s B=%s prefix=%s C=%s request_misses=%s",
@@ -677,7 +730,7 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
             manager.offload_new_kv(
                 slot_mapping=slots, k_cache_cpu=k_cpu, v_cache_cpu=v_cpu,
                 k_cache_npu=kv_cache[0], v_cache_npu=kv_cache[1], k=None, v=None,
-                has_prefill=True, capturing=False,
+                has_prefill=True, capturing=self._in_graph_runtime(),
             )
             return result
         if self._is_decode_only(attn_metadata):
@@ -962,8 +1015,8 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
         return self._pad_to_input_tokens(attn_output, ql_nope.shape[0])
 
     def _generalized_mtp_copy(self, q, q_rope, kv_cache, manager, layer_name, batch, metadata):
-        if self._in_graph_runtime():
-            raise RuntimeError("Generalized MTP serving currently requires eager execution")
+        if self._in_graph_runtime() and batch.graph_buffers is None:
+            raise RuntimeError("Generalized MTP graph inputs were not prepared before capture")
         runtime = _mtp_runtime(manager)
         src, dst, topk_misses, miss_src, miss_dst, misses = runtime.copy_metadata(batch)
         hbm_kv, hbm_rope = manager.hbm_kv_pair_for_fused(layer_name)
@@ -974,6 +1027,8 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
         for full, resident in ((kv_cache[0], hbm_kv), (kv_cache[1], hbm_rope)):
             dim = resident.shape[-1]
             values = full.reshape(-1, dim).index_select(0, batch.tail_sources)
+            if batch.graph_buffers is not None:
+                values = values.masked_fill(~batch.graph_buffers.tail_valid[:, None], 0)
             resident.reshape(-1, dim).index_copy_(0, batch.tail_destinations, values)
         if manager.tp_size > 1:
             # Rank zero writes the shared host pool on the current stream.
@@ -984,7 +1039,7 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
             q[:batch.num_tokens], q_rope[:batch.num_tokens],
         )
         out = manager.get_fused_attention_out(query)
-        if manager.nano_debug_enabled() and not manager._nano_debug_decode_logged:
+        if batch.graph_buffers is None and manager.nano_debug_enabled() and not manager._nano_debug_decode_logged:
             logger.info(
                 "generalized MTP copy-SFA inputs: layer=%s query_shape=%s query_ends=%s "
                 "pool_rows=%s hbm_shape=%s dram_shape=%s",
@@ -998,7 +1053,7 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
             batch.hbm_block_table, batch.source_block_table,
             hbm_rope, hbm_kv, dram_rope, dram_kv, float(self.scale), out,
         )
-        if manager.nano_debug_enabled() and not manager._nano_debug_decode_logged:
+        if batch.graph_buffers is None and manager.nano_debug_enabled() and not manager._nano_debug_decode_logged:
             manager._nano_debug_decode_logged = True
             logger.info(
                 "generalized MTP copy-SFA submitted: layer=%s T=%s B=%s DRAM_device=%s "

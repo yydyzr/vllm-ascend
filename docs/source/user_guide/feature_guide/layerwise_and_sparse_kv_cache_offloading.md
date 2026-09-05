@@ -321,13 +321,45 @@ exercise MTP3 sparse replacement beyond the resident budget, and check
 operator execution as well as generated output. The retained full cache makes
 this a correctness/debug setup; it does not demonstrate memory savings.
 
+### Experimental full-decode graph integration
+
+The working implementation accepts `FULL_DECODE_ONLY` with
+`keep_device_kv_cache=true`. The target-model graph path was validated with
+DP1, TP16, MTP3, FlashComm1, shared-expert DP, and eager speculative drafting.
+All 16 ranks captured and replayed the offload graph, and all three fixed
+prompt texts matched the eager offload result exactly across two passes. A
+standalone registered host-memory D2H → LIM → copy-SFA graph also passed five
+replays covering fills, hits, replacement, resets, and changing transfer
+descriptors.
+
+Graph entries own persistent query boundaries, sequence lengths, block tables,
+LIM states, and transfer metadata. Request ownership is refreshed before
+replay, and padding uses hot-cache rows outside the scheduler's request pool.
+Short, mixed, and nonuniform batches use eager execution on the retained full
+device cache. Other graph modes and PD-only operation remain unsupported.
+
+For the DP1/TP16/MTP3 validation case, use `--max-num-seqs 4` with
+`--compilation-config '{"cudagraph_mode":"FULL_DECODE_ONLY","cudagraph_capture_sizes":[16]}'`.
+FlashComm1 requires capture sizes divisible by TP size. With MTP3 and
+`max_num_seqs=2`, the dispatcher filters out capture size 16 because its
+uniform decode capacity is only eight tokens; enabling the configuration alone
+therefore does not prove graph execution. Check capture and replay logs.
+
+Run target graphs with `"enforce_eager": true` in `--speculative-config` for
+GLM models. GLM speculative drafting remains eager because its current graph
+profile inputs are incompatible with the sequence-parallel padding used by
+this configuration. Compare a matched eager baseline with the same prompts
+twice, and verify in the logs that long requests replay the offload graph.
+Enabling `FULL_DECODE_ONLY` alone is not sufficient evidence of graph use.
+
 ## 6. Limitations
 
 - Shared-buffer Layerwise Prefill Offload requires Memcache and eager mode.
 - Context parallelism has not been validated with Layerwise Prefill Offload.
 - Sparse Decode Offload supports DP and TP; CP and PP are not supported.
-- Generalized MTP offload currently requires eager colocated validation;
-  PD-only deployment and model graph replay are not supported by this path.
+- Generalized MTP offload has focused eager and target-model
+  `FULL_DECODE_ONLY` colocated validation. GLM speculative drafting remains
+  eager; PD-only deployment and other graph modes are unsupported.
 - MemFabric is the only supported `SfaRemoteD2HConnector` transfer backend.
 - Layerwise buffer reuse cannot currently be combined with
   `MooncakeLayerwiseConnector` because per-buffer transfer completion gating is

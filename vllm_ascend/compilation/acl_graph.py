@@ -20,6 +20,7 @@ from vllm.forward_context import BatchDescriptor, get_forward_context
 from vllm.logger import logger
 from vllm.platforms import current_platform
 
+from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 
 from ..utils import weak_ref_tensors
@@ -55,6 +56,7 @@ class ACLGraphEntry:
     # for aclgraph debugging, track the input addresses
     # during capture, and check if they are the same during replay
     input_addresses: list[int] | None = None
+    offload_inputs: Any | None = None
 
 
 class ACLGraphWrapper:
@@ -114,6 +116,9 @@ class ACLGraphWrapper:
         self.concrete_aclgraph_entries: dict[BatchDescriptor, ACLGraphEntry] = {}
         self.enable_enpu = enable_enpu
         self.use_eagle = use_eagle
+        self.generalized_mtp_offload = getattr(
+            get_ascend_config().sparse_kv_offload_config, "generalized_mtp", False,
+        )
         _acl_graph_wrappers.add(self)
 
     def __getattr__(self, key: str):
@@ -131,6 +136,66 @@ class ACLGraphWrapper:
         return self.runnable
 
     def __call__(self, *args, **kwargs):
+        context = get_forward_context()
+        if (
+            not self.generalized_mtp_offload
+            or self.runtime_mode != CUDAGraphMode.FULL
+            or context.cudagraph_runtime_mode != CUDAGraphMode.FULL
+        ):
+            return self._call_graph(*args, **kwargs)
+
+        # Import the sparse backend only for an offload graph. Preparing its
+        # request lifecycle and owned inputs must happen outside capture.
+        from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.generalized_mtp_graph import (
+            MtpGraphMetadataSet,
+            eligible_graph_steps,
+        )
+        from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.sparse_kv_offload_manager import (
+            get_sparse_kv_offload_manager,
+        )
+
+        steps = kwargs.get("multi_steps_attn_metadata") or [context.attn_metadata]
+
+        def eager_fallback():
+            old_mode = context.cudagraph_runtime_mode
+            context.cudagraph_runtime_mode = CUDAGraphMode.NONE
+            try:
+                return self.runnable(*args, **kwargs)
+            finally:
+                context.cudagraph_runtime_mode = old_mode
+
+        if not eligible_graph_steps(steps):
+            return eager_fallback()
+        descriptor = context.batch_descriptor
+        entry = self.concrete_aclgraph_entries.setdefault(descriptor, ACLGraphEntry(descriptor))
+        if entry.offload_inputs is None:
+            manager = get_sparse_kv_offload_manager()
+            entry.offload_inputs = MtpGraphMetadataSet(manager.generalized_mtp_runtime, steps)
+        if not entry.offload_inputs.accepts(steps):
+            return eager_fallback()
+        entry.offload_inputs.update(steps)
+        old_metadata = context.attn_metadata
+        old_draft = getattr(context, "draft_attn_metadatas", None)
+        context.attn_metadata = entry.offload_inputs.steps[0]
+        context.draft_attn_metadatas = entry.offload_inputs.steps if old_draft is not None else None
+        if "multi_steps_attn_metadata" in kwargs:
+            kwargs = {**kwargs, "multi_steps_attn_metadata": entry.offload_inputs.steps}
+        was_replay = entry.aclgraph is not None
+        try:
+            output = self._call_graph(*args, **kwargs)
+            if was_replay:
+                entry.offload_inputs.replays += 1
+                if entry.offload_inputs.replays == 1:
+                    logger.info(
+                        "Generalized MTP offload graph replay submitted: draft=%s steps=%s tokens=%s",
+                        _EXTRA_CTX.is_draft_model, len(entry.offload_inputs.steps), descriptor.num_tokens,
+                    )
+            return output
+        finally:
+            context.attn_metadata = old_metadata
+            context.draft_attn_metadatas = old_draft
+
+    def _call_graph(self, *args, **kwargs):
         forward_context = get_forward_context()
         batch_descriptor = forward_context.batch_descriptor
         aclgraph_runtime_mode = forward_context.cudagraph_runtime_mode

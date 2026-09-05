@@ -1662,6 +1662,18 @@ def update_sparse_kv_offload_metadata(
         offload_token_to_req.np[num_tokens:num_tokens_padded].fill(0)
     offload_token_to_req.copy_to_gpu(num_tokens_padded)
 
+    if getattr(sparse_kv_offload_config, "generalized_mtp", False) and effective_num_reqs == 0:
+        # Startup graph dummy batches have query rows but no scheduler-owned
+        # requests. The graph builder supplies isolated synthetic LIM inputs;
+        # never allocate real request slots from this dummy token count.
+        offload_req_topk_buffer_slots.np[:num_reqs_padded].fill(-1)
+        offload_req_topk_buffer_slots.copy_to_gpu(num_reqs_padded)
+        offload_device_slot_mapping.np[:num_tokens_padded].fill(-1)
+        offload_device_slot_mapping.copy_to_gpu(num_tokens_padded)
+        offload_seq_lengths_key.np[:num_reqs_padded].fill(0)
+        offload_seq_lengths_key.copy_to_gpu(num_reqs_padded)
+        return
+
     if sparse_kv_offload_config.fused_op_type == "nano":
         manager = get_sparse_kv_offload_manager()
         manager.clear_nano_init_step()

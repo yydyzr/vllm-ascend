@@ -1214,8 +1214,15 @@ class SparseKVOffloadConfig:
             width = 1 + vllm_config.speculative_config.num_speculative_tokens
             if not 1 <= width <= 7:
                 raise ValueError("Generalized LIM supports at most six speculative tokens (seven query rows)")
-            if not self.keep_device_kv_cache or not vllm_config.model_config.enforce_eager:
-                raise ValueError("Generalized MTP offload currently requires eager colocate with keep_device_kv_cache")
+            if not self.keep_device_kv_cache:
+                raise ValueError("Generalized MTP offload requires colocate with keep_device_kv_cache")
+            if not vllm_config.model_config.enforce_eager:
+                from vllm.config import CUDAGraphMode
+
+                if vllm_config.compilation_config.cudagraph_mode != CUDAGraphMode.FULL_DECODE_ONLY:
+                    raise ValueError("Generalized MTP offload supports eager or FULL_DECODE_ONLY execution")
+                if width < 2:
+                    raise ValueError("Generalized MTP graphs require at least one speculative token")
             if "topk_buffer_size" not in user_config:
                 self.topk_buffer_size = max(self.topk_buffer_size, width * self.topk)
             if not width * self.topk <= self.topk_buffer_size <= 16256 or self.topk_buffer_size % 128:

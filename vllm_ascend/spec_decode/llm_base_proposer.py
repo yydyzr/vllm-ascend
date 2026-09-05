@@ -662,6 +662,8 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                         assert self.block_table_tensor_clone is not None, "block_table_tensor_clone is not init"
                         common_attn_metadata.block_table_tensor = self.block_table_tensor_clone[:num_reqs]
                     if not self.use_compress or draft_index == 0:
+                        if getattr(self.runner.sparse_kv_offload_config, "generalized_mtp", False):
+                            extra_attn_metadata_args["draft_index"] = draft_index
                         attn_metadata_eagle = builder.build_for_graph_capture(
                             common_attn_metadata,
                             AscendAttentionState.SpecDecoding

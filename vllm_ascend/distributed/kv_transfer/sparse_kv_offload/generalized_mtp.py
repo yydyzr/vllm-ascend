@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Eager colocated metadata and cache ownership for generalized MTP offload.
+"""Colocated metadata and cache ownership for generalized MTP offload.
 
 The retained device cache supplies short/mixed batches and the circular dense
 tail. Sparse misses are read from the registered host pool by copy-SFA.
@@ -50,10 +50,11 @@ class MtpBatch:
     prefix_lengths: list[int]
     cache_sizes: list[int]
     num_tokens: int
+    graph_buffers: object | None = None
 
 
 def make_mtp_batch(metadata, manager) -> MtpBatch | None:
-    """Use authoritative eager lengths, including rejection-adjusted drafts."""
+    """Snapshot scheduled lengths, including rejection-adjusted drafts."""
     if metadata.num_prefills or not metadata.num_decodes:
         return None
     count = metadata.num_decodes
@@ -132,11 +133,13 @@ class GeneralizedMtpRuntime:
         self.output_batch = None
 
     def prepare_lim(self, layer_name, batch, source_capacity, device):
+        if batch.graph_buffers is not None:
+            return batch.graph_buffers.lim_inputs(layer_name)
         manager = self.manager
         mapping = self.maps.get(layer_name)
         if mapping is None:
             mapping = torch.full(
-                (manager.max_num_reqs, source_capacity), INVALID_SLOT,
+                (getattr(manager, "max_num_topk_rows", manager.max_num_reqs), source_capacity), INVALID_SLOT,
                 dtype=torch.int32, device=device,
             )
             self.maps[layer_name] = mapping
@@ -164,11 +167,15 @@ class GeneralizedMtpRuntime:
         return mapping, torch.tensor(states, dtype=torch.int32, device=device), self.outputs
 
     def require_outputs(self, batch):
+        if batch.graph_buffers is not None:
+            return batch.graph_buffers.outputs
         if self.output_batch is not batch or self.outputs is None:
             raise RuntimeError("Shared MTP attention ran before its indexer owner for this batch")
         return self.outputs
 
     def copy_metadata(self, batch):
+        if batch.graph_buffers is not None:
+            return batch.graph_buffers.copy_metadata()
         src, dst, topk_misses, miss_src, miss_dst, misses = self.require_outputs(batch)
         # A [B, 16384] slice of [B, 32768] is noncontiguous for B > 1.
         # Both public ABIs require contiguous tensors, so bridge explicitly.
