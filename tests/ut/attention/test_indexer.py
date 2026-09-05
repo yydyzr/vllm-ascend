@@ -51,5 +51,9 @@ def test_sfa_indexer_metadata_builder_is_cache_only():
     assert builder.get_cudagraph_support(vllm_config, kv_cache_spec) is AttentionCGSupport.UNIFORM_BATCH
 
     common_attn_metadata = MagicMock()
-    assert builder.build(0, common_attn_metadata) is None
-    assert builder.build_for_cudagraph_capture(common_attn_metadata) is None
+    for metadata in (
+        builder.build(0, common_attn_metadata),
+        builder.build_for_cudagraph_capture(common_attn_metadata),
+    ):
+        assert metadata.block_table is common_attn_metadata.block_table_tensor
+        assert metadata.slot_mapping is common_attn_metadata.slot_mapping

@@ -257,13 +257,13 @@ python examples/disaggregated_prefill_v1/load_balance_proxy_layerwise_server_exa
 For multi-node deployment, advertise reachable addresses instead of
 `0.0.0.0`. Send inference requests to the proxy port (`9000` in this example).
 
-## 5. Generalized MTP Colocated Validation
+## 5. Generalized LIM and Copy-SFA
 
 The `nano` backend uses generalized LIM and copy-SFA when speculative decoding
-is enabled. This initial integration requires eager mode and a retained device
-KV cache. It supports up to six speculative tokens (seven query rows per
-request) and BF16/FP16 indexer inputs. The native copy-SFA kernel accepts 8 or
-128 attention heads per rank. The eager adapter pads 1 through 7 heads to 8
+is enabled, or when Sparse Decode Offload uses `keep_device_kv_cache=false`.
+It supports up to six speculative tokens (seven query rows per request) and
+BF16/FP16 indexer inputs. The native copy-SFA kernel accepts 8 or
+128 attention heads per rank. The adapter pads 1 through 7 heads to 8
 and discards the padded outputs; GLM-5.2 TP16 uses this path with 4 heads.
 
 Install the Decode dependencies above. With the
@@ -336,7 +336,8 @@ Graph entries own persistent query boundaries, sequence lengths, block tables,
 LIM states, and transfer metadata. Request ownership is refreshed before
 replay, and padding uses hot-cache rows outside the scheduler's request pool.
 Short, mixed, and nonuniform batches use eager execution on the retained full
-device cache. Other graph modes and PD-only operation remain unsupported.
+device cache in this colocated configuration. Other graph modes remain
+unsupported. The separate PD path is described below.
 
 For the DP1/TP16/MTP3 validation case, use `--max-num-seqs 4` with
 `--compilation-config '{"cudagraph_mode":"FULL_DECODE_ONLY","cudagraph_capture_sizes":[16]}'`.
@@ -352,6 +353,79 @@ this configuration. Compare a matched eager baseline with the same prompts
 twice, and verify in the logs that long requests replay the offload graph.
 Enabling `FULL_DECODE_ONLY` alone is not sufficient evidence of graph use.
 
+### Experimental PD host-to-tail integration
+
+For a Decode node receiving KV through `SfaRemoteD2HConnector`, set
+`fused_op_type="nano"` and `keep_device_kv_cache=false`. The connector transfers
+the main KV history into the shared host pool and the indexer cache into device
+memory. It does not populate nano's two device tail blocks.
+
+The Decode attention path now writes its new KV into the host pool, then
+restores only the tail needed by copy-SFA. For block size `B=128`, sequence
+length `S`, and query width `Q`, the tail starts at
+`L=floor((S-Q)/B)*B` and covers `[L,S)`. That span crosses at most two blocks
+for the supported query widths. Each KV component uses up to two contiguous
+copies, following the actual host block table and the request's device pool
+row. Full-history KV is not materialized on the device.
+
+Graph entries own persistent copy descriptors and an active-request mask.
+Descriptor construction and H2D execute inside the captured graph before
+copy-SFA, so every replay uses current sequence lengths, block tables, and pool
+rows. Padding has zero copy lengths. Restoring the tail on every invocation
+also replaces stale contents after speculative-token rejection or request-slot
+reuse. Main-cache and indexer-cache mappings are tracked separately; draft
+metadata may share them only when both caches belong to the same KV group.
+
+Short requests and nonuniform query batches remain eager. They gather each
+query's causal TopK KV set from host memory into a bounded device row before
+ordinary SFA, then invalidate LIM residency before the next fused batch.
+This fallback also works with `keep_device_kv_cache=false`. Each prepared MTP
+step owns its query boundaries and sequence lengths, so preparing a later draft
+step cannot change the earlier step's fallback routing or causal lengths.
+
+The initial PD validation used GLM-5.2 on two A3 nodes, DP1/TP16,
+FlashComm1, shared-expert DP, eager execution, and MTP disabled. Prefill used
+Memcache layerwise offload with three shared buffers and independent layer 0;
+Decode used an 8192-token hot buffer and a 64 GiB host pool. All six requests
+matched the existing PD offload baseline exactly, including overlapping short
+and 10K-plus-token requests and two passes through each prompt. A separate
+registered-host-memory test passed five graph replays while changing tail
+lengths, block mappings, pool rows, source contents, and padding. This does
+not establish broad model accuracy or performance.
+
+The matched MTP3 PD configuration was also validated with MTP enabled on both
+Prefill and Decode. Eager execution and target-model `FULL_DECODE_ONLY` each
+completed the same six requests with exact output matches to the PD baseline
+and to each other. The long/short overlap lasted 11.5 seconds in eager mode and
+12.0 seconds in graph mode. All 16 Decode ranks received metadata for 79 main
+layers, including the draft layer, and logged target-model graph replay with
+16 input tokens. GLM speculative drafting stayed eager. This is focused
+correctness evidence for A3 DP1/TP16, GLM-5.2 BF16, MTP3, an 8192-token hot
+buffer, and a 64 GiB host pool; performance tuning remains separate.
+
+A matched three-run PD comparison used a 10,555-token prompt, 82 generated
+tokens, four warmup requests, and eight measured requests per run. All 96
+measured responses matched. With the same target graph and eager MTP3 drafter,
+mean output throughput was 20.34 tokens/s for `default` versus 6.85 for `nano`
+at concurrency 1, and 59.96 versus 56.04 at concurrency 4. Nano concurrency-4
+results varied from 50.42 to 59.17 tokens/s. These rates include the full PD
+request path. Single-request decode time per token increased from 32.10 to
+125.45 ms; at concurrency 4 it remained approximately 41 ms for both backends.
+Inactive graph rows currently use cold cache initialization on every replay,
+which is a candidate for explaining the low-concurrency overhead. Its latency
+contribution has not been isolated by profiling.
+
+When testing PD with MTP, enable matching MTP configuration on Prefill so its
+draft-layer KV is registered and transferred as well as the target-model KV.
+Prefill layerwise offload remains eager. Keep GLM speculative drafting eager
+when testing `FULL_DECODE_ONLY` on Decode.
+
+For repeated verification with a retained Prefill process, use a fresh Decode
+`kv_port` range after restarting Decode, or restart Prefill as well. The current
+producer caches its MemFabric handshake by endpoint and does not invalidate it
+when a Decode process restarts at the same address and port. Reserve the full
+DP-by-TP port range described above.
+
 ## 6. Limitations
 
 - Shared-buffer Layerwise Prefill Offload requires Memcache and eager mode.
@@ -359,7 +433,9 @@ Enabling `FULL_DECODE_ONLY` alone is not sufficient evidence of graph use.
 - Sparse Decode Offload supports DP and TP; CP and PP are not supported.
 - Generalized MTP offload has focused eager and target-model
   `FULL_DECODE_ONLY` colocated validation. GLM speculative drafting remains
-  eager; PD-only deployment and other graph modes are unsupported.
+  eager. True PD has focused Q1 eager and matched MTP3 eager/target-graph
+  validation on GLM-5.2 A3 DP1/TP16. Q1 full-decode graphs and other graph modes
+  remain unsupported in this integration.
 - MemFabric is the only supported `SfaRemoteD2HConnector` transfer backend.
 - Layerwise buffer reuse cannot currently be combined with
   `MooncakeLayerwiseConnector` because per-buffer transfer completion gating is

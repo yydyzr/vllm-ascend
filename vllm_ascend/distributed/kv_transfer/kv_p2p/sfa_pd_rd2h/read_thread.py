@@ -6,6 +6,7 @@ from __future__ import annotations
 import logging
 import math
 import threading
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
@@ -25,6 +26,8 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.sfa_pd_rd2h.protocol import (
 
 READ_THREAD_POLL_TIMEOUT_MS = 100
 THREAD_SHUTDOWN_TIMEOUT_SECONDS = 5.0
+DESTINATION_REGISTRATION_TIMEOUT_SECONDS = 30.0
+DESTINATION_REGISTRATION_POLL_SECONDS = 0.01
 
 
 @dataclass
@@ -111,6 +114,32 @@ class MembPullReadThread(threading.Thread):
         self._host = get_ip()
         self._stop_event = threading.Event()
         self.startup_error: BaseException | None = None
+
+    def _wait_for_destination_registration(
+        self,
+        request_ids: set[str],
+        timeout: float = DESTINATION_REGISTRATION_TIMEOUT_SECONDS,
+    ) -> None:
+        # The scheduler advertises D's endpoint before its connector metadata
+        # reaches the workers. A short P forward can therefore finish while D
+        # is still executing a different request's step. Wait for start_load_kv
+        # to publish the destinations before interpreting READ_READY as a read.
+        pending = {req_id for req_id in request_ids if req_id not in self._state.dest_blocks_by_req}
+        if not pending:
+            return
+        started = time.monotonic()
+        deadline = started + timeout
+        logger.info("MembPull D waiting for destination registration: requests=%s", sorted(pending))
+        while pending:
+            if self._stop_event.is_set():
+                raise RuntimeError("MembPull stopped while waiting for destination registration")
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise RuntimeError(f"MembPull timed out waiting for destination registration: {sorted(pending)}")
+            if self._stop_event.wait(min(remaining, DESTINATION_REGISTRATION_POLL_SECONDS)):
+                raise RuntimeError("MembPull stopped while waiting for destination registration")
+            pending = {req_id for req_id in pending if req_id not in self._state.dest_blocks_by_req}
+        logger.info("MembPull D destination registration ready after %.3fs", time.monotonic() - started)
 
     def _record_chunk_done(self, done_ext_ids: list[str], group_member_idx: int, ratio: int) -> None:
         """Accumulate a contributor's last-layer arrival; complete only when the whole group reported."""
@@ -249,6 +278,7 @@ class MembPullReadThread(threading.Thread):
                                     "MF_META was not received from this P connection before READ_READY_BATCH"
                                 )
                             if read_reqs:
+                                self._wait_for_destination_registration({entry[0] for entry in read_reqs})
                                 self._do_read_batch(
                                     layer_name,
                                     read_reqs,

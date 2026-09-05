@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Colocated metadata and cache ownership for generalized MTP offload.
+"""Metadata and cache ownership for generalized nano Q1/MTP offload.
 
-The retained device cache supplies short/mixed batches and the circular dense
-tail. Sparse misses are read from the registered host pool by copy-SFA.
+Registered host KV supplies sparse misses and bounded circular HBM tails.
+Colocated execution may additionally retain a full device cache for prefill.
 """
 
 from dataclasses import dataclass
@@ -61,13 +61,21 @@ def make_mtp_batch(metadata, manager) -> MtpBatch | None:
     # Builders reuse these buffers for target and draft steps. Keep an owned
     # snapshot: .to().contiguous() can retain a view whose values later change
     # while this batch's Python lengths and queued custom calls stay fixed.
-    query_ends = metadata.cum_query_lens[:count].to(dtype=torch.int32).clone(
-        memory_format=torch.contiguous_format,
+    query_ends = (
+        metadata.cum_query_lens[:count]
+        .to(dtype=torch.int32)
+        .clone(
+            memory_format=torch.contiguous_format,
+        )
     )
     ends = query_ends.cpu().tolist()
     widths = [end - start for start, end in zip([0] + ends[:-1], ends)]
-    seq_lens = metadata.seq_lens[:count].to(dtype=torch.int32).clone(
-        memory_format=torch.contiguous_format,
+    seq_lens = (
+        metadata.seq_lens[:count]
+        .to(dtype=torch.int32)
+        .clone(
+            memory_format=torch.contiguous_format,
+        )
     )
     lengths = seq_lens.cpu().tolist()
     block_size = manager.block_size
@@ -82,8 +90,12 @@ def make_mtp_batch(metadata, manager) -> MtpBatch | None:
             prefix > width * TOPK and not width * TOPK <= cache <= 16256
         ):
             raise ValueError(f"Invalid generalized LIM budget: Q={width}, L={prefix}, C={cache}")
-    pools = metadata.req_topk_buffer_slots[:count].to(dtype=torch.int32).clone(
-        memory_format=torch.contiguous_format,
+    pools = (
+        metadata.req_topk_buffer_slots[:count]
+        .to(dtype=torch.int32)
+        .clone(
+            memory_format=torch.contiguous_format,
+        )
     )
     pool_rows = pools.cpu().tolist()
     if len(set(pool_rows)) != count or any(pool < 0 or pool >= manager.max_num_reqs for pool in pool_rows):
@@ -110,12 +122,19 @@ def make_mtp_batch(metadata, manager) -> MtpBatch | None:
     rows = torch.tensor(source_rows, dtype=torch.int64, device=device)
     source_blocks = source_block_table[rows, positions // block_size].to(torch.int64)
     return MtpBatch(
-        query_ends, seq_lens,
+        query_ends,
+        seq_lens,
         torch.tensor(prefixes, dtype=torch.int32, device=device),
-        torch.tensor(caches, dtype=torch.int32, device=device), pools,
-        table.to(device), source_block_table, source_blocks * block_size + positions % block_size,
+        torch.tensor(caches, dtype=torch.int32, device=device),
+        pools,
+        table.to(device),
+        source_block_table,
+        source_blocks * block_size + positions % block_size,
         torch.tensor(destinations, dtype=torch.int64, device=device),
-        pool_rows, prefixes, caches, ends[-1],
+        pool_rows,
+        prefixes,
+        caches,
+        ends[-1],
     )
 
 
@@ -139,8 +158,10 @@ class GeneralizedMtpRuntime:
         mapping = self.maps.get(layer_name)
         if mapping is None:
             mapping = torch.full(
-                (getattr(manager, "max_num_topk_rows", manager.max_num_reqs), source_capacity), INVALID_SLOT,
-                dtype=torch.int32, device=device,
+                (getattr(manager, "max_num_topk_rows", manager.max_num_reqs), source_capacity),
+                INVALID_SLOT,
+                dtype=torch.int32,
+                device=device,
             )
             self.maps[layer_name] = mapping
         if mapping.shape[1] != source_capacity:
@@ -160,8 +181,12 @@ class GeneralizedMtpRuntime:
             return torch.empty(shape, dtype=torch.int32, device=device)
 
         self.outputs = (
-            empty((tokens, 1, TOPK)), empty((tokens, 1, TOPK)), empty((tokens,)),
-            empty((count, LIM_MISS_CAPACITY)), empty((count, LIM_MISS_CAPACITY)), empty((count,)),
+            empty((tokens, 1, TOPK)),
+            empty((tokens, 1, TOPK)),
+            empty((tokens,)),
+            empty((count, LIM_MISS_CAPACITY)),
+            empty((count, LIM_MISS_CAPACITY)),
+            empty((count,)),
         )
         self.output_batch = batch
         return mapping, torch.tensor(states, dtype=torch.int32, device=device), self.outputs
@@ -180,7 +205,10 @@ class GeneralizedMtpRuntime:
         # A [B, 16384] slice of [B, 32768] is noncontiguous for B > 1.
         # Both public ABIs require contiguous tensors, so bridge explicitly.
         copy_src = torch.full(
-            (len(batch.pool_rows), COPY_MISS_CAPACITY), -1, dtype=torch.int32, device=src.device,
+            (len(batch.pool_rows), COPY_MISS_CAPACITY),
+            -1,
+            dtype=torch.int32,
+            device=src.device,
         )
         copy_dst = torch.full_like(copy_src, -1)
         copy_src[:, :LIM_MISS_CAPACITY].copy_(miss_src)

@@ -12,6 +12,8 @@ from types import SimpleNamespace
 
 import torch
 
+from vllm_ascend.attention.indexer import AscendSFAIndexerMetadata
+
 from .generalized_mtp import (
     COPY_MISS_CAPACITY,
     INVALID_SLOT,
@@ -20,6 +22,7 @@ from .generalized_mtp import (
     MtpBatch,
     make_mtp_batch,
 )
+from .nano_cache import KV_COMPONENTS, TAIL_BLOCKS, CopyDescriptors
 
 
 class MtpGraphBuffers:
@@ -43,6 +46,7 @@ class MtpGraphBuffers:
         if manager.max_num_topk_rows < manager.max_num_reqs + self.requests:
             raise ValueError("MTP graph padding requires a private hot-cache row per request")
         self.layers = {}
+        self.tail_copies = {}
 
         def zeros(shape, dtype=torch.int32):
             return torch.zeros(shape, dtype=dtype, device=device)
@@ -65,6 +69,7 @@ class MtpGraphBuffers:
             graph_buffers=self,
         )
         self.tail_valid = zeros(self.requests * 2 * manager.block_size, torch.bool)
+        self.active_mask = zeros(self.requests, torch.bool)
         self.outputs = (
             zeros((self.tokens, 1, TOPK)),
             zeros((self.tokens, 1, TOPK)),
@@ -100,6 +105,8 @@ class MtpGraphBuffers:
         manager, graph = self.manager, self.batch
         count = len(batch.pool_rows)
         self.active_requests = count
+        self.active_mask.zero_()
+        self.active_mask[:count].fill_(True)
         scratch = list(range(manager.max_num_reqs + count, manager.max_num_reqs + self.requests))
         pools = batch.pool_rows + scratch
         prefixes = batch.prefix_lengths + [manager.topk_buffer_size] * (self.requests - count)
@@ -159,6 +166,10 @@ class MtpGraphBuffers:
             raise ValueError("MTP graph map capacity changed after allocation")
         if layer_name not in self.layers:
             self.layers[layer_name] = (mapping, torch.empty(self.requests, dtype=torch.int32, device=self.device))
+            self.tail_copies[layer_name] = CopyDescriptors(
+                self.requests * TAIL_BLOCKS * KV_COMPONENTS,
+                self.device,
+            )
         owners = {slot: req for req, slot in manager.topk_buffer_slot_manager.req2slot.items()}
         resident = runtime.residents.setdefault(layer_name, {})
         states = []
@@ -243,17 +254,31 @@ class MtpGraphMetadataSet:
         self.replays = 0
         self.steps = []
         self.groups = []
+        self.indexer_steps = []
         for step in metadata_steps:
             captured = {}
             seen = {}
             groups = []
+            indexers = {}
             for layer_name, metadata in step.items():
                 # A model can mix sparse SFA and ordinary attention layers in
                 # one metadata dictionary. Only SFA offload metadata owns an
                 # MTP batch; keep the other layers on their existing captured
                 # metadata instead of rejecting the entire graph.
                 if not hasattr(metadata, "mtp_batch"):
-                    captured[layer_name] = metadata
+                    if isinstance(metadata, AscendSFAIndexerMetadata):
+                        owned_indexer = clone_graph_metadata(metadata)
+                        # Later replays can contain more requests than the
+                        # first live batch. Keep all indexer table rows stable.
+                        owned_indexer.block_table = metadata.block_table.new_zeros(
+                            (runtime.manager.max_num_reqs, metadata.block_table.shape[1]),
+                        )
+                        rows = min(metadata.block_table.shape[0], runtime.manager.max_num_reqs)
+                        owned_indexer.block_table[:rows].copy_(metadata.block_table[:rows])
+                        indexers[layer_name] = owned_indexer
+                        captured[layer_name] = indexers[layer_name]
+                    else:
+                        captured[layer_name] = metadata
                     continue
                 if id(metadata) not in seen:
                     batch = metadata.mtp_batch
@@ -284,6 +309,7 @@ class MtpGraphMetadataSet:
                 captured[layer_name] = owned
             self.steps.append(captured)
             self.groups.append(groups)
+            self.indexer_steps.append(indexers)
 
     def accepts(self, metadata_steps):
         if len(metadata_steps) != len(self.steps):
@@ -297,6 +323,11 @@ class MtpGraphMetadataSet:
     def update(self, metadata_steps):
         if not self.accepts(metadata_steps):
             raise ValueError("MTP graph metadata does not match its captured request/query capacity")
+        for indexers, step in zip(self.indexer_steps, metadata_steps):
+            for name, owned in indexers.items():
+                update_graph_metadata(owned, step[name])
+                if any(getattr(metadata, "mtp_graph_capture", False) for metadata in step.values()):
+                    owned.slot_mapping.fill_(-1)
         for groups, step in zip(self.groups, metadata_steps):
             for owned, buffers, names in groups:
                 incoming = step[names[0]]
@@ -308,6 +339,8 @@ class MtpGraphMetadataSet:
                 buffers.update(incoming.mtp_batch)
                 if incoming.mtp_graph_capture:
                     buffers.active_requests = 0
+                    buffers.active_mask.zero_()
+                    buffers.tail_valid.zero_()
                 for layer_name in names:
                     buffers.prepare_layer(layer_name)
 

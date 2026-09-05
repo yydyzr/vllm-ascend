@@ -85,6 +85,8 @@ def _mtp_runtime(manager) -> GeneralizedMtpRuntime:
 class AscendSFAKVOffloadMetadata(AscendSFAMetadata):
     mtp_batch: MtpBatch | None = None
     mtp_graph_capture: bool = False
+    main_slot_mapping: torch.Tensor | None = None
+    indexer_block_table: torch.Tensor | None = None
 
 
 def _check_device_kv_cache_exist() -> None:
@@ -126,7 +128,8 @@ class AscendSFAKVOffloadMetadataBuilder(AscendSFAMetadataBuilder):
         )
         self._mtp_capture_width = (
             1 + vllm_config.speculative_config.num_speculative_tokens
-            if vllm_config.speculative_config is not None else 1
+            if getattr(vllm_config, "speculative_config", None) is not None
+            else 1
         )
 
     def _populate_offload_metadata(
@@ -140,11 +143,12 @@ class AscendSFAKVOffloadMetadataBuilder(AscendSFAMetadataBuilder):
         if _generalized_mtp_enabled() and not for_graph_capture:
             # FIA/FlashComm padding adds artificial requests. Ownership and
             # the generalized ABI describe only the scheduled query rows.
-            starts = common_attn_metadata.query_start_loc_cpu[:common_attn_metadata.num_reqs]
-            ends = common_attn_metadata.query_start_loc_cpu[1:common_attn_metadata.num_reqs + 1]
+            starts = common_attn_metadata.query_start_loc_cpu[: common_attn_metadata.num_reqs]
+            ends = common_attn_metadata.query_start_loc_cpu[1 : common_attn_metadata.num_reqs + 1]
             actual_reqs = int(((ends > starts) & (ends <= common_attn_metadata.num_actual_tokens)).sum())
             common_attn_metadata = common_attn_metadata.unpadded(
-                common_attn_metadata.num_actual_tokens, actual_reqs,
+                common_attn_metadata.num_actual_tokens,
+                actual_reqs,
             )
         num_decodes, num_prefills, num_decode_tokens, _ = split_decodes_and_prefills(
             common_attn_metadata,
@@ -162,6 +166,12 @@ class AscendSFAKVOffloadMetadataBuilder(AscendSFAMetadataBuilder):
         metadata.req_ids_tensor = common_attn_metadata.req_ids_tensor
         metadata.token_to_req = common_attn_metadata.token_to_req
         if _generalized_mtp_enabled():
+            # The base builder reuses its length buffers while preparing all
+            # draft steps before any of them execute. The eager fallback also
+            # needs step-owned lengths: later Q1 drafts must not overwrite the
+            # first step's multi-query boundaries or causal sequence lengths.
+            metadata.cum_query_lens = metadata.cum_query_lens.clone()
+            metadata.seq_lens = metadata.seq_lens.clone()
             # Draft metadata must carry request pool ownership, but all lengths
             # and tail locations are rebuilt after speculative rejection.
             metadata.req_topk_buffer_slots = common_attn_metadata.req_topk_buffer_slots
@@ -174,7 +184,9 @@ class AscendSFAKVOffloadMetadataBuilder(AscendSFAMetadataBuilder):
 
                 metadata.mtp_graph_capture = True
                 metadata.mtp_batch = make_capture_batch(
-                    metadata, manager, self._mtp_capture_width if draft_index == 0 else 1,
+                    metadata,
+                    manager,
+                    self._mtp_capture_width if draft_index == 0 else 1,
                 )
             else:
                 # The base SFA builder may retain padded prefix buffers.
@@ -226,7 +238,10 @@ class AscendSFAKVOffloadMetadataBuilder(AscendSFAMetadataBuilder):
         # Dummy queries must not write the retained device or host history.
         metadata.slot_mapping.fill_(-1)
         return self._populate_offload_metadata(
-            metadata, common_attn_metadata, for_graph_capture=True, draft_index=draft_index,
+            metadata,
+            common_attn_metadata,
+            for_graph_capture=True,
+            draft_index=draft_index,
         )
 
     def build_for_drafting(
@@ -406,9 +421,33 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
     ) -> torch.Tensor:
         self._current_layer_name = layer_name
         try:
+            if _generalized_mtp_enabled() and self.has_indexer and attn_metadata is not None:
+                indexer_name = self.indexer.k_cache.prefix
+                context = get_forward_context()
+                indexer_metadata = context.attn_metadata.get(indexer_name)
+                if indexer_metadata is not None:
+                    attn_metadata = replace(
+                        attn_metadata,
+                        main_slot_mapping=attn_metadata.slot_mapping,
+                        slot_mapping=indexer_metadata.slot_mapping,
+                        indexer_block_table=indexer_metadata.block_table,
+                    )
+                else:
+                    # Draft builders omit cache-only indexer layers. Aliasing
+                    # their IDs is safe only for an explicitly shared group.
+                    groups = get_sparse_kv_offload_manager().kv_cache_config.kv_cache_groups
+                    group_ids = {name: gid for gid, group in enumerate(groups) for name in group.layer_names}
+                    if group_ids.get(layer_name) is None or group_ids.get(layer_name) != group_ids.get(indexer_name):
+                        raise RuntimeError(
+                            "Nano draft attention requires explicit indexer metadata for separate KV groups"
+                        )
             return super().forward(layer_name, hidden_states, kv_cache, attn_metadata, need_gather_q_kv, output)
         finally:
             self._current_layer_name = None
+
+    def _get_sfa_kv_slot_mapping(self, attn_metadata):
+        main_slots = getattr(attn_metadata, "main_slot_mapping", None)
+        return attn_metadata.slot_mapping if main_slots is None else main_slots
 
     def _compute_kv_only(
         self,
@@ -451,17 +490,10 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
         if not manager.has_nano_init_step():
             return
         if self._in_graph_runtime():
-            raise RuntimeError(
-                "nano first-decode topk-buffer prefix init must remain eager"
-            )
+            raise RuntimeError("nano first-decode topk-buffer prefix init must remain eager")
         num_decodes = int(attn_metadata.num_decodes or 0)
-        if (
-            attn_metadata.cache_slots_pool is None
-            or attn_metadata.offload_seq_lengths_key is None
-        ):
-            raise RuntimeError(
-                "nano prefix init requires cache_slots_pool and offload_seq_lengths_key"
-            )
+        if attn_metadata.cache_slots_pool is None or attn_metadata.offload_seq_lengths_key is None:
+            raise RuntimeError("nano prefix init requires cache_slots_pool and offload_seq_lengths_key")
         manager.initialize_nano_prefix_topk_buffer(
             layer_name=layer_name,
             block_table=attn_metadata.block_table[:num_decodes],
@@ -487,11 +519,15 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
         if (mtp_enabled and attn_metadata.mtp_batch is None) or not (
             self._use_nano_fused_op() and self._is_decode_only(attn_metadata)
         ):
+            indexer_table = getattr(attn_metadata, "indexer_block_table", None)
+            indexer_metadata = (
+                attn_metadata if indexer_table is None else replace(attn_metadata, block_table=indexer_table)
+            )
             return super().indexer_select_post_process(
                 x,
                 q_c,
                 kv_cache,
-                attn_metadata,
+                indexer_metadata,
                 cos,
                 sin,
                 actual_seq_lengths_query,
@@ -518,9 +554,7 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
         actual_seq_lengths_key: torch.Tensor,
     ) -> torch.Tensor:
         if not self.has_indexer:
-            raise RuntimeError(
-                f"nano fused_li_manage requires an indexer. layer_name={self.layer_name}."
-            )
+            raise RuntimeError(f"nano fused_li_manage requires an indexer. layer_name={self.layer_name}.")
         if self.enable_sparse_li_c8:
             raise NotImplementedError("nano fused_li_manage does not support sparse LI C8")
         assert self.wk_weights_proj is not None
@@ -604,13 +638,9 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
         q_li = q_li[:query_rows]
         weights = weights[:query_rows]
         if q_li.shape[1] not in (32, 64):
-            raise RuntimeError(
-                f"nano fused_li_manage expects 32 or 64 index heads, got {q_li.shape[1]}"
-            )
+            raise RuntimeError(f"nano fused_li_manage expects 32 or 64 index heads, got {q_li.shape[1]}")
         if q_li.shape[-1] != 128:
-            raise RuntimeError(
-                f"nano fused_li_manage expects head_dim=128, got {q_li.shape[-1]}"
-            )
+            raise RuntimeError(f"nano fused_li_manage expects head_dim=128, got {q_li.shape[-1]}")
 
         index_key = kv_cache[self.kv_cache_indexer_k_idx]
         block_size = manager.block_size
@@ -622,20 +652,34 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
 
         block_table = attn_metadata.block_table[:num_decodes]
         if mtp_batch is not None:
-            block_table = mtp_batch.source_block_table
+            indexer_table = getattr(attn_metadata, "indexer_block_table", None)
+            block_table = mtp_batch.source_block_table if indexer_table is None else indexer_table[:num_decodes]
             runtime = _mtp_runtime(manager)
             mapping, states, outputs = runtime.prepare_lim(
-                layer_name, mtp_batch, block_table.size(1) * block_size, q_li.device,
+                layer_name,
+                mtp_batch,
+                block_table.size(1) * block_size,
+                q_li.device,
             )
             # The pinned floating-point LIM ABI reserves scale inputs; the
             # kernel does not read their values (this is not LI C8 support).
             query_scale = torch.empty(q_li.shape[:2], dtype=torch.float32, device=q_li.device)
             key_scale = torch.empty(index_key_cache.shape[:3], dtype=torch.float32, device=q_li.device)
             torch.ops._C_ascend.npu_fused_li_manage_mtp(
-                weights.contiguous(), query_scale, q_li.contiguous(), key_scale,
-                index_key_cache.contiguous(), block_table.contiguous(),
-                mtp_batch.query_ends, mtp_batch.seq_lens, mtp_batch.offload_lens,
-                mtp_batch.cache_tokens, states, mtp_batch.pool_entries, mapping, *outputs,
+                weights.contiguous(),
+                query_scale,
+                q_li.contiguous(),
+                key_scale,
+                index_key_cache.contiguous(),
+                block_table.contiguous(),
+                mtp_batch.query_ends,
+                mtp_batch.seq_lens,
+                mtp_batch.offload_lens,
+                mtp_batch.cache_tokens,
+                states,
+                mtp_batch.pool_entries,
+                mapping,
+                *outputs,
             )
             if (
                 mtp_batch.graph_buffers is None
@@ -645,8 +689,12 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
                 manager._nano_debug_li_steps = 1
                 logger.info(
                     "generalized MTP LIM executed: layer=%s T=%s B=%s prefix=%s C=%s request_misses=%s",
-                    layer_name, query_rows, num_decodes, mtp_batch.prefix_lengths,
-                    mtp_batch.cache_sizes, outputs[-1].cpu().tolist(),
+                    layer_name,
+                    query_rows,
+                    num_decodes,
+                    mtp_batch.prefix_lengths,
+                    mtp_batch.cache_sizes,
+                    outputs[-1].cpu().tolist(),
                 )
             return outputs[0]
         _li_layer_id = manager._get_offload_layer_id(layer_name)
@@ -654,9 +702,12 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
         if _li_layer_id == 0 and manager.nano_debug_enabled() and _li_steps < 6:
             manager._nano_debug_li_steps = _li_steps + 1
             _idx = index_key_cache.detach()
-            _cand = attn_metadata.offload_seq_lengths_key[:num_decodes].detach().to(
-                device="cpu", dtype=torch.int32
-            ).tolist()
+            _cand = (
+                attn_metadata.offload_seq_lengths_key[:num_decodes]
+                .detach()
+                .to(device="cpu", dtype=torch.int32)
+                .tolist()
+            )
             _bt = block_table.detach().to(device="cpu", dtype=torch.int32).tolist()
             logger.info(
                 "nano debug li_indexer layer=%s step=%d indexer_shape=%s nz_ratio=%.4f "
@@ -722,15 +773,39 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
         attn_metadata: M,
     ):
         if _generalized_mtp_enabled():
+            if not get_ascend_config().sparse_kv_offload_config.keep_device_kv_cache:
+                if not self._is_decode_only(attn_metadata):
+                    _check_device_kv_cache_exist()
+                k_nope, k_pe = self._compute_kv_only(kv_no_split, cos, sin)
+                manager = get_sparse_kv_offload_manager()
+                k_cpu, v_cpu = self._cpu_cache_pair(manager, self._offload_layer_name())
+                manager.offload_new_kv(
+                    slot_mapping=slots,
+                    k_cache_cpu=k_cpu,
+                    v_cache_cpu=v_cpu,
+                    k_cache_npu=None,
+                    v_cache_npu=None,
+                    k=k_nope,
+                    v=k_pe,
+                    has_prefill=False,
+                    capturing=self._in_graph_runtime(),
+                )
+                return k_pe, k_nope
             # Retain a complete device cache for colocated prefill/short-batch
-            # fallback and rebuild the dense tail from it after rejection.
+            # fallback, and update the host pool used by nano's tail restore.
             result = super().exec_kv(kv_no_split, cos, sin, kv_cache, slots, attn_metadata)
             manager = get_sparse_kv_offload_manager()
             k_cpu, v_cpu = self._cpu_cache_pair(manager, self._offload_layer_name())
             manager.offload_new_kv(
-                slot_mapping=slots, k_cache_cpu=k_cpu, v_cache_cpu=v_cpu,
-                k_cache_npu=kv_cache[0], v_cache_npu=kv_cache[1], k=None, v=None,
-                has_prefill=True, capturing=self._in_graph_runtime(),
+                slot_mapping=slots,
+                k_cache_cpu=k_cpu,
+                v_cache_cpu=v_cpu,
+                k_cache_npu=kv_cache[0],
+                v_cache_npu=kv_cache[1],
+                k=None,
+                v=None,
+                has_prefill=True,
+                capturing=self._in_graph_runtime(),
             )
             return result
         if self._is_decode_only(attn_metadata):
@@ -741,9 +816,7 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
             if self._use_nano_fused_op():
                 device_slots = attn_metadata.device_slot_mapping
                 if device_slots is None:
-                    raise RuntimeError(
-                        "nano fused decode requires device_slot_mapping metadata"
-                    )
+                    raise RuntimeError("nano fused decode requires device_slot_mapping metadata")
                 token_count = device_slots.numel()
                 k_nope = k_nope[:token_count]
                 k_pe = k_pe[:token_count]
@@ -810,9 +883,7 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
             # PD-disagg D gets that one-block tail from P (not handled here).
             device_slots = attn_metadata.device_slot_mapping
             if device_slots is None:
-                raise RuntimeError(
-                    "nano colocate prefill requires device_slot_mapping for dense-tail dual-write"
-                )
+                raise RuntimeError("nano colocate prefill requires device_slot_mapping for dense-tail dual-write")
             token_count = min(int(slots.numel()), int(device_slots.numel()))
             if token_count > 0:
                 src_slots = slots.reshape(-1)[:token_count].to(dtype=torch.int64)
@@ -836,8 +907,7 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
                     if manager.nano_debug_enabled() and not manager._nano_debug_prefill_logged:
                         manager._nano_debug_prefill_logged = True
                         logger.info(
-                            "nano debug prefill dual-write layer=%s n_tail=%s "
-                            "dst_slot[0]=%s src_slot[0]=%s",
+                            "nano debug prefill dual-write layer=%s n_tail=%s dst_slot[0]=%s src_slot[0]=%s",
                             layer_name,
                             int(dst_slots.numel()),
                             int(dst_slots[0].item()),
@@ -865,9 +935,24 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
         if _generalized_mtp_enabled():
             batch = attn_metadata.mtp_batch
             if batch is None:
+                if not get_ascend_config().sparse_kv_offload_config.keep_device_kv_cache:
+                    return self._generalized_pd_fallback(
+                        ql_nope,
+                        q_pe,
+                        topk_indices,
+                        attn_metadata,
+                        manager,
+                        layer_name,
+                    )
                 return super()._execute_sparse_flash_attention_process(
-                    ql_nope, q_pe, kv_cache, topk_indices, attn_metadata,
-                    actual_seq_lengths_query, actual_seq_lengths_key, block_table=block_table,
+                    ql_nope,
+                    q_pe,
+                    kv_cache,
+                    topk_indices,
+                    attn_metadata,
+                    actual_seq_lengths_query,
+                    actual_seq_lengths_key,
+                    block_table=block_table,
                 )
             return self._pad_to_input_tokens(
                 self._generalized_mtp_copy(ql_nope, q_pe, kv_cache, manager, layer_name, batch, attn_metadata),
@@ -1014,6 +1099,49 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
         attn_output = torch.cat([decode_attn_output, prefill_attn_output], dim=0)
         return self._pad_to_input_tokens(attn_output, ql_nope.shape[0])
 
+    def _generalized_pd_fallback(self, q, q_rope, topk_indices, metadata, manager, layer_name):
+        if self._in_graph_runtime():
+            raise RuntimeError("Generalized PD short-query attention must remain eager")
+        if not self._is_decode_only(metadata):
+            _check_device_kv_cache_exist()
+        requests, tokens = metadata.num_decodes, metadata.num_decode_tokens
+        ends = metadata.cum_query_lens[:requests].to(torch.int64)
+        widths = torch.diff(ends, prepend=ends.new_zeros(1))
+        token_to_request = torch.repeat_interleave(
+            torch.arange(requests, device=q.device),
+            widths,
+            output_size=tokens,
+        )
+        visible = metadata.seq_lens[:requests].index_select(0, token_to_request) - (
+            ends.index_select(0, token_to_request) - torch.arange(tokens, device=q.device) - 1
+        )
+        selected = topk_indices[:tokens].reshape(tokens, -1)
+        if selected.shape[1] != NANO_FUSED_TOPK:
+            raise ValueError("Generalized PD fallback requires 2048 TopK entries per query")
+        # The fallback uses query rows rather than persistent request rows.
+        # Invalidate once per fallback batch in the builder before any layer
+        # overwrites the hot arena; the next fused batch must first-fill.
+        slots, table = manager.gather_nano_fallback(
+            layer_name,
+            metadata.block_table[:requests],
+            selected,
+            token_to_request,
+            visible,
+        )
+        hbm_k, hbm_v = manager.hbm_kv_pair_for_fused(layer_name)
+        output = DeviceOperator.execute_sparse_flash_attention_process(
+            self,
+            q[:tokens],
+            q_rope[:tokens],
+            (hbm_k, hbm_v),
+            slots.unsqueeze(1),
+            metadata,
+            torch.arange(1, tokens + 1, dtype=torch.int32, device=q.device),
+            torch.full((tokens,), NANO_FUSED_TOPK, dtype=torch.int32, device=q.device),
+            block_table=table,
+        )
+        return self._pad_to_input_tokens(output, q.shape[0])
+
     def _generalized_mtp_copy(self, q, q_rope, kv_cache, manager, layer_name, batch, metadata):
         if self._in_graph_runtime() and batch.graph_buffers is None:
             raise RuntimeError("Generalized MTP graph inputs were not prepared before capture")
@@ -1021,45 +1149,57 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
         src, dst, topk_misses, miss_src, miss_dst, misses = runtime.copy_metadata(batch)
         hbm_kv, hbm_rope = manager.hbm_kv_pair_for_fused(layer_name)
         dram_kv, dram_rope = manager.dram_kv_pair_for_fused(layer_name)
-        # At most two tail blocks per request; never copy the full DRAM history
-        # into HBM. Reconstruct this span each call so rejected tokens cannot
-        # leave stale draft-step tail contents.
-        for full, resident in ((kv_cache[0], hbm_kv), (kv_cache[1], hbm_rope)):
-            dim = resident.shape[-1]
-            values = full.reshape(-1, dim).index_select(0, batch.tail_sources)
-            if batch.graph_buffers is not None:
-                values = values.masked_fill(~batch.graph_buffers.tail_valid[:, None], 0)
-            resident.reshape(-1, dim).index_copy_(0, batch.tail_destinations, values)
-        if manager.tp_size > 1:
-            # Rank zero writes the shared host pool on the current stream.
-            # Match the existing prefix-copy stream ordering before GVA reads.
-            manager.tp_group.broadcast(torch.empty((), dtype=torch.int8, device=q.device), src=0)
+        # RD2H populates the CPU main pool, not nano's rank-local HBM tails.
+        # Restore only [L,S), after the current query's D2H, on every replay.
+        manager.restore_nano_tail(layer_name, batch)
         query_heads = q.shape[1]
         query, query_rope = prepare_copy_sfa_queries(
-            q[:batch.num_tokens], q_rope[:batch.num_tokens],
+            q[: batch.num_tokens],
+            q_rope[: batch.num_tokens],
         )
         out = manager.get_fused_attention_out(query)
         if batch.graph_buffers is None and manager.nano_debug_enabled() and not manager._nano_debug_decode_logged:
             logger.info(
                 "generalized MTP copy-SFA inputs: layer=%s query_shape=%s query_ends=%s "
                 "pool_rows=%s hbm_shape=%s dram_shape=%s",
-                layer_name, tuple(query.shape), batch.query_ends.cpu().tolist(),
-                batch.pool_rows, tuple(hbm_kv.shape), tuple(dram_kv.shape),
+                layer_name,
+                tuple(query.shape),
+                batch.query_ends.cpu().tolist(),
+                batch.pool_rows,
+                tuple(hbm_kv.shape),
+                tuple(dram_kv.shape),
             )
         torch.ops._C_ascend.npu_fused_copy_sfa_mtp(
-            query_rope, query, batch.query_ends,
+            query_rope,
+            query,
+            batch.query_ends,
             batch.cache_tokens + batch.seq_lens - batch.offload_lens,
-            batch.cache_tokens, dst, src, topk_misses, miss_src, miss_dst, misses,
-            batch.hbm_block_table, batch.source_block_table,
-            hbm_rope, hbm_kv, dram_rope, dram_kv, float(self.scale), out,
+            batch.cache_tokens,
+            dst,
+            src,
+            topk_misses,
+            miss_src,
+            miss_dst,
+            misses,
+            batch.hbm_block_table,
+            batch.source_block_table,
+            hbm_rope,
+            hbm_kv,
+            dram_rope,
+            dram_kv,
+            float(self.scale),
+            out,
         )
         if batch.graph_buffers is None and manager.nano_debug_enabled() and not manager._nano_debug_decode_logged:
             manager._nano_debug_decode_logged = True
             logger.info(
-                "generalized MTP copy-SFA submitted: layer=%s T=%s B=%s DRAM_device=%s "
-                "query_heads=%s kernel_heads=%s",
-                layer_name, batch.num_tokens, len(batch.pool_rows), dram_kv.device,
-                query_heads, query.shape[1],
+                "generalized MTP copy-SFA submitted: layer=%s T=%s B=%s DRAM_device=%s query_heads=%s kernel_heads=%s",
+                layer_name,
+                batch.num_tokens,
+                len(batch.pool_rows),
+                dram_kv.device,
+                query_heads,
+                query.shape[1],
             )
         return out[:, :query_heads].contiguous()
 
@@ -1093,17 +1233,12 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
         else:
             topk_src_ids, topk_dst_slots, miss_counts = manager.get_lim_output_buffers(num_decodes)
             if manager._last_lim_batch_size < num_decodes:
-                raise RuntimeError(
-                    "nano fused_copy_sfa expected fused_li_manage outputs for "
-                    f"batch_size={num_decodes}"
-                )
+                raise RuntimeError(f"nano fused_copy_sfa expected fused_li_manage outputs for batch_size={num_decodes}")
 
         q = ql_nope[:num_decode_tokens]
         q_rope = q_pe[:num_decode_tokens]
         if q.ndim != 3 or q.size(-1) != self.kv_lora_rank:
-            raise RuntimeError(
-                f"nano fused_copy_sfa expects ql_nope [B,N,{self.kv_lora_rank}], got {tuple(q.shape)}"
-            )
+            raise RuntimeError(f"nano fused_copy_sfa expects ql_nope [B,N,{self.kv_lora_rank}], got {tuple(q.shape)}")
         if q_rope.ndim != 3 or q_rope.size(-1) != self.qk_rope_head_dim:
             raise RuntimeError(
                 f"nano fused_copy_sfa expects q_pe [B,N,{self.qk_rope_head_dim}], got {tuple(q_rope.shape)}"

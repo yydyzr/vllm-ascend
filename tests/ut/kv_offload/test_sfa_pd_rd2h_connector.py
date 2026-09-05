@@ -2,7 +2,7 @@
 
 import asyncio
 import threading
-from concurrent.futures import Future
+from concurrent.futures import Future, ThreadPoolExecutor
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -31,6 +31,7 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.sfa_pd_rd2h.protocol import (  #
     READ_READY_BATCH,
     LayerMetadata,
     SendTask,
+    SfaPDConsumerMetadata,
     SfaPDProducerReqMeta,
     infer_sfa_component_group_ids,
 )
@@ -155,6 +156,7 @@ def test_batch_metaserver_dispatches_prompt_list_once():
 def _make_read_thread() -> MembPullReadThread:
     thread = MembPullReadThread.__new__(MembPullReadThread)
     thread.tp_rank = 0
+    thread._stop_event = threading.Event()
     thread._state = ConsumerReadState(
         num_blocks=16,
         tp_size=1,
@@ -541,6 +543,87 @@ def test_read_descriptor_rejects_missing_destination_blocks():
             p_indexer_block_ids=[],
             want_info=False,
         )
+
+
+def test_read_waits_for_worker_destination_registration():
+    thread = _make_read_thread()
+    thread._state.dest_blocks_by_req.clear()
+    entered_wait = threading.Event()
+    waiting_for_second_request = threading.Event()
+    real_wait = thread._stop_event.wait
+
+    def observe_wait(timeout):
+        entered_wait.set()
+        if "req-0" in thread._state.dest_blocks_by_req and "req-1" not in thread._state.dest_blocks_by_req:
+            waiting_for_second_request.set()
+        return real_wait(timeout)
+
+    with (
+        patch.object(thread._stop_event, "wait", side_effect=observe_wait),
+        ThreadPoolExecutor(max_workers=1) as executor,
+    ):
+        read = executor.submit(thread._wait_for_destination_registration, {"req-0", "req-1"}, 2.0)
+        assert entered_wait.wait(timeout=1)
+        thread._state.dest_blocks_by_req["req-0"] = ([3, 4], [8])
+        assert waiting_for_second_request.wait(timeout=1)
+        assert not read.done()
+        thread._state.dest_blocks_by_req["req-1"] = ([5, 6], [9])
+        read.result(timeout=1)
+
+
+def test_registered_destination_does_not_wait():
+    thread = _make_read_thread()
+    with patch.object(thread._stop_event, "wait", side_effect=AssertionError("unexpected wait")):
+        thread._wait_for_destination_registration({"req-0"})
+
+
+def test_delayed_worker_load_publishes_external_request_destination():
+    worker = _make_consumer_worker_for_completion_test()
+    worker.request_map.clear()
+    worker._dest_blocks_by_req.clear()
+    thread = _make_read_thread()
+    thread._state.dest_blocks_by_req = worker._dest_blocks_by_req
+    entered_wait = threading.Event()
+    real_wait = thread._stop_event.wait
+
+    def observe_wait(timeout):
+        entered_wait.set()
+        return real_wait(timeout)
+
+    metadata = SfaPDConsumerMetadata()
+    metadata.add_request("late-request-12345678", [3, 4], [8])
+    with (
+        patch.object(thread._stop_event, "wait", side_effect=observe_wait),
+        ThreadPoolExecutor(max_workers=1) as executor,
+    ):
+        read = executor.submit(thread._wait_for_destination_registration, {"late-request"}, 2.0)
+        assert entered_wait.wait(timeout=1)
+        worker.start_load_kv(metadata)
+        read.result(timeout=1)
+
+    assert worker.request_map["late-request"] == "late-request-12345678"
+    assert thread._state.dest_blocks_by_req["late-request"] == ([3, 4], [8])
+
+
+def test_destination_registration_wait_is_bounded():
+    thread = _make_read_thread()
+    with pytest.raises(RuntimeError, match="timed out waiting for destination registration"):
+        thread._wait_for_destination_registration({"missing-request"}, timeout=0)
+
+
+def test_destination_registration_wait_stops_on_shutdown():
+    thread = _make_read_thread()
+
+    def stop_while_registering(timeout):
+        thread._state.dest_blocks_by_req["missing-request"] = ([3, 4], [8])
+        thread._stop_event.set()
+        return True
+
+    with (
+        patch.object(thread._stop_event, "wait", side_effect=stop_while_registering),
+        pytest.raises(RuntimeError, match="stopped while waiting for destination registration"),
+    ):
+        thread._wait_for_destination_registration({"missing-request"})
 
 
 def test_read_descriptor_rejects_incomplete_indexer_transfer():

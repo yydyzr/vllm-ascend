@@ -8,6 +8,7 @@ import pytest
 import torch
 import torch_npu  # noqa: F401
 
+from vllm_ascend.attention.indexer import AscendSFAIndexerMetadata
 from vllm_ascend.attention.sfa_kv_offload import AscendSFAKVOffloadMetadata
 from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.generalized_mtp import (
     GeneralizedMtpRuntime,
@@ -165,3 +166,45 @@ def test_graph_step_keeps_ordinary_attention_metadata():
     graphs = MtpGraphMetadataSet(buffers.runtime, [step])
     assert graphs.steps[0]["ordinary"] is ordinary
     graphs.update([step])
+
+
+def test_graph_owns_separate_indexer_mappings_and_refreshes_them():
+    manager, source, buffers = fixture()
+    batch = make_mtp_batch(source, manager)
+    device = source.seq_lens.device
+    metadata = AscendSFAKVOffloadMetadata(
+        num_actual_tokens=8,
+        num_input_tokens=16,
+        slot_mapping=torch.arange(16, dtype=torch.int32, device=device),
+        seq_lens=source.seq_lens,
+        seq_lens_cpu=source.seq_lens.cpu(),
+        cum_query_lens=source.cum_query_lens,
+        block_table=source.block_table,
+        sin=torch.zeros(16, 64, device=device),
+        cos=torch.ones(16, 64, device=device),
+        num_decodes=2,
+        num_decode_tokens=8,
+        mtp_batch=batch,
+    )
+    indexer = AscendSFAIndexerMetadata(source.block_table + 100, metadata.slot_mapping + 50)
+    step = {"main": metadata, "indexer": indexer}
+    graphs = MtpGraphMetadataSet(buffers.runtime, [step])
+    owned = graphs.steps[0]["indexer"]
+    assert owned.block_table.data_ptr() != indexer.block_table.data_ptr()
+    pointers = [owned.block_table.data_ptr(), owned.slot_mapping.data_ptr()]
+    graphs.update([step])
+    snapshots = [torch.empty_like(owned.block_table), torch.empty_like(owned.slot_mapping)]
+    graph = torch.npu.NPUGraph()
+    with torch.npu.graph(graph):
+        snapshots[0].copy_(owned.block_table)
+        snapshots[1].copy_(owned.slot_mapping)
+    indexer.block_table.add_(17)
+    indexer.slot_mapping.add_(11)
+    graphs.update([step])
+    graph.replay()
+    torch.npu.synchronize()
+    assert pointers == [owned.block_table.data_ptr(), owned.slot_mapping.data_ptr()]
+    torch.testing.assert_close(snapshots[0][:2], indexer.block_table)
+    assert snapshots[0][2].count_nonzero().item() == 0
+    torch.testing.assert_close(snapshots[1], indexer.slot_mapping)
+    torch.testing.assert_close(graphs.steps[0]["main"].block_table[:2], batch.source_block_table)

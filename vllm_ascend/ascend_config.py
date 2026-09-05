@@ -1209,13 +1209,19 @@ class SparseKVOffloadConfig:
             raise ValueError(
                 f"fused op type: {self.fused_op_type} is not in supported op list: {self.support_fused_op_types}."
             )
-        self.generalized_mtp = self.fused_op_type == "nano" and vllm_config.speculative_config is not None
+        # True PD also uses the generalized ABI for Q=1. This lets its eager
+        # baseline exercise the same storage path before enabling speculation.
+        self.generalized_mtp = self.fused_op_type == "nano" and (
+            vllm_config.speculative_config is not None or not self.keep_device_kv_cache
+        )
         if self.generalized_mtp:
-            width = 1 + vllm_config.speculative_config.num_speculative_tokens
+            width = 1 + (
+                vllm_config.speculative_config.num_speculative_tokens
+                if vllm_config.speculative_config is not None
+                else 0
+            )
             if not 1 <= width <= 7:
                 raise ValueError("Generalized LIM supports at most six speculative tokens (seven query rows)")
-            if not self.keep_device_kv_cache:
-                raise ValueError("Generalized MTP offload requires colocate with keep_device_kv_cache")
             if not vllm_config.model_config.enforce_eager:
                 from vllm.config import CUDAGraphMode
 
