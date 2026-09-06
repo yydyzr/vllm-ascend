@@ -411,9 +411,15 @@ at concurrency 1, and 59.96 versus 56.04 at concurrency 4. Nano concurrency-4
 results varied from 50.42 to 59.17 tokens/s. These rates include the full PD
 request path. Single-request decode time per token increased from 32.10 to
 125.45 ms; at concurrency 4 it remained approximately 41 ms for both backends.
-Inactive graph rows currently use cold cache initialization on every replay,
-which is a candidate for explaining the low-concurrency overhead. Its latency
-contribution has not been isolated by profiling.
+Inactive graph rows currently use cold cache initialization on every replay.
+Subsequent C4 profiling observed a four-to-three-request transition that added
+approximately 134 ms of target LIM and first-fill kernel work on rank 0 in one
+replay. The costly first-fill behavior was present across all 16 ranks. Extra
+view/transpose-copy work also averaged 3.80 ms per rank per replay. These are
+profiling measurements, not speedups from an implemented fix. See the
+[Nano Sparse Offload Optimization Plan](../../developer_guide/performance_and_debug/nano_sparse_offload_optimization.md)
+for the evidence, inactive-row kernel changes, shared miss-buffer layout,
+head-count/DP2-TP8 discussion, and validation plan.
 
 When testing PD with MTP, enable matching MTP configuration on Prefill so its
 draft-layer KV is registered and transferred as well as the target-model KV.

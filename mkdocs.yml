@@ -317,6 +317,7 @@ nav:
         - developer_guide/performance_and_debug/index.md
         - developer_guide/performance_and_debug/performance_benchmark.md
         - developer_guide/performance_and_debug/optimization_and_tuning.md
+        - developer_guide/performance_and_debug/nano_sparse_offload_optimization.md
         - developer_guide/performance_and_debug/service_profiling_guide.md
         - developer_guide/performance_and_debug/msprobe_guide.md
   - Community:

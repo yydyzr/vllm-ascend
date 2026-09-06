@@ -26,5 +26,6 @@ Explore the design documents covering patch architecture, CPU binding, model run
 
 - **[Performance Benchmark](performance_and_debug/performance_benchmark.md)** — Benchmarking guide
 - **[Optimization and Tuning](performance_and_debug/optimization_and_tuning.md)** — Performance optimization
+- **[Nano Sparse Offload Optimization](performance_and_debug/nano_sparse_offload_optimization.md)** — Profiling findings and proposed LIM/copy-SFA improvements
 - **[Service Profiling Guide](performance_and_debug/service_profiling_guide.md)** — Service profiling
 - **[msprobe Guide](performance_and_debug/msprobe_guide.md)** — Debugging with msprobe
