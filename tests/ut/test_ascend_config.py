@@ -189,6 +189,7 @@ class TestAscendConfig(TestBase):
         self.assertFalse(ascend_config.multistream_overlap_shared_expert)
         self.assertFalse(ascend_config.enable_kv_nz)
         self.assertFalse(ascend_config.disable_mla_decode_head_pad)
+        self.assertFalse(ascend_config.enable_force_eplb)
         self.assertEqual(ascend_config.weight_nz_mode, 1)
 
         ascend_compilation_config = ascend_config.ascend_compilation_config
@@ -231,6 +232,7 @@ class TestAscendConfig(TestBase):
                 "fusion_ops_gmmswigluquant": False,
             },
             "multistream_overlap_shared_expert": True,
+            "enable_force_eplb": True,
             "eplb_config": {"num_redundant_experts": 2},
             "refresh": True,
             "enable_kv_nz": False,
@@ -240,6 +242,7 @@ class TestAscendConfig(TestBase):
         ascend_config = init_ascend_config(test_vllm_config)
         self.assertEqual(ascend_config.eplb_config.num_redundant_experts, 2)
         self.assertTrue(ascend_config.multistream_overlap_shared_expert)
+        self.assertTrue(ascend_config.enable_force_eplb)
 
         ascend_compilation_config = ascend_config.ascend_compilation_config
         self.assertFalse(ascend_compilation_config.fuse_norm_quant)
@@ -1141,6 +1144,29 @@ class TestTopLevelSwitchTypeValidation(TestBase):
 
         self.assertFalse(config.rejection_sampler_config.enable_block_verify)
         self.assertEqual(config.rejection_sampler_config.posterior_threshold, 0.8)
+
+    @_clean_up
+    @patch("vllm_ascend.platform.NPUPlatform.check_and_update_config")
+    def test_enable_force_eplb(self, mock_fix):
+        vc = VllmConfig()
+        self.assertFalse(init_ascend_config(vc).enable_force_eplb)
+
+        enabled_vc = VllmConfig()
+        enabled_vc.additional_config = {"enable_force_eplb": True}
+        self.assertTrue(init_ascend_config(enabled_vc).enable_force_eplb)
+
+    @_clean_up
+    @patch.dict(os.environ, {"DYNAMIC_EPLB": "true"}, clear=False)
+    @patch("vllm_ascend.platform.NPUPlatform.check_and_update_config")
+    def test_enable_force_eplb_rejects_dynamic_eplb(self, mock_fix):
+        vc = VllmConfig()
+        vc.model_config = SimpleNamespace(is_moe=True)
+        vc.additional_config = {
+            "enable_force_eplb": True,
+            "eplb_config": {"dynamic_eplb": True},
+        }
+        with self.assertRaisesRegex(ValueError, "cannot be mixed with dynamic_eplb"):
+            init_ascend_config(vc)
 
     @_clean_up
     @patch("vllm_ascend.platform.NPUPlatform.check_and_update_config")
