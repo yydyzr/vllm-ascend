@@ -1194,6 +1194,8 @@ class TestAscendMLAImpl(TestBase):
         # 256 is power of 2, so padding should be 0
         self.assertEqual(self.impl.num_heads_padded, 256)
         self.assertEqual(self.impl.head_padding, 0)
+        self.assertEqual(self.impl.decode_num_heads, 256)
+        self.assertEqual(self.impl.decode_head_padding, 0)
 
     @patch("vllm_ascend.attention.mla_v1.get_current_vllm_config")
     def test_init_head_padding_for_non_power_of_two(self, mock_get_current_vllm_config):
@@ -1234,6 +1236,9 @@ class TestAscendMLAImpl(TestBase):
         self.assertEqual(impl.num_heads, 20)
         self.assertEqual(impl.num_heads_padded, 32)  # next power of 2
         self.assertEqual(impl.head_padding, 12)  # 32 - 20
+        # Decode still pads by default so older CANN keeps a power-of-2 FIA shape.
+        self.assertEqual(impl.decode_num_heads, 32)
+        self.assertEqual(impl.decode_head_padding, 12)
 
     def test_q_proj_and_k_up_proj(self):
         batch_size = 4
@@ -2381,6 +2386,7 @@ class TestAscendMLAImpl(TestBase):
         # Verify num_query_heads passed to FIA is padded
         mock_npu_fused_infer_attention_score_v2.assert_called_once()
         call_kwargs = mock_npu_fused_infer_attention_score_v2.call_args.kwargs
+        self.assertEqual(call_kwargs.get("num_query_heads"), impl.decode_num_heads)
         self.assertEqual(call_kwargs.get("num_query_heads"), impl.num_heads_padded)
 
     @patch("vllm_ascend.attention.mla_v1.get_current_vllm_config")
@@ -2457,7 +2463,137 @@ class TestAscendMLAImpl(TestBase):
 
         mock_npu_fused_infer_attention_score_v2.assert_called_once()
         call_kwargs = mock_npu_fused_infer_attention_score_v2.call_args.kwargs
+        self.assertEqual(call_kwargs.get("num_query_heads"), impl.decode_num_heads)
         self.assertEqual(call_kwargs.get("num_query_heads"), impl.num_heads_padded)
+
+    @patch("vllm_ascend.attention.mla_v1.get_current_vllm_config")
+    def test_init_disable_mla_decode_head_pad(self, mock_get_current_vllm_config):
+        """disable_mla_decode_head_pad keeps decode FIA on the native head count."""
+        mock_get_current_vllm_config.return_value = MagicMock()
+        vllm_config = MagicMock()
+        vllm_config.additional_config = {"refresh": True, "disable_mla_decode_head_pad": True}
+        init_ascend_config(vllm_config)
+        kwargs = {
+            "kv_lora_rank": 32,
+            "qk_nope_head_dim": 64,
+            "qk_rope_head_dim": 32,
+            "qk_head_dim": 96,
+            "v_head_dim": 128,
+            "q_lora_rank": 64,
+            "q_proj": MagicMock(),
+            "q_b_proj": MagicMock(),
+            "kv_b_proj": MagicMock(),
+            "o_proj": MagicMock(),
+            "kv_a_proj_with_mqa": MagicMock(),
+            "fused_qkv_a_proj": MagicMock(),
+            "kv_a_layernorm": MagicMock(),
+            "rotary_emb": MagicMock(),
+            "g_proj": None,
+            "use_mla_rope": True,
+        }
+        impl = AscendMLAImpl(
+            num_heads=96,
+            head_size=1024,
+            scale=0.1,
+            num_kv_heads=96,
+            alibi_slopes=None,
+            sliding_window=None,
+            kv_cache_dtype="auto",
+            blocksparse_params=None,
+            logits_soft_cap=None,
+            attn_type=None,
+            kv_sharing_target_layer_name=None,
+            **kwargs,
+        )
+        self.assertEqual(impl.num_heads, 96)
+        self.assertEqual(impl.num_heads_padded, 128)
+        self.assertEqual(impl.head_padding, 32)
+        self.assertEqual(impl.decode_num_heads, 96)
+        self.assertEqual(impl.decode_head_padding, 0)
+
+    @patch("vllm_ascend.attention.mla_v1.get_current_vllm_config")
+    @patch("vllm_ascend.ascend_forward_context.get_forward_context")
+    @patch("torch_npu.npu_fused_infer_attention_score_v2")
+    def test_forward_decode_disable_mla_decode_head_pad(
+        self, mock_npu_fused_infer_attention_score_v2, mock_get_forward_context, mock_get_current_vllm_config
+    ):
+        """Decode FIA keeps native Q heads when disable_mla_decode_head_pad is set."""
+        mock_get_current_vllm_config.return_value = MagicMock()
+        vllm_config = MagicMock()
+        vllm_config.additional_config = {"refresh": True, "disable_mla_decode_head_pad": True}
+        init_ascend_config(vllm_config)
+        num_heads = 96
+        kwargs = {
+            "kv_lora_rank": 256,
+            "qk_nope_head_dim": 64,
+            "qk_rope_head_dim": 32,
+            "qk_head_dim": 96,
+            "v_head_dim": 128,
+            "q_lora_rank": 64,
+            "q_proj": MagicMock(),
+            "q_b_proj": MagicMock(),
+            "kv_b_proj": MagicMock(),
+            "o_proj": MagicMock(),
+            "kv_a_proj_with_mqa": MagicMock(),
+            "fused_qkv_a_proj": MagicMock(),
+            "kv_a_layernorm": MagicMock(),
+            "rotary_emb": MagicMock(),
+            "g_proj": None,
+            "use_mla_rope": True,
+        }
+        impl = AscendMLAImpl(
+            num_heads=num_heads,
+            head_size=1024,
+            scale=0.1,
+            num_kv_heads=num_heads,
+            alibi_slopes=None,
+            sliding_window=None,
+            kv_cache_dtype="auto",
+            blocksparse_params=None,
+            logits_soft_cap=None,
+            attn_type=None,
+            kv_sharing_target_layer_name=None,
+            **kwargs,
+        )
+        B = 2
+        BS = 100
+        HD = impl.v_head_dim
+        impl.spec_token_num = 1
+        impl._v_up_proj = MagicMock()
+        impl._v_up_proj.return_value = torch.randn(B, num_heads, HD)
+        q_nope = torch.randn(B, num_heads, impl.qk_nope_head_dim)
+        q_pe = torch.randn(B, num_heads, impl.qk_rope_head_dim)
+        k_nope = torch.randn(BS, num_heads, impl.kv_lora_rank)
+        k_pe = torch.randn(BS, num_heads, impl.qk_rope_head_dim)
+        attn_metadata = MagicMock()
+        attn_metadata.attn_state = AscendAttentionState.DecodeOnly
+        attn_metadata.decode = MagicMock()
+        attn_metadata.decode.actual_seq_qlen = MagicMock()
+        attn_metadata.decode.actual_seq_kvlen = MagicMock()
+        attn_metadata.decode.block_table = MagicMock()
+        impl.enable_kv_nz = False
+        impl.fa_quant_layer = False
+        impl.speculative_config = None
+
+        mock_npu_fused_infer_attention_score_v2.return_value = [
+            torch.randn(impl.decode_num_heads, B, 1, impl.kv_lora_rank),
+            None,
+        ]
+        mock_get_forward_context.return_value = MagicMock(capturing=False)
+        result = impl._forward_decode(q_nope, q_pe, k_nope, k_pe, BS, attn_metadata)
+
+        self.assertEqual(result.shape[0], B)
+        self.assertEqual(result.shape[1], num_heads)
+        self.assertEqual(result.shape[2], HD)
+        self.assertEqual(impl.decode_num_heads, num_heads)
+        self.assertEqual(impl.decode_head_padding, 0)
+
+        mock_npu_fused_infer_attention_score_v2.assert_called_once()
+        call_args = mock_npu_fused_infer_attention_score_v2.call_args
+        call_kwargs = call_args.kwargs
+        self.assertEqual(call_kwargs.get("num_query_heads"), num_heads)
+        q_nope_arg = call_args.args[0]
+        self.assertEqual(q_nope_arg.shape[1], num_heads)
 
     @patch("vllm_ascend.ascend_forward_context.get_forward_context")
     @patch("torch_npu.npu_fused_infer_attention_score_v2")

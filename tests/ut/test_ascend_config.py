@@ -188,6 +188,7 @@ class TestAscendConfig(TestBase):
         ascend_config = init_ascend_config(test_vllm_config)
         self.assertFalse(ascend_config.multistream_overlap_shared_expert)
         self.assertFalse(ascend_config.enable_kv_nz)
+        self.assertFalse(ascend_config.disable_mla_decode_head_pad)
         self.assertEqual(ascend_config.weight_nz_mode, 1)
 
         ascend_compilation_config = ascend_config.ascend_compilation_config
@@ -1140,6 +1141,16 @@ class TestTopLevelSwitchTypeValidation(TestBase):
 
         self.assertFalse(config.rejection_sampler_config.enable_block_verify)
         self.assertEqual(config.rejection_sampler_config.posterior_threshold, 0.8)
+
+    @_clean_up
+    @patch("vllm_ascend.platform.NPUPlatform.check_and_update_config")
+    def test_disable_mla_decode_head_pad(self, mock_fix):
+        vc = VllmConfig()
+        self.assertFalse(init_ascend_config(vc).disable_mla_decode_head_pad)
+
+        enabled_vc = VllmConfig()
+        enabled_vc.additional_config = {"disable_mla_decode_head_pad": True}
+        self.assertTrue(init_ascend_config(enabled_vc).disable_mla_decode_head_pad)
 
     @_clean_up
     @patch("vllm_ascend.utils.model_uses_sfa_sparse", return_value=False)

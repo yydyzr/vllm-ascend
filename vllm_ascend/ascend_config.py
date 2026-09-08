@@ -251,6 +251,7 @@ class AscendConfig:
             "enable_prefill_mc2": false,
             "multistream_overlap_shared_expert": false,
             "enable_kv_nz": false,
+            "disable_mla_decode_head_pad": false,
             "enable_mc2_hierarchy_comm": false,
             "enable_reduce_sample": false,
             "enable_dsa_cp": false,
@@ -385,6 +386,10 @@ class AscendConfig:
     enable_prefill_mc2: bool = False
     multistream_overlap_shared_expert: bool = False
     enable_kv_nz: bool = False
+    # When True, MLA decode FIA keeps the native query-head count instead of
+    # padding to the next power of 2 (e.g. 96 stays 96, not 128). Prefill is
+    # unchanged. Default False: current CANN still requires power-of-2 heads.
+    disable_mla_decode_head_pad: bool = False
     enable_mc2_hierarchy_comm: bool = False  # deprecated, will be replaced by mc2_comm_alg = "hierarchy"
     enable_reduce_sample: bool = False
     enable_dsa_cp: bool = False

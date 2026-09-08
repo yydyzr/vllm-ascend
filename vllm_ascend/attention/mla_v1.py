@@ -873,6 +873,14 @@ class AscendMLAImpl(MLAAttentionImpl):
         # next power of 2.
         self.num_heads_padded = 1 << (self.num_heads - 1).bit_length()
         self.head_padding = self.num_heads_padded - self.num_heads
+        # Decode FIA can skip that pad when CANN already accepts the native
+        # head count. Prefill still uses head_padding for the rope-concat path.
+        if ascend_config.disable_mla_decode_head_pad:
+            self.decode_num_heads = self.num_heads
+            self.decode_head_padding = 0
+        else:
+            self.decode_num_heads = self.num_heads_padded
+            self.decode_head_padding = self.head_padding
         self.mlapo_num_heads = self.num_heads
         self.mlapo_weight_quant_mode = 3
         self._mlapo_uses_native_weights = False
@@ -1513,7 +1521,9 @@ class AscendMLAImpl(MLAAttentionImpl):
         assert decode_meta is not None
         # TODO: The CANN package is expected to support num_heads that are not
         # powers of 2 in 2026 Q2. Once supported, all padding operations under
-        # `if self.head_padding > 0` in this function can be removed.
+        # `if self.decode_head_padding > 0` in this function can be removed.
+        # Until then, set additional_config.disable_mla_decode_head_pad=true
+        # when the running CANN already accepts the native head count.
         num_tokens = q_nope.size(0)
         # shape of knope/k_pe for npu graph mode should be:
         # [num_blocks, num_kv_heads, block_size, self.kv_lora_rank/self.qk_rope_head_dim]
@@ -1557,11 +1567,11 @@ class AscendMLAImpl(MLAAttentionImpl):
             # Input shape: [num_tokens, num_heads, dim]
             q_nope = q_nope.view(num_tokens, self.num_heads, -1).contiguous()
             q_pe = q_pe.view(num_tokens, self.num_heads, -1)
-            if self.head_padding > 0:
-                q_pe = F.pad(q_pe, (0, 0, 0, self.head_padding), "constant", 0)
-                q_nope = F.pad(q_nope, (0, 0, 0, self.head_padding), "constant", 0)
+            if self.decode_head_padding > 0:
+                q_pe = F.pad(q_pe, (0, 0, 0, self.decode_head_padding), "constant", 0)
+                q_nope = F.pad(q_nope, (0, 0, 0, self.decode_head_padding), "constant", 0)
             # Output shape: [num_heads, num_tokens, dim]
-            attn_output_shape = (self.num_heads_padded, num_tokens, self.kv_lora_rank)
+            attn_output_shape = (self.decode_num_heads, num_tokens, self.kv_lora_rank)
             if not attn_metadata.causal:
                 # K3's DSpark draft block is bidirectional. With FIA this is
                 # sparse_mode=0 and no mask; a default mask here would hide the
@@ -1582,20 +1592,20 @@ class AscendMLAImpl(MLAAttentionImpl):
                 input_layout = "BNSD"
                 q_nope = q_nope.view(num_tokens, self.num_heads, 1, -1).contiguous()
                 q_pe = q_pe.view(num_tokens, self.num_heads, 1, -1)
-                if self.head_padding > 0:
-                    q_pe = F.pad(q_pe, (0, 0, 0, 0, 0, self.head_padding), "constant", 0)
-                    q_nope = F.pad(q_nope, (0, 0, 0, 0, 0, self.head_padding), "constant", 0)
+                if self.decode_head_padding > 0:
+                    q_pe = F.pad(q_pe, (0, 0, 0, 0, 0, self.decode_head_padding), "constant", 0)
+                    q_nope = F.pad(q_nope, (0, 0, 0, 0, 0, self.decode_head_padding), "constant", 0)
                 dequant_scale_q_nope = dequant_scale_q_nope.view(num_tokens, self.num_heads, 1)
-                attn_output_shape = (num_tokens, self.num_heads_padded, 1, self.kv_lora_rank)
+                attn_output_shape = (num_tokens, self.decode_num_heads, 1, self.kv_lora_rank)
             else:
                 input_layout = "BSND_NBSD"
                 q_nope = q_nope.view(num_tokens, 1, self.num_heads, -1).contiguous()
                 q_pe = q_pe.view(num_tokens, 1, self.num_heads, -1).contiguous()
-                if self.head_padding > 0:
-                    q_pe = F.pad(q_pe, (0, 0, 0, self.head_padding), "constant", 0)
-                    q_nope = F.pad(q_nope, (0, 0, 0, self.head_padding), "constant", 0)
+                if self.decode_head_padding > 0:
+                    q_pe = F.pad(q_pe, (0, 0, 0, self.decode_head_padding), "constant", 0)
+                    q_nope = F.pad(q_nope, (0, 0, 0, self.decode_head_padding), "constant", 0)
                 dequant_scale_q_nope = dequant_scale_q_nope.view(num_tokens, 1, self.num_heads)
-                attn_output_shape = (self.num_heads_padded, num_tokens, 1, self.kv_lora_rank)
+                attn_output_shape = (self.decode_num_heads, num_tokens, 1, self.kv_lora_rank)
         else:
             # The output layout is set to NBSD to eliminate the need for a
             # transpose operation after attention.
@@ -1604,26 +1614,26 @@ class AscendMLAImpl(MLAAttentionImpl):
                 input_layout = "BSND_NBSD"
                 q_nope = q_nope.view(num_tokens, 1, self.num_heads, -1).contiguous()
                 q_pe = q_pe.view(num_tokens, 1, self.num_heads, -1)
-                if self.head_padding > 0:
-                    q_pe = F.pad(q_pe, (0, 0, 0, self.head_padding), "constant", 0)
-                    q_nope = F.pad(q_nope, (0, 0, 0, self.head_padding), "constant", 0)
+                if self.decode_head_padding > 0:
+                    q_pe = F.pad(q_pe, (0, 0, 0, self.decode_head_padding), "constant", 0)
+                    q_nope = F.pad(q_nope, (0, 0, 0, self.decode_head_padding), "constant", 0)
             else:
                 # Input shape: [num_tokens, num_heads, seq_len, dim]
                 input_layout = "BNSD_NBSD"
                 q_nope = q_nope.view(num_tokens, self.num_heads, 1, -1).contiguous()
                 q_pe = q_pe.view(num_tokens, self.num_heads, 1, -1)
-                if self.head_padding > 0:
-                    q_pe = F.pad(q_pe, (0, 0, 0, 0, 0, self.head_padding), "constant", 0)
-                    q_nope = F.pad(q_nope, (0, 0, 0, 0, 0, self.head_padding), "constant", 0)
+                if self.decode_head_padding > 0:
+                    q_pe = F.pad(q_pe, (0, 0, 0, 0, 0, self.decode_head_padding), "constant", 0)
+                    q_nope = F.pad(q_nope, (0, 0, 0, 0, 0, self.decode_head_padding), "constant", 0)
             # Output shape: [num_heads, num_tokens, seq_len, dim]
-            attn_output_shape = (self.num_heads_padded, num_tokens, 1, self.kv_lora_rank)
+            attn_output_shape = (self.decode_num_heads, num_tokens, 1, self.kv_lora_rank)
             sparse_mode = 0
             attn_mask = None
 
         common_kwargs = {
             "query_rope": q_pe,
             "key_rope": k_pe,
-            "num_query_heads": self.num_heads_padded,
+            "num_query_heads": self.decode_num_heads,
             "num_key_value_heads": self.num_kv_heads,
             "input_layout": input_layout,
             "atten_mask": attn_mask,
@@ -1667,7 +1677,7 @@ class AscendMLAImpl(MLAAttentionImpl):
                 weak_ref_tensors(k_nope),
                 weak_ref_tensors(q_pe),
                 weak_ref_tensors(k_pe),
-                self.num_heads_padded,
+                self.decode_num_heads,
                 self.num_kv_heads,
                 input_layout,
                 weak_ref_tensors(attn_mask) if attn_mask is not None else None,
@@ -1708,7 +1718,7 @@ class AscendMLAImpl(MLAAttentionImpl):
         else:
             attn_output, _ = torch_npu.npu_fused_infer_attention_score_v2(q_nope, k_nope, k_nope, **common_kwargs)
 
-        if self.head_padding > 0:
+        if self.decode_head_padding > 0:
             attn_output = attn_output[: self.num_heads]
         return self._v_up_proj(attn_output)
 
