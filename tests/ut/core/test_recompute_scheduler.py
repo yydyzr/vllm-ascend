@@ -24,6 +24,11 @@ from vllm.v1.kv_cache_interface import (
 )
 from vllm.v1.request import Request, RequestStatus
 
+try:
+    from vllm.v1.kv_cache_interface import MambaSpec
+except ImportError:
+    MambaSpec = None
+
 from vllm_ascend.core.recompute_scheduler import (
     RecomputeReqInfo,
     RecomputeScheduler,
@@ -125,6 +130,129 @@ def test_finish_recomputed_request_uses_normal_abort_cleanup():
             client_index=request.client_index,
         )
     ]
+
+
+def test_truncate_computed_blocks_supports_legacy_short_mamba_group():
+    if MambaSpec is None:
+        return
+    scheduler = RecomputeScheduler.__new__(RecomputeScheduler)
+    mamba_block = MagicMock()
+    attention_blocks = [MagicMock(), MagicMock()]
+    blocks = SimpleNamespace(blocks=([mamba_block], attention_blocks))
+    kv_cache_manager = SimpleNamespace(
+        truncate_computed_blocks=MagicMock(),
+        coordinator=SimpleNamespace(
+            single_type_managers=[
+                SimpleNamespace(block_size=4),
+                SimpleNamespace(block_size=4),
+            ]
+        ),
+        kv_cache_config=SimpleNamespace(
+            kv_cache_groups=[
+                SimpleNamespace(kv_cache_spec=MagicMock(spec=MambaSpec)),
+                SimpleNamespace(kv_cache_spec=MagicMock()),
+            ]
+        ),
+        create_kv_cache_blocks=MagicMock(side_effect=lambda value: value),
+    )
+    scheduler.kv_cache_manager = kv_cache_manager
+
+    truncated = scheduler._truncate_computed_blocks_for_connector(blocks, 8)
+
+    assert truncated == ([mamba_block], attention_blocks)
+    kv_cache_manager.truncate_computed_blocks.assert_not_called()
+
+
+def test_recompute_scheduler_aligns_connector_hit_to_block_boundary(monkeypatch):
+    from tests.ut.core.test_dyntra_lb_scheduler import (
+        create_dyntra_lb_scheduler,
+        make_dyntra_test_config,
+    )
+    from tests.ut.kv_offload.utils import create_request
+
+    block_size = 16
+    vllm_config = make_dyntra_test_config(block_size=block_size)
+    scheduler = create_dyntra_lb_scheduler(
+        vllm_config,
+        scheduler_cls=RecomputeScheduler,
+    )
+    request = create_request(
+        request_id=1,
+        num_tokens=block_size,
+        block_size=block_size,
+        do_remote_prefill=True,
+    )
+    scheduler.add_request(request)
+    empty_blocks = scheduler.kv_cache_manager.empty_kv_cache_blocks
+    connector_local_token_counts = []
+    truncate_calls = []
+
+    monkeypatch.setattr(
+        scheduler,
+        "_get_computed_blocks_for_connector",
+        lambda request: (empty_blocks, 5, 0, False),
+    )
+
+    def truncate_computed_blocks(blocks, num_tokens):
+        truncate_calls.append((blocks, num_tokens))
+        return empty_blocks
+
+    monkeypatch.setattr(
+        scheduler.kv_cache_manager,
+        "truncate_computed_blocks",
+        truncate_computed_blocks,
+        raising=False,
+    )
+
+    def get_num_new_matched_tokens(request, num_local_tokens):
+        connector_local_token_counts.append(num_local_tokens)
+        return 8, True
+
+    monkeypatch.setattr(
+        scheduler.connector,
+        "get_num_new_matched_tokens",
+        get_num_new_matched_tokens,
+    )
+
+    scheduler.schedule()
+
+    assert connector_local_token_counts == [0]
+    assert truncate_calls == [(empty_blocks, 0)]
+    assert request.num_computed_tokens == 8
+    assert request.status == RequestStatus.WAITING_FOR_REMOTE_KVS
+
+
+def test_recompute_scheduler_does_not_resume_deliverable_stale_output():
+    from tests.ut.core.test_dyntra_lb_scheduler import (
+        create_dyntra_lb_scheduler,
+        make_dyntra_test_config,
+    )
+    from tests.ut.kv_offload.utils import create_model_runner_output, create_request
+
+    vllm_config = make_dyntra_test_config()
+    scheduler = create_dyntra_lb_scheduler(
+        vllm_config,
+        scheduler_cls=RecomputeScheduler,
+    )
+    request = create_request(request_id=1)
+    scheduler.add_request(request)
+    first_output = scheduler.schedule()
+    scheduler.update_from_output(
+        first_output,
+        create_model_runner_output([request]),
+    )
+
+    scheduler.running.remove(request)
+    request.status = RequestStatus.WAITING
+    request.num_stale_output_tokens = 1
+    request.drop_stale_output = False
+    scheduler.waiting.prepend_request(request)
+
+    skipped_output = scheduler.schedule()
+
+    assert request.request_id not in skipped_output.num_scheduled_tokens
+    assert request in scheduler.skipped_waiting
+    assert request not in scheduler.running
 
 
 def test_dsv4_decode_node_observes_real_dense_local_cache_hit():
