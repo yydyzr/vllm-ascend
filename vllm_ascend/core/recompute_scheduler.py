@@ -1233,12 +1233,12 @@ class RecomputeScheduler(Scheduler):
             generated_token_ids = sampled_token_ids[req_index] if sampled_token_ids else []
 
             scheduled_spec_token_ids = scheduler_output.scheduled_spec_decode_tokens.get(req_id)
+            # vLLM 0.27.1 dropped Request.async_tokens_to_discard in favor of
+            # num_stale_output_tokens. getattr keeps the old skip on v0.26.
             spec_stats_eligible = scheduled_spec_token_ids and (
                 generated_token_ids or self.num_sampled_tokens_per_step == 0
             )
-            if spec_stats_eligible and (
-                hasattr(request, "num_stale_output_tokens") or request.async_tokens_to_discard == 0
-            ):
+            if spec_stats_eligible and getattr(request, "async_tokens_to_discard", 0) == 0:
                 num_draft_tokens = len(scheduled_spec_token_ids)
                 num_sampled = self.num_sampled_tokens_per_step
                 num_accepted = max(len(generated_token_ids) - num_sampled, 0)
