@@ -35,6 +35,47 @@ from vllm_ascend.core.recompute_scheduler import (
 )
 
 
+def test_drop_stale_output_on_d_node_without_requires_kv_delivery():
+    scheduler = RecomputeScheduler.__new__(RecomputeScheduler)
+    scheduler.requires_kv_delivery = False
+    scheduler.vllm_config = SimpleNamespace(
+        kv_transfer_config=SimpleNamespace(is_kv_consumer=True, is_kv_producer=False)
+    )
+
+    assert scheduler._drop_stale_output_on_preempt() is True
+
+
+def test_unschedule_preempted_running_request_restores_budget():
+    scheduler = RecomputeScheduler.__new__(RecomputeScheduler)
+    request = Request(
+        request_id="already-scheduled",
+        prompt_token_ids=[1, 2, 3, 4],
+        sampling_params=SamplingParams(max_tokens=8),
+        pooling_params=None,
+    )
+    scheduled_running_reqs = [request]
+    num_scheduled_tokens = {request.request_id: 2}
+    req_to_new_blocks = {request.request_id: object()}
+    scheduled_spec_decode_tokens = {request.request_id: [9]}
+    scheduled_encoder_inputs: dict[str, list[int]] = {}
+
+    encoder_budget = scheduler._unschedule_preempted_running_request(
+        request,
+        scheduled_running_reqs,
+        num_scheduled_tokens,
+        req_to_new_blocks,
+        scheduled_spec_decode_tokens,
+        scheduled_encoder_inputs,
+        encoder_compute_budget=3,
+    )
+
+    assert encoder_budget == 3
+    assert scheduled_running_reqs == []
+    assert num_scheduled_tokens == {}
+    assert req_to_new_blocks == {}
+    assert scheduled_spec_decode_tokens == {}
+
+
 def test_add_request_does_not_inject_placeholder_spec_tokens():
     scheduler = RecomputeScheduler.__new__(RecomputeScheduler)
     scheduler.requests = {}

@@ -458,3 +458,61 @@ def test_is_pd_decode_recompute_scheduler_enabled_decode_consumer_disabled():
     ascend_config.scheduler_config.recompute_scheduler_enable = False
     with mock.patch("vllm_ascend.utils.get_ascend_config", return_value=ascend_config):
         assert utils.is_pd_decode_recompute_scheduler_enabled(vllm_config) is False
+
+
+def test_recompute_enable_does_not_skip_dp_allreduce_when_tokens_must_match():
+    vllm_config = mock.MagicMock()
+    vllm_config.kv_transfer_config = mock.MagicMock()
+    vllm_config.kv_transfer_config.is_kv_consumer = True
+    vllm_config.compilation_config.cudagraph_mode.separate_routine.return_value = True
+    vllm_config.scheduler_config.max_num_batched_tokens = 4096
+
+    ascend_config = mock.MagicMock()
+    ascend_config.scheduler_config.recompute_scheduler_enable = True
+    ascend_config.enable_shared_expert_dp = False
+    ascend_config.finegrained_tp_config.oproj_tensor_parallel_size = 0
+    ascend_config.finegrained_tp_config.embedding_tensor_parallel_size = 0
+    ascend_config.sparse_kv_offload_config.enabled = True
+    ascend_config.sparse_kv_offload_config.generalized_mtp = True
+
+    with (
+        mock.patch("vllm_ascend.utils.is_hierarchical_communication_enabled", return_value=False),
+        mock.patch("vllm_ascend.utils.enable_sp", return_value=False),
+        mock.patch("vllm_ascend.utils.get_ascend_config", return_value=ascend_config),
+        mock.patch("vllm_ascend.utils.is_moe_model", return_value=True),
+    ):
+        assert utils._dp_ranks_must_share_token_count(vllm_config) is True
+        assert utils.should_skip_allreduce_across_dp_group(vllm_config) is False
+
+
+def test_recompute_enable_is_not_enough_to_skip_dp_allreduce(monkeypatch):
+    vllm_config = mock.MagicMock()
+    vllm_config.kv_transfer_config = mock.MagicMock()
+    vllm_config.kv_transfer_config.is_kv_consumer = True
+    vllm_config.compilation_config.cudagraph_mode.separate_routine.return_value = True
+    vllm_config.scheduler_config.max_num_batched_tokens = 4096
+
+    ascend_config = mock.MagicMock()
+    ascend_config.scheduler_config.recompute_scheduler_enable = True
+    ascend_config.enable_shared_expert_dp = False
+    ascend_config.finegrained_tp_config.oproj_tensor_parallel_size = 0
+    ascend_config.finegrained_tp_config.embedding_tensor_parallel_size = 0
+    ascend_config.sparse_kv_offload_config.enabled = False
+    ascend_config.sparse_kv_offload_config.generalized_mtp = False
+
+    class _FakeMoE:
+        MC2 = object()
+        FUSED_MC2 = object()
+
+    def fake_select(num_tokens, _vllm_config):
+        return _FakeMoE.MC2 if num_tokens <= 64 else object()
+
+    monkeypatch.setattr("vllm_ascend.utils.is_hierarchical_communication_enabled", lambda: False)
+    monkeypatch.setattr("vllm_ascend.utils.enable_sp", lambda _cfg=None: False)
+    monkeypatch.setattr("vllm_ascend.utils.get_ascend_config", lambda: ascend_config)
+    monkeypatch.setattr("vllm_ascend.utils.is_moe_model", lambda _cfg: True)
+    monkeypatch.setattr("vllm_ascend.utils.get_potential_max_tokens", lambda: 16)
+    monkeypatch.setattr("vllm_ascend.ascend_forward_context.select_moe_comm_method", fake_select)
+    monkeypatch.setattr("vllm_ascend.ops.fused_moe.moe_comm_method.MoECommType", _FakeMoE)
+
+    assert utils.should_skip_allreduce_across_dp_group(vllm_config) is False

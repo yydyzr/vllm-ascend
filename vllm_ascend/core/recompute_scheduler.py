@@ -216,7 +216,35 @@ class RecomputeScheduler(Scheduler):
             parent(request, timestamp)
 
     def _drop_stale_output_on_preempt(self) -> bool:
-        return bool(getattr(self, "requires_kv_delivery", False))
+        if getattr(self, "requires_kv_delivery", False):
+            return True
+        # vLLM 0.27.1 may not set requires_kv_delivery on this scheduler.
+        # D-node KV consumers still must drop in-flight tokens after preempt,
+        # otherwise WAITING requests with stale output are skipped forever.
+        transfer_config = getattr(self.vllm_config, "kv_transfer_config", None)
+        return bool(transfer_config is not None and getattr(transfer_config, "is_kv_consumer", False))
+
+    def _unschedule_preempted_running_request(
+        self,
+        preempted_req: Request,
+        scheduled_running_reqs: list[Request],
+        num_scheduled_tokens: dict[str, int],
+        req_to_new_blocks: dict[str, KVCacheBlocks],
+        scheduled_spec_decode_tokens: dict[str, list[int]],
+        scheduled_encoder_inputs: dict[str, list[int]],
+        encoder_compute_budget: int,
+    ) -> int:
+        if preempted_req not in scheduled_running_reqs:
+            return encoder_compute_budget
+        preempted_req_id = preempted_req.request_id
+        scheduled_running_reqs.remove(preempted_req)
+        num_scheduled_tokens.pop(preempted_req_id, None)
+        req_to_new_blocks.pop(preempted_req_id, None)
+        scheduled_spec_decode_tokens.pop(preempted_req_id, None)
+        preempted_encoder_inputs = scheduled_encoder_inputs.pop(preempted_req_id, None)
+        if preempted_encoder_inputs:
+            encoder_compute_budget += sum(preempted_req.get_num_encoder_embeds(i) for i in preempted_encoder_inputs)
+        return encoder_compute_budget
 
     # delta for dyntra_lb: provide an overridable no-op hook for applying a cross-rank plan.
     def _apply_load_balance_modifications(self) -> None:
@@ -432,20 +460,19 @@ class RecomputeScheduler(Scheduler):
                         del self.running[victim_index]
                         if victim_index < req_index:
                             req_index -= 1
-                        if preempted_req in scheduled_running_reqs:
-                            preempted_req_id = preempted_req.request_id
-                            scheduled_running_reqs.remove(preempted_req)
-                            token_budget += num_scheduled_tokens.pop(preempted_req_id)
-                            req_to_new_blocks.pop(preempted_req_id)
-                            scheduled_spec_decode_tokens.pop(preempted_req_id, None)
-                            preempted_encoder_inputs = scheduled_encoder_inputs.pop(preempted_req_id, None)
-                            if preempted_encoder_inputs:
-                                num_embeds_to_restore = sum(
-                                    preempted_req.get_num_encoder_embeds(i) for i in preempted_encoder_inputs
-                                )
-                                encoder_compute_budget += num_embeds_to_restore
                     else:
                         preempted_req = self.running.pop()
+                    if preempted_req in scheduled_running_reqs:
+                        token_budget += num_scheduled_tokens.get(preempted_req.request_id, 0)
+                    encoder_compute_budget = self._unschedule_preempted_running_request(
+                        preempted_req,
+                        scheduled_running_reqs,
+                        num_scheduled_tokens,
+                        req_to_new_blocks,
+                        scheduled_spec_decode_tokens,
+                        scheduled_encoder_inputs,
+                        encoder_compute_budget,
+                    )
 
                     transfer_config = self.vllm_config.kv_transfer_config
                     drop_stale_output = self._drop_stale_output_on_preempt()
@@ -469,7 +496,7 @@ class RecomputeScheduler(Scheduler):
                                 )
                             )
                         if offloaded:
-                            logger.info(
+                            logger.debug(
                                 "[RecomputeScheduler] Recompute preemption offload "
                                 "enabled for request %s, computed_tokens=%d.",
                                 recomputed_req_id,
@@ -489,7 +516,7 @@ class RecomputeScheduler(Scheduler):
                             )
                             preempted_reqs.append(recomputed_req)
                         else:
-                            logger.info(
+                            logger.debug(
                                 "[RecomputeScheduler] Recompute preemption falls back "
                                 "without offload for request %s, computed_tokens=%d.",
                                 recomputed_req_id,
@@ -508,7 +535,7 @@ class RecomputeScheduler(Scheduler):
                             drop_stale_output=drop_stale_output,
                         )
                         preempted_reqs.append(preempted_req)
-                        logger.info(
+                        logger.debug(
                             "[RecomputeScheduler] Preempted request %s. running_count=%s, token_budget=%s",
                             preempted_req.request_id,
                             len(self.running),
