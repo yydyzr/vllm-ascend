@@ -1113,13 +1113,47 @@ def get_potential_max_tokens() -> int:
     return _potential_max_tokens
 
 
+def _dp_ranks_must_share_token_count(vllm_config: VllmConfig) -> bool:
+    """True when a cross-DP collective cannot tolerate per-rank token mismatch.
+
+    RecomputeScheduler itself does not make token counts uniform. Using
+    ``recompute_scheduler_enable`` to skip the DP all-reduce leaves an empty
+    rank at 1 (or 1+K) tokens while a busy rank stays at its graph size.
+    FlashComm1, shared-expert DP, nano FULL dummy replay, and fine-grained
+    o_proj/embedding TP then deadlock or fall back to eager.
+    """
+    if enable_sp(vllm_config):
+        return True
+    try:
+        ascend_config = get_ascend_config()
+    except Exception:
+        return False
+    finegrained = getattr(ascend_config, "finegrained_tp_config", None)
+    if finegrained is not None and (
+        getattr(finegrained, "oproj_tensor_parallel_size", 0) > 0
+        or getattr(finegrained, "embedding_tensor_parallel_size", 0) > 0
+    ):
+        return True
+    if getattr(ascend_config, "enable_shared_expert_dp", False):
+        return True
+    offload = getattr(ascend_config, "sparse_kv_offload_config", None)
+    return bool(
+        offload is not None and getattr(offload, "enabled", False) and getattr(offload, "generalized_mtp", False)
+    )
+
+
 def should_skip_allreduce_across_dp_group(vllm_config: VllmConfig, is_draft_model: bool = False) -> bool:
     """Decide whether to skip the all-reduce across the DP group.
 
     Skipping is applicable for all dense models and for moe models only on ranks
-    that act as KV consumers. We skip the DP all-reduce when either:
-    - Both the prefill and decode communication methods are MC2 (or FUSED_MC2), or
-    - Decode requires MC2 and ascend_config.scheduler_config.recompute_scheduler_enable is True.
+    that act as KV consumers. We skip the DP all-reduce only when both the
+    prefill and decode communication methods are MC2 (or FUSED_MC2) and no
+    remaining collective requires uniform token counts.
+
+    ``recompute_scheduler_enable`` is intentionally not a skip trigger. That
+    flag only recomputes the last prompt token on D-nodes; it does not balance
+    dummy-rank graph sizes. Treating it as a skip made empty DP ranks keep
+    size 1 while busy ranks replay a larger FULL graph.
 
     Skipping means each rank may have a different number of tokens, so MC2 needs
     a non-zero global_bs and must NOT receive mc2_mask.
@@ -1132,6 +1166,8 @@ def should_skip_allreduce_across_dp_group(vllm_config: VllmConfig, is_draft_mode
     this is cheap and avoids id-reuse / stale-cache / init-ordering hazards.
     """
     if is_hierarchical_communication_enabled():
+        return False
+    if _dp_ranks_must_share_token_count(vllm_config):
         return False
 
     # For dense models, since we don't actually need dp communication, we simply skip it.
@@ -1161,9 +1197,7 @@ def should_skip_allreduce_across_dp_group(vllm_config: VllmConfig, is_draft_mode
     prefill_must_use_mc2 = needs_mc2(scheduler_config.max_num_batched_tokens)
     uniform_cudagraph_mode = not vllm_config.compilation_config.cudagraph_mode.separate_routine()
     chunked_prefill_can_skip = prefill_must_use_mc2 and uniform_cudagraph_mode
-    return decode_can_skip and (
-        chunked_prefill_can_skip or get_ascend_config().scheduler_config.recompute_scheduler_enable
-    )
+    return decode_can_skip and chunked_prefill_can_skip
 
 
 def has_layer_idx(model_instance: torch.nn.Module) -> bool:
