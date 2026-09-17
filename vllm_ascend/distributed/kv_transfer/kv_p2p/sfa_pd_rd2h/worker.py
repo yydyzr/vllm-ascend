@@ -44,6 +44,7 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.sfa_pd_rd2h.send_thread import (
     MembPullSendingThread,
     ProducerSendState,
 )
+from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.nano_topk_slots import NANO_RING_TOKENS
 from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.sparse_kv_offload_manager import (
     get_sparse_kv_offload_manager,
 )
@@ -219,6 +220,7 @@ class SFAPDRD2HConsumerWorker:
                             pool_slot=int(pool_slot),
                             tail_tokens=tail_tokens,
                             tail_block_index=int(getattr(req, "tail_block_index", 0) or 0),
+                            kv_tokens=int(getattr(req, "kv_tokens", 0) or 0),
                         )
 
     def save_kv_layer(
@@ -324,6 +326,16 @@ class SFAPDRD2HConsumerWorker:
         result = self._invalid_block_ids
         self._invalid_block_ids = set()
         return result
+
+    def get_nano_tails_pending_restore(self) -> set[str]:
+        """Internal req ids whose expected tail D2D never submitted a descriptor."""
+        pending: set[str] = set()
+        for ext_id, dest in getattr(self, "_nano_tail_by_req", {}).items():
+            if dest.tail_tokens > 0 and not dest.copied:
+                req_id = self.request_map.get(ext_id)
+                if req_id is not None:
+                    pending.add(req_id)
+        return pending
 
     def get_num_cpu_blocks(self, req_ids: list[str]) -> dict[str, int] | None:
         """Per-req actual main-MLA CPU-block count for the solution-1 threshold."""
@@ -473,13 +485,14 @@ class SFAPDRD2HConsumerWorker:
             raise RuntimeError("nano PD tail D2D requires registered topk buffers")
         self._topk_k_bases = [int(tensor.data_ptr()) for tensor in topk_k]
         self._topk_v_bases = [int(tensor.data_ptr()) for tensor in topk_v]
+        # Spec page size is only for P-block addressing / token-byte math.
         self._nano_block_size = int(manager.block_size)
         self._topk_row_tokens = int(topk_k[0].shape[1])
-        self._topk_hot_tokens = self._topk_row_tokens - 2 * self._nano_block_size
+        self._topk_hot_tokens = self._topk_row_tokens - NANO_RING_TOKENS
         if self._topk_hot_tokens <= 0:
             raise RuntimeError(
                 "nano topk row is missing circular tail slots: "
-                f"row_tokens={self._topk_row_tokens}, block_size={self._nano_block_size}"
+                f"row_tokens={self._topk_row_tokens}, ring={NANO_RING_TOKENS}"
             )
 
     def shutdown(self) -> None:

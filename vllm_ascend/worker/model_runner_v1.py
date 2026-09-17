@@ -3264,6 +3264,15 @@ class NPUModelRunner(GPUModelRunner):
             return {}
         return getter() or {}
 
+    def _nano_tails_pending_d2d_restore(self) -> set[str]:
+        if not has_kv_transfer_group():
+            return set()
+        connector = get_kv_transfer_group()
+        getter = getattr(connector, "get_nano_tails_pending_restore", None)
+        if getter is None:
+            return set()
+        return set(getter() or ())
+
     def _prepare_nano_request_slots(self, num_reqs: int, padded_reqs: int, *, dummy: bool) -> None:
         if self._offload_pool_slots is None:
             return
@@ -3285,12 +3294,16 @@ class NPUModelRunner(GPUModelRunner):
             }
             used = set(self._offload_request_slots.values()) | set(prebound.values())
             available = iter(slot for slot in range(capacity) if slot not in used)
+            pending_d2d_restore = self._nano_tails_pending_d2d_restore()
             for row, req in enumerate(self.input_batch.req_ids[:num_reqs]):
                 if req not in self._offload_request_slots:
                     slot = prebound[req] if req in prebound else next(available)
                     self._offload_request_slots[req] = slot
                     self._offload_slot_generation += 1
                     self._offload_slot_generations[slot] = self._offload_slot_generation
+                if req in pending_d2d_restore:
+                    # D2D was supposed to fill this tail but never submitted.
+                    self._nano_need_eager_tail_restore = True
                 slot = self._offload_request_slots[req]
                 slots[row] = slot
                 generations[row] = self._offload_slot_generations[slot]

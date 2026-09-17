@@ -179,6 +179,8 @@ def test_runner_pool_ownership_survives_compaction_and_dummy_run():
     runner._offload_slot_generation = 0
     runner._offload_slot_generations = {}
     runner.input_batch = SimpleNamespace(req_ids=["a", "b"], req_id_to_index={"a": 0, "b": 1})
+    runner._prebound_nano_slots = lambda: {}
+    runner._nano_tails_pending_d2d_restore = lambda: set()
     runner._prepare_nano_request_slots(2, 3, dummy=False)
     assert runner._offload_pool_slots.np[:3].tolist() == [0, 1, 6]
     assert runner._offload_pool_generations.np[:3].tolist() == [1, 2, -1]

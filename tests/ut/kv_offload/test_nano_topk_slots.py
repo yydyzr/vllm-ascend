@@ -4,8 +4,10 @@
 import pytest
 
 from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.nano_topk_slots import (
+    NANO_RING_TOKENS,
     NanoTopkSlotAllocator,
     nano_pool_capacity,
+    nano_tail_device_token,
     nano_tail_geometry,
 )
 
@@ -20,8 +22,24 @@ def test_nano_tail_geometry_skips_aligned_prefix():
 
 
 def test_nano_tail_geometry_keeps_incomplete_last_block():
-    assert nano_tail_geometry(10367, 128) == (127, 80)
-    assert nano_tail_geometry(129, 128) == (1, 1)
+    assert nano_tail_geometry(10367) == (127, 80)
+    assert nano_tail_geometry(129) == (1, 1)
+
+
+def test_nano_tail_device_token_matches_restore_dst():
+    # Same numbers as sfa_kv_offload metadata: prefix=10240, pool=1, topk=8192.
+    tail_tokens, tail_block = nano_tail_geometry(10367)
+    assert (tail_tokens, tail_block) == (127, 80)
+    hot = 8192
+    row = hot + NANO_RING_TOKENS
+    # restore: pool * (topk/128+2)*128 + hot + (80%2)*128
+    assert nano_tail_device_token(1, tail_block, row, hot) == 1 * row + hot
+    assert nano_tail_device_token(0, 81, row, hot) == hot + 128
+
+
+def test_nano_tail_device_token_rejects_non_ring_row():
+    with pytest.raises(ValueError, match="circular suffix"):
+        nano_tail_device_token(1, 0, 256, 128)
 
 
 def test_nano_slot_allocator_reuses_and_releases():

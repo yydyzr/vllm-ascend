@@ -4,6 +4,11 @@
 from __future__ import annotations
 
 NANO_POOL_PADDING_ROWS = 2
+# Attention / restore / exec_kv all hardcode this kernel page. PD D2D must
+# use the same units even if the paged cache spec uses another block size.
+NANO_KERNEL_BLOCK_SIZE = 128
+NANO_RING_BLOCKS = 2
+NANO_RING_TOKENS = NANO_KERNEL_BLOCK_SIZE * NANO_RING_BLOCKS
 
 
 def nano_pool_capacity(max_num_seqs: int) -> int:
@@ -11,11 +16,12 @@ def nano_pool_capacity(max_num_seqs: int) -> int:
     return max_num_seqs + NANO_POOL_PADDING_ROWS
 
 
-def nano_tail_geometry(kv_tokens: int, block_size: int) -> tuple[int, int]:
+def nano_tail_geometry(kv_tokens: int, block_size: int = NANO_KERNEL_BLOCK_SIZE) -> tuple[int, int]:
     """Return ``(tail_tokens, tail_block_index)`` for a finished prefill prefix.
 
-    The circular tail only stores the incomplete last block. A 128-aligned
-    prefix has nothing to prefetch.
+    ``block_size`` must be the nano kernel page (128). The circular tail only
+    stores the incomplete last 128-token block. A 128-aligned prefix has
+    nothing to prefetch.
     """
     if kv_tokens <= 0 or block_size <= 0:
         return 0, 0
@@ -23,6 +29,27 @@ def nano_tail_geometry(kv_tokens: int, block_size: int) -> tuple[int, int]:
     if tail_tokens == 0:
         return 0, 0
     return tail_tokens, kv_tokens // block_size
+
+
+def nano_tail_device_token(
+    pool_slot: int,
+    tail_block_index: int,
+    row_tokens: int,
+    hot_tokens: int,
+) -> int:
+    """Flattened token index of the circular-tail page restore writes to.
+
+    Must match ``sfa_kv_offload``::
+
+        pool * stride_blocks * 128 + hot_tokens + (tail_block % 2) * 128
+    """
+    if row_tokens != hot_tokens + NANO_RING_TOKENS:
+        raise ValueError(
+            "nano tail dest is not the 2-page circular suffix: "
+            f"row_tokens={row_tokens}, hot_tokens={hot_tokens}, ring={NANO_RING_TOKENS}"
+        )
+    ring_offset = (tail_block_index % NANO_RING_BLOCKS) * NANO_KERNEL_BLOCK_SIZE
+    return pool_slot * row_tokens + hot_tokens + ring_offset
 
 
 class NanoTopkSlotAllocator:

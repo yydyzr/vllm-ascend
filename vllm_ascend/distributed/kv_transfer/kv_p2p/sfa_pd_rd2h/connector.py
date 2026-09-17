@@ -223,6 +223,14 @@ class SfaRemoteD2HConnector(KVConnectorBase_V1, SupportsHMA):
             return {}
         return dict(getattr(worker, "nano_slots_by_req", {}))
 
+    def get_nano_tails_pending_restore(self) -> set[str]:
+        """Requests whose PD tail D2D did not submit any descriptor."""
+        worker = self.connector_worker
+        getter = getattr(worker, "get_nano_tails_pending_restore", None)
+        if getter is None:
+            return set()
+        return set(getter() or ())
+
     # Phase 3: real per-req CPU-block count for the solution-1 threshold.
     def get_num_cpu_blocks(self, req_ids: list[str]) -> dict[str, int] | None:
         if self.connector_worker is None:

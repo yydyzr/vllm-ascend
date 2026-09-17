@@ -162,6 +162,8 @@ class NanoTailDest:
     pool_slot: int
     tail_tokens: int
     tail_block_index: int
+    kv_tokens: int = 0
+    copied: bool = False
 
 
 class SfaPDConsumerMetadata(KVConnectorMetadata):

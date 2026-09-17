@@ -26,6 +26,10 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.sfa_pd_rd2h.protocol import (
     SFAPD_PROTOCOL_VERSION,
     NanoTailDest,
 )
+from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.nano_topk_slots import (
+    NANO_KERNEL_BLOCK_SIZE,
+    nano_tail_device_token,
+)
 
 READ_THREAD_POLL_TIMEOUT_MS = 100
 THREAD_SHUTDOWN_TIMEOUT_SECONDS = 5.0
@@ -511,11 +515,37 @@ class MembPullReadThread(threading.Thread):
         if tail is None or tail.tail_tokens <= 0:
             return
         if not state.topk_k_bases or not state.topk_v_bases:
+            logger.warning(
+                "MembPull nano tail D2D skipped, topk bases missing: req=%s layer=%s",
+                ext_req_id,
+                layer.get("layer_name"),
+            )
             return
         if state.block_size <= 0 or state.topk_row_tokens <= 0:
+            logger.warning(
+                "MembPull nano tail D2D skipped, invalid geometry: req=%s "
+                "block_size=%s row_tokens=%s",
+                ext_req_id,
+                state.block_size,
+                state.topk_row_tokens,
+            )
             return
-        local_idx = tail.tail_block_index - main_start_block
+        # P's block list is in spec-page units. Nano dest/ring is always 128.
+        kv_tokens = tail.kv_tokens or (
+            tail.tail_block_index * NANO_KERNEL_BLOCK_SIZE + tail.tail_tokens
+        )
+        p_block_index = kv_tokens // state.block_size
+        local_idx = p_block_index - main_start_block
         if local_idx < 0 or local_idx >= len(p_main_block_ids):
+            logger.debug(
+                "MembPull nano tail D2D not in this chunk: req=%s "
+                "p_block=%d start=%d chunk_blocks=%d tail_tokens=%d",
+                ext_req_id,
+                p_block_index,
+                main_start_block,
+                len(p_main_block_ids),
+                tail.tail_tokens,
+            )
             return
         offload_id = layer["offload_id"]
         if offload_id >= len(state.topk_k_bases) or offload_id >= len(state.topk_v_bases):
@@ -531,8 +561,12 @@ class MembPullReadThread(threading.Thread):
             )
         token_bytes_k = p_k_len // state.block_size
         token_bytes_v = p_v_len // state.block_size
-        ring_offset = (tail.tail_block_index % 2) * state.block_size
-        dst_token = tail.pool_slot * state.topk_row_tokens + state.topk_hot_tokens + ring_offset
+        dst_token = nano_tail_device_token(
+            tail.pool_slot,
+            tail.tail_block_index,
+            state.topk_row_tokens,
+            state.topk_hot_tokens,
+        )
         p_block_id = int(p_main_block_ids[local_idx])
         peer = np.array(
             [
@@ -555,6 +589,7 @@ class MembPullReadThread(threading.Thread):
         peer_chunks.append(peer)
         local_chunks.append(local)
         length_chunks.append(length)
+        tail.copied = True
 
     def _build_req_descriptors(
         self,

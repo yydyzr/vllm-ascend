@@ -305,6 +305,9 @@ class AscendSFAKVOffloadMetadataBuilder(AscendSFAMetadataBuilder):
             metadata.nano_copy_dst_offsets = self.nano_copy_dst_offsets[draft_index, :descriptor_count]
             metadata.nano_copy_lengths = self.nano_copy_lengths[draft_index, :descriptor_count]
             metadata.nano_copy_count = self.nano_copy_count[draft_index]
+            # PD decode captures without graph H2D. The pull path must D2D the
+            # last incomplete main block into this same circular destination;
+            # prefix rollback still eager-restores from the host pool.
             metadata.nano_skip_tail_restore = self.is_pd_decode_consumer
             tokens = common_attn_metadata.num_input_tokens
             positions = self.nano_token_positions[:tokens]

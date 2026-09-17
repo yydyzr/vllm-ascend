@@ -1517,6 +1517,7 @@ def test_consumer_worker_records_nano_slot_for_runner():
                 pool_slot=3,
                 tail_tokens=7,
                 tail_block_index=4,
+                kv_tokens=519,
             )
         ]
     )
@@ -1528,6 +1529,9 @@ def test_consumer_worker_records_nano_slot_for_runner():
     assert dest.pool_slot == 3
     assert dest.tail_tokens == 7
     assert dest.tail_block_index == 4
+    assert dest.kv_tokens == 519
+    assert dest.copied is False
+    assert worker.get_nano_tails_pending_restore() == {"req-tail-internal"}
 
 
 def test_connector_exposes_nano_slot_bindings():
@@ -1544,7 +1548,7 @@ def _make_tail_read_thread(*, tp_rank: int = 0, tp_size: int = 1) -> MembPullRea
     thread._state.nano_tail_by_req["req-0"] = NanoTailDest(pool_slot=1, tail_tokens=3, tail_block_index=0)
     thread._state.topk_k_bases = [100_000]
     thread._state.topk_v_bases = [200_000]
-    thread._state.topk_row_tokens = 256
+    thread._state.topk_row_tokens = 384
     thread._state.topk_hot_tokens = 128
     thread._state.block_size = 128
     return thread
@@ -1564,10 +1568,11 @@ def test_nano_tail_d2d_appends_to_every_decode_rank():
         want_info=False,
     )
 
-    # dst_token = slot 1 * 256 + 128 + 0 = 384
-    assert local == [100_000 + 384 * 10, 200_000 + 384 * 20]
+    # dst_token = slot 1 * 384 + 128 + 0 = 512
+    assert local == [100_000 + 512 * 10, 200_000 + 512 * 20]
     assert peer == [1000 + 5 * 1280, 2000 + 5 * 2560]
     assert lengths == [3 * 10, 3 * 20]
+    assert thread._state.nano_tail_by_req["req-0"].copied is True
 
 
 def test_nano_tail_d2d_skips_when_last_block_is_not_in_chunk():
@@ -1590,4 +1595,5 @@ def test_nano_tail_d2d_skips_when_last_block_is_not_in_chunk():
     assert local == [3000, 4000]
     assert peer == [1000 + 1280, 2000 + 2560]
     assert lengths == [1280, 2560]
+    assert thread._state.nano_tail_by_req["req-0"].copied is False
 

@@ -331,8 +331,7 @@ class SFAPDRD2HScheduler:
             if kv_tokens <= 0:
                 prompt_token_ids = getattr(request, "prompt_token_ids", None) or []
                 kv_tokens = len(prompt_token_ids)
-            block_size = getattr(self, "main_block_size", None) or min(self.block_size)
-            tail_tokens, tail_block_index = nano_tail_geometry(kv_tokens, block_size)
+            tail_tokens, tail_block_index = nano_tail_geometry(kv_tokens)
             pool_slot = allocator.bind(request.request_id)
             self._nano_bindings[request.request_id] = (
                 pool_slot,
