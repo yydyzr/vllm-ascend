@@ -24,7 +24,10 @@ NANO_TAIL_DEBUG_PREFIX = "[NANO_TAIL_DEBUG]"
 # not flood the log after the first few ring writes are visible.
 _MAX_EXEC_KV_LOGS = 8
 _MAX_ATTENTION_LOGS = 4
-_MAX_TAIL_VERIFY_LOGS = 4
+# Tail checks are per step, and divergence can start a few steps in, so keep
+# enough budget to watch the ring evolve instead of only its seeded state.
+_MAX_TAIL_VERIFY_LOGS = 16
+_MAX_RESTORE_DIFF_LOGS = 16
 # One span per request per tail page. A decode batch that seeds more than this
 # already shows the pattern in the first few.
 _MAX_TAIL_VERIFY_SPANS = 4
@@ -35,6 +38,7 @@ _TAIL_VERIFY_SEARCH_TOKENS = 256
 _exec_kv_logs = 0
 _attention_logs = 0
 _tail_verify_logs = 0
+_restore_diff_logs = 0
 
 
 def nano_tail_debug_enabled() -> bool:
@@ -45,10 +49,11 @@ def nano_tail_debug_enabled() -> bool:
 
 
 def reset_nano_tail_debug_counters() -> None:
-    global _exec_kv_logs, _attention_logs, _tail_verify_logs
+    global _exec_kv_logs, _attention_logs, _tail_verify_logs, _restore_diff_logs
     _exec_kv_logs = 0
     _attention_logs = 0
     _tail_verify_logs = 0
+    _restore_diff_logs = 0
 
 
 def emit_nano_tail_debug(event: str, **fields: Any) -> None:
@@ -181,6 +186,7 @@ def emit_nano_tail_verify(
     tail_src: torch.Tensor,
     tail_dst: torch.Tensor,
     tail_lengths: torch.Tensor,
+    tp_rank: int,
 ) -> None:
     """Check the PD-seeded circular tail against the host KV it should mirror.
 
@@ -188,12 +194,19 @@ def emit_nano_tail_verify(
     copy, so comparing them isolates a bad D2D payload from a ring that is
     merely not refreshed. Call before any restore, otherwise the restore
     makes the two sides equal by construction.
+
+    Only tp_rank 0 owns the host pool. Other ranks hold a raw-pointer view of
+    it that is valid for DMA address translation but not mapped for CPU loads,
+    so dereferencing it there faults. Use ``probe_nano_tail_restore`` for those
+    ranks. See ``SparseKVOffloadManager._restore_bfloat16_tensor``.
     """
     global _tail_verify_logs
     try:
         if not envs.VLLM_ASCEND_NANO_TAIL_DEBUG:
             return
         if layer_id != 0 or _tail_verify_logs >= _MAX_TAIL_VERIFY_LOGS:
+            return
+        if int(tp_rank) != 0:
             return
         if _stream_is_capturing():
             return
@@ -229,6 +242,91 @@ def emit_nano_tail_verify(
         }
         logger.info("%s %s", NANO_TAIL_DEBUG_PREFIX, json.dumps(payload, separators=(",", ":")))
         _tail_verify_logs += 1
+    except Exception:
+        pass
+
+
+def _restore_diff_summary(d2d: torch.Tensor, restored: torch.Tensor) -> dict[str, Any]:
+    if d2d.shape != restored.shape:
+        return {"error": "shape_mismatch", "d2d": list(d2d.shape), "restored": list(restored.shape)}
+    if d2d.numel() == 0:
+        return {"error": "empty_span"}
+    left = d2d.to(torch.float32)
+    right = restored.to(torch.float32)
+    per_token = (right - left).abs().amax(dim=-1)
+    # One device-to-host copy per span component: the per-token diffs plus the
+    # two all-zero probes. Keeps the probe off the per-element sync path.
+    probes = torch.cat([per_token.reshape(-1), left.abs().amax().reshape(1), right.abs().amax().reshape(1)])
+    values = probes.detach().to("cpu")
+    diffs = values[:-2]
+    mismatched = torch.nonzero(diffs > 0).flatten()
+    return {
+        "max_abs_diff": _json_float(float(diffs.max())),
+        "mismatch_tokens": int(mismatched.numel()),
+        "first_mismatch": int(mismatched[0]) if mismatched.numel() else -1,
+        "d2d_all_zero": bool(values[-2] == 0),
+        "restored_all_zero": bool(values[-1] == 0),
+    }
+
+
+def probe_nano_tail_restore(
+    *,
+    layer_name: str,
+    layer_id: int,
+    ring_k: torch.Tensor,
+    ring_v: torch.Tensor,
+    tail_dst: torch.Tensor,
+    tail_lengths: torch.Tensor,
+    restore,
+) -> None:
+    """Measure what the skipped H2D restore would have changed in the ring.
+
+    Works on every TP rank because it reads the host pool through the same
+    DMA path the restore uses instead of CPU loads. The pre-restore payload is
+    written back afterwards so the model still consumes the D2D-seeded tail and
+    the accuracy under test is unchanged.
+    """
+    global _restore_diff_logs
+    try:
+        if not envs.VLLM_ASCEND_NANO_TAIL_DEBUG:
+            return
+        if layer_id != 0 or _restore_diff_logs >= _MAX_RESTORE_DIFF_LOGS:
+            return
+        if _stream_is_capturing():
+            return
+        lengths = [int(x) for x in tail_lengths.reshape(-1).tolist()]
+        destinations = [int(x) for x in tail_dst.reshape(-1).tolist()]
+        # Snapshot every live span, not just the logged ones, so the write-back
+        # covers everything the restore below touches.
+        snapshots = [
+            (dst, tokens, ring_k[dst : dst + tokens].clone(), ring_v[dst : dst + tokens].clone())
+            for dst, tokens in zip(destinations, lengths)
+            if tokens > 0
+        ]
+        if not snapshots:
+            return
+        restore()
+        spans = [
+            {
+                "dst_token": dst,
+                "tokens": tokens,
+                "k": _restore_diff_summary(snap_k, ring_k[dst : dst + tokens]),
+                "v": _restore_diff_summary(snap_v, ring_v[dst : dst + tokens]),
+            }
+            for dst, tokens, snap_k, snap_v in snapshots[:_MAX_TAIL_VERIFY_SPANS]
+        ]
+        for dst, tokens, snap_k, snap_v in snapshots:
+            ring_k[dst : dst + tokens].copy_(snap_k)
+            ring_v[dst : dst + tokens].copy_(snap_v)
+        payload = {
+            "event": "tail_restore_diff",
+            "layer": layer_name,
+            "layer_id": int(layer_id),
+            "spans": spans,
+            "seq": _restore_diff_logs,
+        }
+        logger.info("%s %s", NANO_TAIL_DEBUG_PREFIX, json.dumps(payload, separators=(",", ":")))
+        _restore_diff_logs += 1
     except Exception:
         pass
 

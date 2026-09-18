@@ -79,6 +79,7 @@ def _tail_verify_fixture(torch, *, host_tokens=512, dim_k=8, dim_v=4, ring_token
         "tail_src": torch.tensor([[256, 0]], dtype=torch.int64),
         "tail_dst": torch.tensor([[256, 0]], dtype=torch.int64),
         "tail_lengths": torch.tensor([[112, 0]], dtype=torch.int32),
+        "tp_rank": 0,
     }
 
 
@@ -142,6 +143,14 @@ def test_tail_verify_skips_aligned_prefix_and_non_first_layer(nano_tail_debug_on
     assert _emit_tail_verify(later_layer) is None
 
 
+def test_tail_verify_skips_ranks_without_a_cpu_mapped_host_pool(nano_tail_debug_on):
+    torch = pytest.importorskip("torch")
+    kwargs = _tail_verify_fixture(torch)
+    _seed_ring(kwargs, 256)
+    kwargs["tp_rank"] = 1
+    assert _emit_tail_verify(kwargs) is None
+
+
 def test_tail_verify_is_silent_when_disabled(monkeypatch):
     torch = pytest.importorskip("torch")
     monkeypatch.delenv("VLLM_ASCEND_NANO_TAIL_DEBUG", raising=False)
@@ -157,6 +166,102 @@ def test_tail_verify_stops_after_log_cap(nano_tail_debug_on):
         _seed_ring(kwargs, 256)
         emitted += _emit_tail_verify(kwargs) is not None
     assert emitted == nano_tail_debug._MAX_TAIL_VERIFY_LOGS
+
+
+def _restore_probe_fixture(torch, *, ring_tokens=384, dim_k=8, dim_v=4):
+    """One 112-token span at ring token 256, restored from a host stand-in."""
+    generator = torch.Generator().manual_seed(1)
+    host_k = torch.rand(112, dim_k, generator=generator)
+    host_v = torch.rand(112, dim_v, generator=generator)
+    ring_k = torch.zeros(ring_tokens, dim_k)
+    ring_v = torch.zeros(ring_tokens, dim_v)
+
+    def restore():
+        ring_k[256:368] = host_k
+        ring_v[256:368] = host_v
+
+    return {
+        "layer_name": "layers.0.self_attn",
+        "layer_id": 0,
+        "ring_k": ring_k,
+        "ring_v": ring_v,
+        "tail_dst": torch.tensor([[256, 0]], dtype=torch.int64),
+        "tail_lengths": torch.tensor([[112, 0]], dtype=torch.int32),
+        "restore": restore,
+    }, (host_k, host_v)
+
+
+def _probe_restore(kwargs):
+    with patch.object(nano_tail_debug.logger, "info") as info:
+        nano_tail_debug.probe_nano_tail_restore(**kwargs)
+    if not info.call_args_list:
+        return None
+    return json.loads(info.call_args.args[2])
+
+
+def test_restore_probe_reports_zero_diff_when_d2d_already_matches(nano_tail_debug_on):
+    torch = pytest.importorskip("torch")
+    kwargs, (host_k, host_v) = _restore_probe_fixture(torch)
+    kwargs["ring_k"][256:368] = host_k
+    kwargs["ring_v"][256:368] = host_v
+    payload = _probe_restore(kwargs)
+    assert payload["event"] == "tail_restore_diff"
+    span = payload["spans"][0]
+    assert (span["dst_token"], span["tokens"]) == (256, 112)
+    for component in ("k", "v"):
+        assert span[component]["max_abs_diff"] == 0.0
+        assert span[component]["mismatch_tokens"] == 0
+        assert span[component]["first_mismatch"] == -1
+        assert span[component]["d2d_all_zero"] is False
+
+
+def test_restore_probe_reports_diff_for_unseeded_ring(nano_tail_debug_on):
+    torch = pytest.importorskip("torch")
+    kwargs, _ = _restore_probe_fixture(torch)
+    span = _probe_restore(kwargs)["spans"][0]
+    assert span["k"]["mismatch_tokens"] == 112
+    assert span["k"]["first_mismatch"] == 0
+    assert span["k"]["d2d_all_zero"] is True
+    assert span["k"]["restored_all_zero"] is False
+
+
+def test_restore_probe_leaves_the_d2d_payload_in_place(nano_tail_debug_on):
+    torch = pytest.importorskip("torch")
+    kwargs, _ = _restore_probe_fixture(torch)
+    seeded_k = torch.full((112, kwargs["ring_k"].shape[-1]), 0.5)
+    kwargs["ring_k"][256:368] = seeded_k
+    untouched = kwargs["ring_k"][:256].clone()
+    assert _probe_restore(kwargs) is not None
+    # The restore ran, but the model must still see the seeded tail.
+    assert torch.equal(kwargs["ring_k"][256:368], seeded_k)
+    assert torch.equal(kwargs["ring_k"][:256], untouched)
+    assert torch.count_nonzero(kwargs["ring_v"][256:368]) == 0
+
+
+def test_restore_probe_skips_aligned_prefix_without_restoring(nano_tail_debug_on):
+    torch = pytest.importorskip("torch")
+    kwargs, _ = _restore_probe_fixture(torch)
+    kwargs["tail_lengths"] = torch.zeros((1, 2), dtype=torch.int32)
+    assert _probe_restore(kwargs) is None
+    assert torch.count_nonzero(kwargs["ring_k"]) == 0
+
+
+def test_restore_probe_stops_after_log_cap(nano_tail_debug_on):
+    torch = pytest.importorskip("torch")
+    emitted = 0
+    for _ in range(nano_tail_debug._MAX_RESTORE_DIFF_LOGS + 2):
+        kwargs, _ = _restore_probe_fixture(torch)
+        emitted += _probe_restore(kwargs) is not None
+    assert emitted == nano_tail_debug._MAX_RESTORE_DIFF_LOGS
+
+
+def test_restore_probe_is_silent_when_disabled(monkeypatch):
+    torch = pytest.importorskip("torch")
+    monkeypatch.delenv("VLLM_ASCEND_NANO_TAIL_DEBUG", raising=False)
+    nano_tail_debug.reset_nano_tail_debug_counters()
+    kwargs, _ = _restore_probe_fixture(torch)
+    assert _probe_restore(kwargs) is None
+    assert torch.count_nonzero(kwargs["ring_k"]) == 0
 
 
 def test_scheduler_bind_emits_geometry(nano_tail_debug_on):
