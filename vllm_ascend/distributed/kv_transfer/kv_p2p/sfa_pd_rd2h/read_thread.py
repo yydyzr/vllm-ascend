@@ -26,6 +26,9 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.sfa_pd_rd2h.protocol import (
     SFAPD_PROTOCOL_VERSION,
     NanoTailDest,
 )
+from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.nano_tail_debug import (
+    emit_nano_tail_debug,
+)
 from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.nano_topk_slots import (
     NANO_KERNEL_BLOCK_SIZE,
     nano_tail_device_token,
@@ -514,11 +517,18 @@ class MembPullReadThread(threading.Thread):
         tail = state.nano_tail_by_req.get(ext_req_id)
         if tail is None or tail.tail_tokens <= 0:
             return
+        layer_name = layer.get("layer_name")
         if not state.topk_k_bases or not state.topk_v_bases:
             logger.warning(
                 "MembPull nano tail D2D skipped, topk bases missing: req=%s layer=%s",
                 ext_req_id,
-                layer.get("layer_name"),
+                layer_name,
+            )
+            emit_nano_tail_debug(
+                "d2d_skip",
+                req=ext_req_id,
+                layer=layer_name,
+                reason="missing_topk_bases",
             )
             return
         if state.block_size <= 0 or state.topk_row_tokens <= 0:
@@ -528,6 +538,14 @@ class MembPullReadThread(threading.Thread):
                 ext_req_id,
                 state.block_size,
                 state.topk_row_tokens,
+            )
+            emit_nano_tail_debug(
+                "d2d_skip",
+                req=ext_req_id,
+                layer=layer_name,
+                reason="invalid_geometry",
+                block_size=int(state.block_size),
+                row_tokens=int(state.topk_row_tokens),
             )
             return
         # P's block list is in spec-page units. Nano dest/ring is always 128.
@@ -545,6 +563,16 @@ class MembPullReadThread(threading.Thread):
                 main_start_block,
                 len(p_main_block_ids),
                 tail.tail_tokens,
+            )
+            emit_nano_tail_debug(
+                "d2d_skip",
+                req=ext_req_id,
+                layer=layer.get("layer_name"),
+                reason="not_in_chunk",
+                p_block_index=int(p_block_index),
+                main_start_block=int(main_start_block),
+                chunk_blocks=len(p_main_block_ids),
+                tail_tokens=int(tail.tail_tokens),
             )
             return
         offload_id = layer["offload_id"]
@@ -590,6 +618,23 @@ class MembPullReadThread(threading.Thread):
         local_chunks.append(local)
         length_chunks.append(length)
         tail.copied = True
+        emit_nano_tail_debug(
+            "d2d_append",
+            req=ext_req_id,
+            layer=layer.get("layer_name"),
+            pool_slot=int(tail.pool_slot),
+            kv_tokens=int(kv_tokens),
+            tail_tokens=int(tail.tail_tokens),
+            tail_block_index=int(tail.tail_block_index),
+            p_block_id=p_block_id,
+            p_block_index=int(p_block_index),
+            dst_token=int(dst_token),
+            token_bytes_k=int(token_bytes_k),
+            token_bytes_v=int(token_bytes_v),
+            peer=[int(peer[0]), int(peer[1])],
+            local=[int(local[0]), int(local[1])],
+            lengths=[int(length[0]), int(length[1])],
+        )
 
     def _build_req_descriptors(
         self,

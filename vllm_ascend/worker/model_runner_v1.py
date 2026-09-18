@@ -157,6 +157,9 @@ from vllm_ascend.device.hardware_profile import HardwareCapability, get_current_
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise_cache_layout import (
     apply_layerwise_kv_cache_plan,
 )
+from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.nano_tail_debug import (
+    emit_nano_tail_debug,
+)
 from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.sparse_kv_offload_manager import (
     allocate_kv_cache_tensors_for_sparse_kv_offload,
     allocate_kv_offload_topk_profile_buffers,
@@ -3295,6 +3298,8 @@ class NPUModelRunner(GPUModelRunner):
             used = set(self._offload_request_slots.values()) | set(prebound.values())
             available = iter(slot for slot in range(capacity) if slot not in used)
             pending_d2d_restore = self._nano_tails_pending_d2d_restore()
+            if pending_d2d_restore:
+                emit_nano_tail_debug("pending_restore", reqs=sorted(pending_d2d_restore))
             for row, req in enumerate(self.input_batch.req_ids[:num_reqs]):
                 if req not in self._offload_request_slots:
                     slot = prebound[req] if req in prebound else next(available)
@@ -3316,6 +3321,12 @@ class NPUModelRunner(GPUModelRunner):
                     last_prefix = self._offload_slot_last_prefix.get(slot)
                     if last_prefix is not None and prefix < last_prefix:
                         self._nano_need_eager_tail_restore = True
+                        emit_nano_tail_debug(
+                            "prefix_rollback",
+                            slot=slot,
+                            prefix=prefix,
+                            last_prefix=int(last_prefix),
+                        )
                     self._offload_slot_last_prefix[slot] = prefix
         self._offload_pool_slots.copy_to_gpu(padded_reqs)
         self._offload_pool_generations.copy_to_gpu(padded_reqs)
@@ -3332,6 +3343,7 @@ class NPUModelRunner(GPUModelRunner):
                 if getattr(metadata, "nano_enabled", False) and getattr(
                     metadata, "nano_copy_src_offsets", None
                 ) is not None:
+                    emit_nano_tail_debug("eager_restore", reason="pending_or_rollback")
                     get_sparse_kv_offload_manager().restore_nano_tails(metadata)
                     return
 

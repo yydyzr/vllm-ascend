@@ -35,7 +35,10 @@ class TestEnvVariables(TestBase):
                     self.assertEqual(getattr(envs_ascend, var_name), var_handler())
 
                     handler_source = inspect.getsource(var_handler)
-                    if var_name == "VLLM_ASCEND_KVPOOL_RANGE_DEBUG":
+                    if var_name in (
+                        "VLLM_ASCEND_KVPOOL_RANGE_DEBUG",
+                        "VLLM_ASCEND_NANO_TAIL_DEBUG",
+                    ):
                         test_vals = ["0", "1"]
                     elif "int(" in handler_source:
                         test_vals = ["123", "456"]
@@ -61,7 +64,12 @@ class TestEnvVariables(TestBase):
                 getattr(envs_ascend, var_name)
 
     def test_kvpool_range_debug_is_strict_and_disabled_by_default(self):
-        name = "VLLM_ASCEND_KVPOOL_RANGE_DEBUG"
+        self._assert_strict_binary_env_default("VLLM_ASCEND_KVPOOL_RANGE_DEBUG")
+
+    def test_nano_tail_debug_is_strict_and_disabled_by_default(self):
+        self._assert_strict_binary_env_default("VLLM_ASCEND_NANO_TAIL_DEBUG")
+
+    def _assert_strict_binary_env_default(self, name: str):
         original_val = os.environ.pop(name, None)
         try:
             self.assertFalse(getattr(envs_ascend, name))
