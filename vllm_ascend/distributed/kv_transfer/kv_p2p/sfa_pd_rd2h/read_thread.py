@@ -510,10 +510,22 @@ class MembPullReadThread(threading.Thread):
     ) -> None:
         """D2D the last incomplete main block into this rank's circular tail."""
         state = self._state
+        layer_name = layer.get("layer_name")
         tail = state.nano_tail_by_req.get(ext_req_id)
         if tail is None or tail.tail_tokens <= 0:
+            # Silence here used to be indistinguishable from a tail that was
+            # transferred, which hides a request whose circular tail keeps
+            # whatever the previous occupant of its pool row left behind. One
+            # line per request is enough: the binding is not per layer.
+            if state.topk_k_bases and int(layer.get("offload_id", 0)) == 0:
+                emit_nano_tail_debug(
+                    "d2d_skip",
+                    req=ext_req_id,
+                    layer=layer_name,
+                    reason="no_tail_binding" if tail is None else "aligned_prefix",
+                    tail_tokens=0 if tail is None else int(tail.tail_tokens),
+                )
             return
-        layer_name = layer.get("layer_name")
         if not state.topk_k_bases or not state.topk_v_bases:
             emit_nano_tail_debug(
                 "d2d_skip",
