@@ -744,8 +744,10 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
                     layer_id=layer_id,
                     ring_k=hbm_k.view(-1, self.kv_lora_rank),
                     ring_v=hbm_v.view(-1, self.qk_rope_head_dim),
+                    tail_src=metadata.nano_tail_src,
                     tail_dst=metadata.nano_tail_dst,
                     tail_lengths=metadata.nano_tail_lengths,
+                    hot_tokens=int(getattr(manager, "topk_buffer_size", 0) or 0),
                     restore=lambda: self._nano_restore_tail(metadata, manager, layer_name),
                 )
             emit_nano_attention_restore(

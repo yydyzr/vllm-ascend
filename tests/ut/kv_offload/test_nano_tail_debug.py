@@ -176,8 +176,14 @@ def test_tail_verify_stops_after_log_cap(nano_tail_debug_on):
     assert emitted == nano_tail_debug._MAX_TAIL_VERIFY_LOGS
 
 
-def _restore_probe_fixture(torch, *, ring_tokens=384, dim_k=8, dim_v=4):
-    """One 112-token span at ring token 256, restored from a host stand-in."""
+def _restore_probe_fixture(torch, *, dim_k=8, dim_v=4):
+    """Pool row 0, tail page 1 of a 128-hot-token ring; sibling page is 128.
+
+    Row geometry mirrors production: hot prefix then two 128-token pages, so
+    the probe's pool row / page / sibling arithmetic is exercised as-is.
+    """
+    hot_tokens = 128
+    ring_tokens = hot_tokens + nano_tail_debug.NANO_RING_TOKENS
     generator = torch.Generator().manual_seed(1)
     host_k = torch.rand(112, dim_k, generator=generator)
     host_v = torch.rand(112, dim_v, generator=generator)
@@ -193,8 +199,10 @@ def _restore_probe_fixture(torch, *, ring_tokens=384, dim_k=8, dim_v=4):
         "layer_id": 0,
         "ring_k": ring_k,
         "ring_v": ring_v,
+        "tail_src": torch.tensor([[1024, 0]], dtype=torch.int64),
         "tail_dst": torch.tensor([[256, 0]], dtype=torch.int64),
         "tail_lengths": torch.tensor([[112, 0]], dtype=torch.int32),
+        "hot_tokens": hot_tokens,
         "restore": restore,
     }, (host_k, host_v)
 
@@ -215,7 +223,9 @@ def test_restore_probe_reports_zero_diff_when_d2d_already_matches(restore_diff_p
     payload = _probe_restore(kwargs)
     assert payload["event"] == "tail_restore_diff"
     span = payload["spans"][0]
-    assert (span["dst_token"], span["tokens"]) == (256, 112)
+    assert (span["src_token"], span["dst_token"], span["tokens"]) == (1024, 256, 112)
+    assert (span["pool_row"], span["tail_page"]) == (0, 1)
+    assert span["sibling_page"]["dst_token"] == 128
     for component in ("k", "v"):
         assert span[component]["max_abs_diff"] == 0.0
         assert span[component]["mismatch_tokens"] == 0
@@ -231,6 +241,23 @@ def test_restore_probe_reports_diff_for_unseeded_ring(restore_diff_probe):
     assert span["k"]["first_mismatch"] == 0
     assert span["k"]["d2d_all_zero"] is True
     assert span["k"]["restored_all_zero"] is False
+
+
+def test_restore_probe_points_at_the_sibling_page_when_the_payload_landed_there(restore_diff_probe):
+    torch = pytest.importorskip("torch")
+    kwargs, (host_k, host_v) = _restore_probe_fixture(torch)
+    # The tail was seeded into page 0 while decode reads page 1, and page 1
+    # still holds the previous occupant of this pool row.
+    kwargs["ring_k"][128:240] = host_k
+    kwargs["ring_v"][128:240] = host_v
+    kwargs["ring_k"][256:368] = 0.25
+    kwargs["ring_v"][256:368] = 0.25
+    span = _probe_restore(kwargs)["spans"][0]
+    assert span["k"]["mismatch_tokens"] == 112
+    sibling = span["sibling_page"]
+    assert sibling["k"]["mismatch_tokens"] == 0
+    assert sibling["v"]["mismatch_tokens"] == 0
+    assert sibling["k"]["sibling_all_zero"] is False
 
 
 def test_restore_probe_leaves_the_d2d_payload_in_place(restore_diff_probe):

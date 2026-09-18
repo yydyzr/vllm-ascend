@@ -19,6 +19,7 @@ from vllm_ascend import envs
 # Circular tail is two 128-token pages after the hot prefix. Keep this local
 # so connector import does not depend on newer nano_topk_slots symbols.
 NANO_RING_TOKENS = 256
+NANO_TAIL_PAGE_TOKENS = NANO_RING_TOKENS // 2
 NANO_TAIL_DEBUG_PREFIX = "[NANO_TAIL_DEBUG]"
 # VLLM_ASCEND_NANO_TAIL_PROBE values. Observe is the default so a debug build
 # reports what the run does instead of changing it.
@@ -31,8 +32,8 @@ _MAX_EXEC_KV_LOGS = 8
 _MAX_ATTENTION_LOGS = 4
 # Tail checks are per step, and divergence can start a few steps in, so keep
 # enough budget to watch the ring evolve instead of only its seeded state.
-_MAX_TAIL_VERIFY_LOGS = 16
-_MAX_RESTORE_DIFF_LOGS = 16
+_MAX_TAIL_VERIFY_LOGS = 32
+_MAX_RESTORE_DIFF_LOGS = 32
 # One span per request per tail page. A decode batch that seeds more than this
 # already shows the pattern in the first few.
 _MAX_TAIL_VERIFY_SPANS = 4
@@ -265,7 +266,7 @@ def _span_probe(left: torch.Tensor, right: torch.Tensor) -> torch.Tensor | None:
     return torch.cat([per_token, before.abs().amax().reshape(1), after.abs().amax().reshape(1)])
 
 
-def _span_report(values: torch.Tensor | None) -> dict[str, Any]:
+def _span_report(values: torch.Tensor | None, *, left_zero_key: str = "d2d_all_zero") -> dict[str, Any]:
     if values is None:
         return {"error": "empty_or_mismatched_span"}
     diffs = values[:-2]
@@ -274,7 +275,7 @@ def _span_report(values: torch.Tensor | None) -> dict[str, Any]:
         "max_abs_diff": _json_float(float(diffs.max())),
         "mismatch_tokens": int(mismatched.numel()),
         "first_mismatch": int(mismatched[0]) if mismatched.numel() else -1,
-        "d2d_all_zero": bool(values[-2] == 0),
+        left_zero_key: bool(values[-2] == 0),
         "restored_all_zero": bool(values[-1] == 0),
     }
 
@@ -285,14 +286,36 @@ def _writeback_residual(snapshot: torch.Tensor, span: torch.Tensor) -> torch.Ten
     return (span.to(torch.float32) - snapshot.to(torch.float32)).abs().amax().reshape(1)
 
 
+def _tail_page_geometry(dst_token: int, hot_tokens: int) -> tuple[int, int, int] | None:
+    """Return (pool_row, tail_page, sibling_dst_token) for a tail destination.
+
+    The sibling is the other 128-token page of the same pool row. Comparing it
+    against host truth separates "the payload never arrived" from "the payload
+    landed in the wrong page".
+    """
+    row_tokens = hot_tokens + NANO_RING_TOKENS
+    if hot_tokens <= 0 or row_tokens <= 0:
+        return None
+    row, offset = divmod(dst_token, row_tokens)
+    if offset < hot_tokens:
+        return None
+    page, within = divmod(offset - hot_tokens, NANO_TAIL_PAGE_TOKENS)
+    if page not in (0, 1):
+        return None
+    sibling = row * row_tokens + hot_tokens + (1 - page) * NANO_TAIL_PAGE_TOKENS + within
+    return row, page, sibling
+
+
 def probe_nano_tail_restore(
     *,
     layer_name: str,
     layer_id: int,
     ring_k: torch.Tensor,
     ring_v: torch.Tensor,
+    tail_src: torch.Tensor,
     tail_dst: torch.Tensor,
     tail_lengths: torch.Tensor,
+    hot_tokens: int,
     restore,
 ) -> None:
     """Run the nano tail probe selected by VLLM_ASCEND_NANO_TAIL_PROBE.
@@ -306,6 +329,9 @@ def probe_nano_tail_restore(
     back so the model still consumes the D2D-seeded tail. ``writeback_residual``
     reports whether that write-back actually won, because a restore that lands
     after it would silently repair the very step being measured.
+    ``sibling_page`` compares the other page of the same pool row against the
+    same host truth, so a payload that landed one page off is distinguishable
+    from one that never arrived and left the previous occupant's bytes behind.
     """
     global _restore_diff_logs
     try:
@@ -328,29 +354,44 @@ def probe_nano_tail_restore(
             return
         lengths = [int(x) for x in tail_lengths.reshape(-1).tolist()]
         destinations = [int(x) for x in tail_dst.reshape(-1).tolist()]
+        sources = [int(x) for x in tail_src.reshape(-1).tolist()]
         # Snapshot every live span, not just the logged ones, so the write-back
         # covers everything the restore below touches.
         snapshots = [
-            (dst, tokens, ring_k[dst : dst + tokens].clone(), ring_v[dst : dst + tokens].clone())
-            for dst, tokens in zip(destinations, lengths)
+            (src, dst, tokens, ring_k[dst : dst + tokens].clone(), ring_v[dst : dst + tokens].clone())
+            for src, dst, tokens in zip(sources, destinations, lengths)
             if tokens > 0
         ]
         if not snapshots:
             return
-        restore()
         reported = snapshots[:_MAX_TAIL_VERIFY_SPANS]
+        geometry = [_tail_page_geometry(dst, int(hot_tokens)) for _, dst, _, _, _ in reported]
+        siblings = [
+            None
+            if place is None or place[2] + tokens > int(ring_k.shape[0])
+            else (ring_k[place[2] : place[2] + tokens].clone(), ring_v[place[2] : place[2] + tokens].clone())
+            for place, (_, _, tokens, _, _) in zip(geometry, reported)
+        ]
+        restore()
         probes = [
             (
-                dst,
-                tokens,
                 _span_probe(snap_k, ring_k[dst : dst + tokens]),
                 _span_probe(snap_v, ring_v[dst : dst + tokens]),
             )
-            for dst, tokens, snap_k, snap_v in reported
+            for _, dst, tokens, snap_k, snap_v in reported
+        ]
+        sibling_probes = [
+            None
+            if sibling is None
+            else (
+                _span_probe(sibling[0], ring_k[dst : dst + tokens]),
+                _span_probe(sibling[1], ring_v[dst : dst + tokens]),
+            )
+            for sibling, (_, dst, tokens, _, _) in zip(siblings, reported)
         ]
         # Write back before the first host sync so the probe cannot be what
         # fixes the step it is measuring.
-        for dst, tokens, snap_k, snap_v in snapshots:
+        for _, dst, tokens, snap_k, snap_v in snapshots:
             ring_k[dst : dst + tokens].copy_(snap_k)
             ring_v[dst : dst + tokens].copy_(snap_v)
         residuals = [
@@ -358,16 +399,34 @@ def probe_nano_tail_restore(
                 _writeback_residual(snap_k, ring_k[dst : dst + tokens]),
                 _writeback_residual(snap_v, ring_v[dst : dst + tokens]),
             )
-            for dst, tokens, snap_k, snap_v in reported
+            for _, dst, tokens, snap_k, snap_v in reported
         ]
         spans = []
-        for (dst, tokens, probe_k, probe_v), (residual_k, residual_v) in zip(probes, residuals):
-            span: dict[str, Any] = {"dst_token": dst, "tokens": tokens}
+        for index, (src, dst, tokens, _, _) in enumerate(reported):
+            probe_k, probe_v = probes[index]
+            residual_k, residual_v = residuals[index]
+            span: dict[str, Any] = {"src_token": src, "dst_token": dst, "tokens": tokens}
+            place = geometry[index]
+            if place is not None:
+                span["pool_row"], span["tail_page"] = place[0], place[1]
             span["k"] = _span_report(None if probe_k is None else probe_k.detach().to("cpu"))
             span["v"] = _span_report(None if probe_v is None else probe_v.detach().to("cpu"))
             for name, residual in (("k", residual_k), ("v", residual_v)):
                 if residual is not None:
                     span[name]["writeback_residual"] = _json_float(float(residual.detach().to("cpu")[0]))
+            sibling_probe = sibling_probes[index]
+            if place is not None and sibling_probe is not None:
+                span["sibling_page"] = {
+                    "dst_token": place[2],
+                    "k": _span_report(
+                        None if sibling_probe[0] is None else sibling_probe[0].detach().to("cpu"),
+                        left_zero_key="sibling_all_zero",
+                    ),
+                    "v": _span_report(
+                        None if sibling_probe[1] is None else sibling_probe[1].detach().to("cpu"),
+                        left_zero_key="sibling_all_zero",
+                    ),
+                }
             spans.append(span)
         payload = {
             "event": "tail_restore_diff",
