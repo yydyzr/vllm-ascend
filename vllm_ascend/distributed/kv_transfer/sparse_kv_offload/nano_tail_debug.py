@@ -20,6 +20,11 @@ from vllm_ascend import envs
 # so connector import does not depend on newer nano_topk_slots symbols.
 NANO_RING_TOKENS = 256
 NANO_TAIL_DEBUG_PREFIX = "[NANO_TAIL_DEBUG]"
+# VLLM_ASCEND_NANO_TAIL_PROBE values. Observe is the default so a debug build
+# reports what the run does instead of changing it.
+NANO_TAIL_PROBE_OBSERVE = 0
+NANO_TAIL_PROBE_SYNC = 1
+NANO_TAIL_PROBE_RESTORE_DIFF = 2
 # exec_kv / attention run every layer every step. Cap so a long decode does
 # not flood the log after the first few ring writes are visible.
 _MAX_EXEC_KV_LOGS = 8
@@ -246,18 +251,23 @@ def emit_nano_tail_verify(
         pass
 
 
-def _restore_diff_summary(d2d: torch.Tensor, restored: torch.Tensor) -> dict[str, Any]:
-    if d2d.shape != restored.shape:
-        return {"error": "shape_mismatch", "d2d": list(d2d.shape), "restored": list(restored.shape)}
-    if d2d.numel() == 0:
-        return {"error": "empty_span"}
-    left = d2d.to(torch.float32)
-    right = restored.to(torch.float32)
-    per_token = (right - left).abs().amax(dim=-1)
-    # One device-to-host copy per span component: the per-token diffs plus the
-    # two all-zero probes. Keeps the probe off the per-element sync path.
-    probes = torch.cat([per_token.reshape(-1), left.abs().amax().reshape(1), right.abs().amax().reshape(1)])
-    values = probes.detach().to("cpu")
+def _span_probe(left: torch.Tensor, right: torch.Tensor) -> torch.Tensor | None:
+    """Device-side diff between two tail spans; no host sync yet.
+
+    Returns per-token max abs diffs followed by the two all-zero probes, so a
+    span costs one device-to-host copy once the caller is ready to sync.
+    """
+    if left.shape != right.shape or left.numel() == 0:
+        return None
+    before = left.to(torch.float32)
+    after = right.to(torch.float32)
+    per_token = (after - before).abs().amax(dim=-1).reshape(-1)
+    return torch.cat([per_token, before.abs().amax().reshape(1), after.abs().amax().reshape(1)])
+
+
+def _span_report(values: torch.Tensor | None) -> dict[str, Any]:
+    if values is None:
+        return {"error": "empty_or_mismatched_span"}
     diffs = values[:-2]
     mismatched = torch.nonzero(diffs > 0).flatten()
     return {
@@ -267,6 +277,12 @@ def _restore_diff_summary(d2d: torch.Tensor, restored: torch.Tensor) -> dict[str
         "d2d_all_zero": bool(values[-2] == 0),
         "restored_all_zero": bool(values[-1] == 0),
     }
+
+
+def _writeback_residual(snapshot: torch.Tensor, span: torch.Tensor) -> torch.Tensor | None:
+    if snapshot.shape != span.shape or snapshot.numel() == 0:
+        return None
+    return (span.to(torch.float32) - snapshot.to(torch.float32)).abs().amax().reshape(1)
 
 
 def probe_nano_tail_restore(
@@ -279,20 +295,36 @@ def probe_nano_tail_restore(
     tail_lengths: torch.Tensor,
     restore,
 ) -> None:
-    """Measure what the skipped H2D restore would have changed in the ring.
+    """Run the nano tail probe selected by VLLM_ASCEND_NANO_TAIL_PROBE.
 
-    Works on every TP rank because it reads the host pool through the same
-    DMA path the restore uses instead of CPU loads. The pre-restore payload is
-    written back afterwards so the model still consumes the D2D-seeded tail and
-    the accuracy under test is unchanged.
+    Mode 0 does nothing, so the default build observes the run without
+    perturbing it. Mode 1 only blocks the host on the device, which tells a
+    late D2D payload apart from a wrong one without touching any content.
+    Mode 2 measures what the skipped H2D restore would have changed: it works
+    on every TP rank because it reaches the host pool through the DMA path the
+    restore uses instead of CPU loads, and it writes the pre-restore payload
+    back so the model still consumes the D2D-seeded tail. ``writeback_residual``
+    reports whether that write-back actually won, because a restore that lands
+    after it would silently repair the very step being measured.
     """
     global _restore_diff_logs
     try:
         if not envs.VLLM_ASCEND_NANO_TAIL_DEBUG:
             return
-        if layer_id != 0 or _restore_diff_logs >= _MAX_RESTORE_DIFF_LOGS:
+        mode = envs.VLLM_ASCEND_NANO_TAIL_PROBE
+        if mode == NANO_TAIL_PROBE_OBSERVE or layer_id != 0:
             return
         if _stream_is_capturing():
+            return
+        if mode == NANO_TAIL_PROBE_SYNC:
+            # Every step, not only the logged ones: a probe that changes the
+            # wait on some steps and not others is not an experiment.
+            torch.npu.synchronize()
+            if _restore_diff_logs < _MAX_RESTORE_DIFF_LOGS:
+                emit_nano_tail_debug("tail_sync_probe", layer=layer_name, seq=_restore_diff_logs)
+                _restore_diff_logs += 1
+            return
+        if _restore_diff_logs >= _MAX_RESTORE_DIFF_LOGS:
             return
         lengths = [int(x) for x in tail_lengths.reshape(-1).tolist()]
         destinations = [int(x) for x in tail_dst.reshape(-1).tolist()]
@@ -306,18 +338,37 @@ def probe_nano_tail_restore(
         if not snapshots:
             return
         restore()
-        spans = [
-            {
-                "dst_token": dst,
-                "tokens": tokens,
-                "k": _restore_diff_summary(snap_k, ring_k[dst : dst + tokens]),
-                "v": _restore_diff_summary(snap_v, ring_v[dst : dst + tokens]),
-            }
-            for dst, tokens, snap_k, snap_v in snapshots[:_MAX_TAIL_VERIFY_SPANS]
+        reported = snapshots[:_MAX_TAIL_VERIFY_SPANS]
+        probes = [
+            (
+                dst,
+                tokens,
+                _span_probe(snap_k, ring_k[dst : dst + tokens]),
+                _span_probe(snap_v, ring_v[dst : dst + tokens]),
+            )
+            for dst, tokens, snap_k, snap_v in reported
         ]
+        # Write back before the first host sync so the probe cannot be what
+        # fixes the step it is measuring.
         for dst, tokens, snap_k, snap_v in snapshots:
             ring_k[dst : dst + tokens].copy_(snap_k)
             ring_v[dst : dst + tokens].copy_(snap_v)
+        residuals = [
+            (
+                _writeback_residual(snap_k, ring_k[dst : dst + tokens]),
+                _writeback_residual(snap_v, ring_v[dst : dst + tokens]),
+            )
+            for dst, tokens, snap_k, snap_v in reported
+        ]
+        spans = []
+        for (dst, tokens, probe_k, probe_v), (residual_k, residual_v) in zip(probes, residuals):
+            span: dict[str, Any] = {"dst_token": dst, "tokens": tokens}
+            span["k"] = _span_report(None if probe_k is None else probe_k.detach().to("cpu"))
+            span["v"] = _span_report(None if probe_v is None else probe_v.detach().to("cpu"))
+            for name, residual in (("k", residual_k), ("v", residual_v)):
+                if residual is not None:
+                    span[name]["writeback_residual"] = _json_float(float(residual.detach().to("cpu")[0]))
+            spans.append(span)
         payload = {
             "event": "tail_restore_diff",
             "layer": layer_name,
