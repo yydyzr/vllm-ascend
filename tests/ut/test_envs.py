@@ -40,8 +40,6 @@ class TestEnvVariables(TestBase):
                         "VLLM_ASCEND_NANO_TAIL_DEBUG",
                     ):
                         test_vals = ["0", "1"]
-                    elif var_name == "VLLM_ASCEND_NANO_TAIL_PROBE":
-                        test_vals = ["0", "1", "2"]
                     elif "int(" in handler_source:
                         test_vals = ["123", "456"]
                     elif "bool(int(" in handler_source:
@@ -70,28 +68,6 @@ class TestEnvVariables(TestBase):
 
     def test_nano_tail_debug_is_strict_and_disabled_by_default(self):
         self._assert_strict_binary_env_default("VLLM_ASCEND_NANO_TAIL_DEBUG")
-
-    def test_nano_tail_probe_defaults_to_observe_and_rejects_unknown_modes(self):
-        name = "VLLM_ASCEND_NANO_TAIL_PROBE"
-        original_val = os.environ.pop(name, None)
-        try:
-            self.assertEqual(getattr(envs_ascend, name), 0)
-            for value in ("0", "1", "2"):
-                with self.subTest(value=value):
-                    os.environ[name] = value
-                    self.assertEqual(getattr(envs_ascend, name), int(value))
-            os.environ[name] = ""
-            self.assertEqual(getattr(envs_ascend, name), 0)
-            for value in ("3", "-1", "sync"):
-                with self.subTest(invalid=value):
-                    os.environ[name] = value
-                    with self.assertRaises(ValueError):
-                        getattr(envs_ascend, name)
-        finally:
-            if original_val is None:
-                os.environ.pop(name, None)
-            else:
-                os.environ[name] = original_val
 
     def _assert_strict_binary_env_default(self, name: str):
         original_val = os.environ.pop(name, None)
