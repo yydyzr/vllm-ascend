@@ -47,6 +47,10 @@ from vllm_ascend.attention.utils import (
     split_decodes_and_prefills,
 )
 from vllm_ascend.device.device_op import DeviceOperator
+from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.nano_tail_debug import (
+    emit_nano_attention_restore,
+    emit_nano_exec_kv_ring,
+)
 from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.sparse_kv_offload_manager import (
     FSA_SELECTION_MEMBERSHIP_CONTROL_INT16_COUNT,
     FSA_SELECTION_MEMBERSHIP_CONTROL_OFFSET_INT16_CNT,
@@ -717,9 +721,16 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
             logical_lens = cache_tokens  # exact saved selection; no extra tail
             topk_misses = self.nano_reuse_topk_misses[:tokens]
             misses = self.nano_reuse_misses[:count]
+            emit_nano_attention_restore(layer_name=layer_name, skipped_graph_h2d=True, reused_indices=True)
         else:
-            if not metadata.nano_skip_tail_restore:
+            skipped = bool(getattr(metadata, "nano_skip_tail_restore", False))
+            if not skipped:
                 self._nano_restore_tail(metadata, manager, layer_name)
+            emit_nano_attention_restore(
+                layer_name=layer_name,
+                skipped_graph_h2d=skipped,
+                reused_indices=False,
+            )
             cache_tokens = metadata.nano_cache_tokens
             logical_lens = metadata.nano_logical_lens
             topk_misses = owner.nano_topk_misses[:tokens]
@@ -800,6 +811,13 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
                     rows = cache_tensor.view(-1, cache_tensor.shape[-1])
                     rows.index_copy_(0, device_slots[: value.shape[0]], value.reshape(value.shape[0], -1))
                 slots = torch.where(attn_metadata.nano_token_active[: slots.numel()], slots, -1)
+                emit_nano_exec_kv_ring(
+                    layer_name=layer_name,
+                    layer_id=layer_id,
+                    device_slots=device_slots,
+                    token_active=attn_metadata.nano_token_active,
+                    hot_tokens=int(getattr(manager, "topk_buffer_size", 0) or 0),
+                )
             manager.offload_new_kv(
                 layer_name=layer_name,
                 slot_mapping=slots,
