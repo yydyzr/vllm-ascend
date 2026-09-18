@@ -50,6 +50,7 @@ from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.nano_tail_debug import (
     emit_nano_attention_restore,
     emit_nano_exec_kv_ring,
+    emit_nano_tail_verify,
 )
 from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.sparse_kv_offload_manager import (
     FSA_SELECTION_MEMBERSHIP_CONTROL_INT16_COUNT,
@@ -721,6 +722,17 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
             emit_nano_attention_restore(layer_name=layer_name, skipped_graph_h2d=True, reused_indices=True)
         else:
             skipped = bool(getattr(metadata, "nano_skip_tail_restore", False))
+            emit_nano_tail_verify(
+                layer_name=layer_name,
+                layer_id=layer_id,
+                host_k=host_k.view(-1, self.kv_lora_rank),
+                ring_k=hbm_k.view(-1, self.kv_lora_rank),
+                host_v=host_v.view(-1, self.qk_rope_head_dim),
+                ring_v=hbm_v.view(-1, self.qk_rope_head_dim),
+                tail_src=metadata.nano_tail_src,
+                tail_dst=metadata.nano_tail_dst,
+                tail_lengths=metadata.nano_tail_lengths,
+            )
             if not skipped:
                 self._nano_restore_tail(metadata, manager, layer_name)
             emit_nano_attention_restore(

@@ -62,6 +62,103 @@ def test_exec_kv_ring_logs_circular_suffix(nano_tail_debug_on):
     assert payload["ring_offsets"] == [8319, 8320]
 
 
+def _tail_verify_fixture(torch, *, host_tokens=512, dim_k=8, dim_v=4, ring_tokens=384):
+    """One 112-token span seeded from host token 256 into ring token 256."""
+    generator = torch.Generator().manual_seed(0)
+    host_k = torch.rand(host_tokens, dim_k, generator=generator)
+    host_v = torch.rand(host_tokens, dim_v, generator=generator)
+    ring_k = torch.zeros(ring_tokens, dim_k)
+    ring_v = torch.zeros(ring_tokens, dim_v)
+    return {
+        "layer_name": "layers.0.self_attn",
+        "layer_id": 0,
+        "host_k": host_k,
+        "ring_k": ring_k,
+        "host_v": host_v,
+        "ring_v": ring_v,
+        "tail_src": torch.tensor([[256, 0]], dtype=torch.int64),
+        "tail_dst": torch.tensor([[256, 0]], dtype=torch.int64),
+        "tail_lengths": torch.tensor([[112, 0]], dtype=torch.int32),
+    }
+
+
+def _seed_ring(kwargs, src_token):
+    kwargs["ring_k"][256:368] = kwargs["host_k"][src_token : src_token + 112]
+    kwargs["ring_v"][256:368] = kwargs["host_v"][src_token : src_token + 112]
+
+
+def _emit_tail_verify(kwargs):
+    with patch.object(nano_tail_debug.logger, "info") as info:
+        nano_tail_debug.emit_nano_tail_verify(**kwargs)
+    if not info.call_args_list:
+        return None
+    return json.loads(info.call_args.args[2])
+
+
+def test_tail_verify_reports_match_when_ring_mirrors_host(nano_tail_debug_on):
+    torch = pytest.importorskip("torch")
+    kwargs = _tail_verify_fixture(torch)
+    _seed_ring(kwargs, 256)
+    payload = _emit_tail_verify(kwargs)
+    assert payload["event"] == "tail_verify"
+    span = payload["spans"][0]
+    assert (span["src_token"], span["dst_token"], span["tokens"]) == (256, 256, 112)
+    for component in ("k", "v"):
+        assert span[component]["mismatch_tokens"] == 0
+        assert span[component]["max_abs_diff"] == 0.0
+        assert span[component]["first_mismatch"] == -1
+        assert span[component]["ring_all_zero"] is False
+
+
+def test_tail_verify_locates_off_by_one_block_source(nano_tail_debug_on):
+    torch = pytest.importorskip("torch")
+    kwargs = _tail_verify_fixture(torch)
+    # Ring seeded from the block before the one the descriptors point at.
+    _seed_ring(kwargs, 128)
+    span = _emit_tail_verify(kwargs)["spans"][0]
+    assert span["k"]["mismatch_tokens"] > 0
+    assert span["k"]["first_mismatch"] == 0
+    assert span["k"]["ring_source_token"] == 128
+
+
+def test_tail_verify_flags_unwritten_ring(nano_tail_debug_on):
+    torch = pytest.importorskip("torch")
+    span = _emit_tail_verify(_tail_verify_fixture(torch))["spans"][0]
+    assert span["k"]["ring_all_zero"] is True
+    assert span["k"]["host_all_zero"] is False
+    assert span["k"]["mismatch_tokens"] == 112
+    # An all-zero ring matches no host token, so the search reports nothing.
+    assert span["k"]["ring_source_token"] == -1
+
+
+def test_tail_verify_skips_aligned_prefix_and_non_first_layer(nano_tail_debug_on):
+    torch = pytest.importorskip("torch")
+    aligned = _tail_verify_fixture(torch)
+    aligned["tail_lengths"] = torch.zeros((1, 2), dtype=torch.int32)
+    assert _emit_tail_verify(aligned) is None
+
+    later_layer = _tail_verify_fixture(torch)
+    later_layer["layer_id"] = 1
+    assert _emit_tail_verify(later_layer) is None
+
+
+def test_tail_verify_is_silent_when_disabled(monkeypatch):
+    torch = pytest.importorskip("torch")
+    monkeypatch.delenv("VLLM_ASCEND_NANO_TAIL_DEBUG", raising=False)
+    nano_tail_debug.reset_nano_tail_debug_counters()
+    assert _emit_tail_verify(_tail_verify_fixture(torch)) is None
+
+
+def test_tail_verify_stops_after_log_cap(nano_tail_debug_on):
+    torch = pytest.importorskip("torch")
+    emitted = 0
+    for _ in range(nano_tail_debug._MAX_TAIL_VERIFY_LOGS + 2):
+        kwargs = _tail_verify_fixture(torch)
+        _seed_ring(kwargs, 256)
+        emitted += _emit_tail_verify(kwargs) is not None
+    assert emitted == nano_tail_debug._MAX_TAIL_VERIFY_LOGS
+
+
 def test_scheduler_bind_emits_geometry(nano_tail_debug_on):
     from tests.ut.kv_offload.test_sfa_pd_rd2h_connector import (
         test_consumer_scheduler_binds_nano_tail_at_alloc,
