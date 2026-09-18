@@ -26,6 +26,9 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.sfa_pd_rd2h.protocol import (
     SFAPD_PROTOCOL_VERSION,
     NanoTailDest,
 )
+from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.nano_tail_debug import (
+    emit_nano_tail_debug,
+)
 
 READ_THREAD_POLL_TIMEOUT_MS = 100
 THREAD_SHUTDOWN_TIMEOUT_SECONDS = 5.0
@@ -510,12 +513,37 @@ class MembPullReadThread(threading.Thread):
         tail = state.nano_tail_by_req.get(ext_req_id)
         if tail is None or tail.tail_tokens <= 0:
             return
+        layer_name = layer.get("layer_name")
         if not state.topk_k_bases or not state.topk_v_bases:
+            emit_nano_tail_debug(
+                "d2d_skip",
+                req=ext_req_id,
+                layer=layer_name,
+                reason="missing_topk_bases",
+            )
             return
         if state.block_size <= 0 or state.topk_row_tokens <= 0:
+            emit_nano_tail_debug(
+                "d2d_skip",
+                req=ext_req_id,
+                layer=layer_name,
+                reason="invalid_geometry",
+                block_size=int(state.block_size),
+                row_tokens=int(state.topk_row_tokens),
+            )
             return
         local_idx = tail.tail_block_index - main_start_block
         if local_idx < 0 or local_idx >= len(p_main_block_ids):
+            emit_nano_tail_debug(
+                "d2d_skip",
+                req=ext_req_id,
+                layer=layer_name,
+                reason="not_in_chunk",
+                p_block_index=int(tail.tail_block_index),
+                main_start_block=int(main_start_block),
+                chunk_blocks=len(p_main_block_ids),
+                tail_tokens=int(tail.tail_tokens),
+            )
             return
         offload_id = layer["offload_id"]
         if offload_id >= len(state.topk_k_bases) or offload_id >= len(state.topk_v_bases):
@@ -555,6 +583,22 @@ class MembPullReadThread(threading.Thread):
         peer_chunks.append(peer)
         local_chunks.append(local)
         length_chunks.append(length)
+        emit_nano_tail_debug(
+            "d2d_append",
+            req=ext_req_id,
+            layer=layer.get("layer_name"),
+            pool_slot=int(tail.pool_slot),
+            tail_tokens=int(tail.tail_tokens),
+            tail_block_index=int(tail.tail_block_index),
+            p_block_id=p_block_id,
+            p_block_index=int(tail.tail_block_index),
+            dst_token=int(dst_token),
+            token_bytes_k=int(token_bytes_k),
+            token_bytes_v=int(token_bytes_v),
+            peer=[int(peer[0]), int(peer[1])],
+            local=[int(local[0]), int(local[1])],
+            lengths=[int(length[0]), int(length[1])],
+        )
 
     def _build_req_descriptors(
         self,

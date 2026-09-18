@@ -32,6 +32,9 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.sfa_pd_rd2h.protocol import (
     get_external_request_id,
     infer_sfa_component_group_ids,
 )
+from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.nano_tail_debug import (
+    emit_nano_tail_debug,
+)
 from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.nano_topk_slots import (
     NanoTopkSlotAllocator,
     nano_pool_capacity,
@@ -339,6 +342,15 @@ class SFAPDRD2HScheduler:
                 tail_tokens,
                 tail_block_index,
                 kv_tokens,
+            )
+            emit_nano_tail_debug(
+                "bind",
+                req=request.request_id,
+                pool_slot=int(pool_slot),
+                kv_tokens=int(kv_tokens),
+                tail_tokens=int(tail_tokens),
+                tail_block_index=int(tail_block_index),
+                aligned_prefix=tail_tokens == 0,
             )
 
         # Notify P via the metaserver rendezvous that D is ready to pull this

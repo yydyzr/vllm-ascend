@@ -31,6 +31,9 @@ from vllm.v1.kv_cache_interface import (
 from vllm.v1.utils import CpuGpuBuffer
 
 from vllm_ascend.ascend_config import SparseKVOffloadConfig, get_ascend_config
+from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.nano_tail_debug import (
+    emit_nano_tail_debug,
+)
 from vllm_ascend.utils import AscendDeviceType, enable_custom_op, get_ascend_device_type
 
 # Main BF16 cache:
@@ -1123,6 +1126,11 @@ class SparseKVOffloadManager:
         if not getattr(self, "nano_host_bases", None):
             raise RuntimeError("nano KV base addresses must be bound before tail restore")
         n = src_off.numel()
+        emit_nano_tail_debug(
+            "h2d_restore",
+            descriptor_count=int(n),
+            layers=len(self.nano_host_bases),
+        )
         for host_bases, device_bases in zip(self.nano_host_bases, self.nano_device_bases):
             torch.add(src_off.view(2, -1), host_bases, out=self.nano_copy_src[:n].view(2, -1))
             torch.add(dst_off.view(2, -1), device_bases, out=self.nano_copy_dst[:n].view(2, -1))

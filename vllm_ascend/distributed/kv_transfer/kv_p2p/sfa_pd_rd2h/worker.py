@@ -44,6 +44,9 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.sfa_pd_rd2h.send_thread import (
     MembPullSendingThread,
     ProducerSendState,
 )
+from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.nano_tail_debug import (
+    emit_nano_tail_debug,
+)
 from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.sparse_kv_offload_manager import (
     get_sparse_kv_offload_manager,
 )
@@ -214,12 +217,24 @@ class SFAPDRD2HConsumerWorker:
                 if pool_slot is not None:
                     self.nano_slots_by_req[req_id] = int(pool_slot)
                     tail_tokens = int(getattr(req, "tail_tokens", 0) or 0)
+                    tail_block_index = int(getattr(req, "tail_block_index", 0) or 0)
+                    kv_tokens = int(getattr(req, "kv_tokens", 0) or 0)
                     if tail_tokens > 0:
                         self._nano_tail_by_req[ext_id] = NanoTailDest(
                             pool_slot=int(pool_slot),
                             tail_tokens=tail_tokens,
-                            tail_block_index=int(getattr(req, "tail_block_index", 0) or 0),
+                            tail_block_index=tail_block_index,
                         )
+                    emit_nano_tail_debug(
+                        "load_dest",
+                        req=req_id,
+                        ext_req=ext_id,
+                        pool_slot=int(pool_slot),
+                        kv_tokens=kv_tokens,
+                        tail_tokens=tail_tokens,
+                        tail_block_index=tail_block_index,
+                        aligned_prefix=tail_tokens == 0,
+                    )
 
     def save_kv_layer(
         self,
