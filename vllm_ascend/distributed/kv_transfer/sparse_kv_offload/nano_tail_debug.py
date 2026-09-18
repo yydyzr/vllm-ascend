@@ -13,10 +13,10 @@ from typing import Any
 from vllm.logger import logger
 
 from vllm_ascend import envs
-from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.nano_topk_slots import (
-    NANO_RING_TOKENS,
-)
 
+# Circular tail is two 128-token pages after the hot prefix. Keep this local
+# so connector import does not depend on newer nano_topk_slots symbols.
+NANO_RING_TOKENS = 256
 NANO_TAIL_DEBUG_PREFIX = "[NANO_TAIL_DEBUG]"
 # exec_kv / attention run every layer every step. Cap so a long decode does
 # not flood the log after the first few ring writes are visible.
