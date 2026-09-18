@@ -35,19 +35,6 @@ def _strict_binary_env(name: str, default: str = "0") -> bool:
     return value == "1"
 
 
-def _bounded_int_env(name: str, low: int, high: int) -> int:
-    raw = os.getenv(name)
-    if raw is None or raw == "":
-        return low
-    try:
-        value = int(raw)
-    except ValueError as error:
-        raise ValueError(f"{name} must be an integer in [{low}, {high}], got {raw!r}") from error
-    if not low <= value <= high:
-        raise ValueError(f"{name} must be in [{low}, {high}], got {value}")
-    return value
-
-
 env_variables: dict[str, Callable[[], Any]] = {
     # max compile thread number for package building. Usually, it is set to
     # the number of CPU cores. If not set, the default value is None, which
@@ -99,14 +86,6 @@ env_variables: dict[str, Callable[[], Any]] = {
     # long-sequence offload. Default: 0 (disabled). Valid values: 0 or 1.
     # This configuration is not sensitive.
     "VLLM_ASCEND_NANO_TAIL_DEBUG": lambda: _strict_binary_env("VLLM_ASCEND_NANO_TAIL_DEBUG"),
-    # Select the nano circular-tail probe run with VLLM_ASCEND_NANO_TAIL_DEBUG=1.
-    # 0 (default): observe only, the probe changes nothing. 1: block the host on
-    # the device before the first offload layer consumes the tail, without
-    # touching tail content, to test whether the PD D2D payload is merely late.
-    # 2: snapshot the tail, run the skipped H2D restore, report the diff, then
-    # write the snapshot back. Valid values: 0, 1 or 2. Debug only, and not
-    # sensitive.
-    "VLLM_ASCEND_NANO_TAIL_PROBE": lambda: _bounded_int_env("VLLM_ASCEND_NANO_TAIL_PROBE", 0, 2),
     # Override the Unified Buffer (UB) size in KB for Triton kernel tile sizing.
     # 0 (default): auto-detect from device properties, falling back to 192 KB
     # (safe for Ascend 910B/A3). Set to a positive value to override when

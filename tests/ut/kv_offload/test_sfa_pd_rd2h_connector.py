@@ -1570,55 +1570,6 @@ def test_nano_tail_d2d_appends_to_every_decode_rank():
     assert lengths == [3 * 10, 3 * 20]
 
 
-def test_nano_tail_d2d_reports_a_request_without_a_tail_binding():
-    layer = _make_layer(k_cpu_ptr=3000, v_cpu_ptr=4000, has_indexer=False)
-    layer["p_k_len"] = 1280
-    layer["p_v_len"] = 2560
-    thread = _make_tail_read_thread()
-    # A request whose tail was never bound must not look like a transferred
-    # one: its circular tail keeps the previous occupant of the pool row.
-    del thread._state.nano_tail_by_req["req-0"]
-
-    with patch(
-        "vllm_ascend.distributed.kv_transfer.kv_p2p.sfa_pd_rd2h.read_thread.emit_nano_tail_debug"
-    ) as emit:
-        thread._build_req_descriptors(
-            layer,
-            "req-0",
-            p_main_block_ids=[1],
-            p_indexer_block_ids=[],
-            want_info=False,
-            main_start_block=0,
-        )
-
-    skip = next(call.kwargs for call in emit.call_args_list if call.args[0] == "d2d_skip")
-    assert skip["reason"] == "no_tail_binding"
-    assert skip["req"] == "req-0"
-
-
-def test_nano_tail_d2d_reports_an_aligned_prefix_without_a_tail():
-    layer = _make_layer(k_cpu_ptr=3000, v_cpu_ptr=4000, has_indexer=False)
-    layer["p_k_len"] = 1280
-    layer["p_v_len"] = 2560
-    thread = _make_tail_read_thread()
-    thread._state.nano_tail_by_req["req-0"] = NanoTailDest(pool_slot=1, tail_tokens=0, tail_block_index=0)
-
-    with patch(
-        "vllm_ascend.distributed.kv_transfer.kv_p2p.sfa_pd_rd2h.read_thread.emit_nano_tail_debug"
-    ) as emit:
-        thread._build_req_descriptors(
-            layer,
-            "req-0",
-            p_main_block_ids=[1],
-            p_indexer_block_ids=[],
-            want_info=False,
-            main_start_block=0,
-        )
-
-    skip = next(call.kwargs for call in emit.call_args_list if call.args[0] == "d2d_skip")
-    assert skip["reason"] == "aligned_prefix"
-
-
 def test_nano_tail_d2d_skips_when_last_block_is_not_in_chunk():
     layer = _make_layer(k_cpu_ptr=3000, v_cpu_ptr=4000, has_indexer=False)
     layer["p_k_len"] = 1280

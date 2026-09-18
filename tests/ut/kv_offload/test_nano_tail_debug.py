@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import json
-from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -19,13 +18,6 @@ def nano_tail_debug_on(monkeypatch):
     yield
     monkeypatch.delenv("VLLM_ASCEND_NANO_TAIL_DEBUG", raising=False)
     nano_tail_debug.reset_nano_tail_debug_counters()
-
-
-@pytest.fixture
-def restore_diff_probe(monkeypatch, nano_tail_debug_on):
-    monkeypatch.setenv("VLLM_ASCEND_NANO_TAIL_PROBE", str(nano_tail_debug.NANO_TAIL_PROBE_RESTORE_DIFF))
-    yield
-    monkeypatch.delenv("VLLM_ASCEND_NANO_TAIL_PROBE", raising=False)
 
 
 def test_emit_is_silent_when_disabled(monkeypatch):
@@ -176,14 +168,8 @@ def test_tail_verify_stops_after_log_cap(nano_tail_debug_on):
     assert emitted == nano_tail_debug._MAX_TAIL_VERIFY_LOGS
 
 
-def _restore_probe_fixture(torch, *, dim_k=8, dim_v=4):
-    """Pool row 0, tail page 1 of a 128-hot-token ring; sibling page is 128.
-
-    Row geometry mirrors production: hot prefix then two 128-token pages, so
-    the probe's pool row / page / sibling arithmetic is exercised as-is.
-    """
-    hot_tokens = 128
-    ring_tokens = hot_tokens + nano_tail_debug.NANO_RING_TOKENS
+def _restore_probe_fixture(torch, *, ring_tokens=384, dim_k=8, dim_v=4):
+    """One 112-token span at ring token 256, restored from a host stand-in."""
     generator = torch.Generator().manual_seed(1)
     host_k = torch.rand(112, dim_k, generator=generator)
     host_v = torch.rand(112, dim_v, generator=generator)
@@ -199,10 +185,8 @@ def _restore_probe_fixture(torch, *, dim_k=8, dim_v=4):
         "layer_id": 0,
         "ring_k": ring_k,
         "ring_v": ring_v,
-        "tail_src": torch.tensor([[1024, 0]], dtype=torch.int64),
         "tail_dst": torch.tensor([[256, 0]], dtype=torch.int64),
         "tail_lengths": torch.tensor([[112, 0]], dtype=torch.int32),
-        "hot_tokens": hot_tokens,
         "restore": restore,
     }, (host_k, host_v)
 
@@ -215,7 +199,7 @@ def _probe_restore(kwargs):
     return json.loads(info.call_args.args[2])
 
 
-def test_restore_probe_reports_zero_diff_when_d2d_already_matches(restore_diff_probe):
+def test_restore_probe_reports_zero_diff_when_d2d_already_matches(nano_tail_debug_on):
     torch = pytest.importorskip("torch")
     kwargs, (host_k, host_v) = _restore_probe_fixture(torch)
     kwargs["ring_k"][256:368] = host_k
@@ -223,9 +207,7 @@ def test_restore_probe_reports_zero_diff_when_d2d_already_matches(restore_diff_p
     payload = _probe_restore(kwargs)
     assert payload["event"] == "tail_restore_diff"
     span = payload["spans"][0]
-    assert (span["src_token"], span["dst_token"], span["tokens"]) == (1024, 256, 112)
-    assert (span["pool_row"], span["tail_page"]) == (0, 1)
-    assert span["sibling_page"]["dst_token"] == 128
+    assert (span["dst_token"], span["tokens"]) == (256, 112)
     for component in ("k", "v"):
         assert span[component]["max_abs_diff"] == 0.0
         assert span[component]["mismatch_tokens"] == 0
@@ -233,7 +215,7 @@ def test_restore_probe_reports_zero_diff_when_d2d_already_matches(restore_diff_p
         assert span[component]["d2d_all_zero"] is False
 
 
-def test_restore_probe_reports_diff_for_unseeded_ring(restore_diff_probe):
+def test_restore_probe_reports_diff_for_unseeded_ring(nano_tail_debug_on):
     torch = pytest.importorskip("torch")
     kwargs, _ = _restore_probe_fixture(torch)
     span = _probe_restore(kwargs)["spans"][0]
@@ -243,24 +225,7 @@ def test_restore_probe_reports_diff_for_unseeded_ring(restore_diff_probe):
     assert span["k"]["restored_all_zero"] is False
 
 
-def test_restore_probe_points_at_the_sibling_page_when_the_payload_landed_there(restore_diff_probe):
-    torch = pytest.importorskip("torch")
-    kwargs, (host_k, host_v) = _restore_probe_fixture(torch)
-    # The tail was seeded into page 0 while decode reads page 1, and page 1
-    # still holds the previous occupant of this pool row.
-    kwargs["ring_k"][128:240] = host_k
-    kwargs["ring_v"][128:240] = host_v
-    kwargs["ring_k"][256:368] = 0.25
-    kwargs["ring_v"][256:368] = 0.25
-    span = _probe_restore(kwargs)["spans"][0]
-    assert span["k"]["mismatch_tokens"] == 112
-    sibling = span["sibling_page"]
-    assert sibling["k"]["mismatch_tokens"] == 0
-    assert sibling["v"]["mismatch_tokens"] == 0
-    assert sibling["k"]["sibling_all_zero"] is False
-
-
-def test_restore_probe_leaves_the_d2d_payload_in_place(restore_diff_probe):
+def test_restore_probe_leaves_the_d2d_payload_in_place(nano_tail_debug_on):
     torch = pytest.importorskip("torch")
     kwargs, _ = _restore_probe_fixture(torch)
     seeded_k = torch.full((112, kwargs["ring_k"].shape[-1]), 0.5)
@@ -273,7 +238,7 @@ def test_restore_probe_leaves_the_d2d_payload_in_place(restore_diff_probe):
     assert torch.count_nonzero(kwargs["ring_v"][256:368]) == 0
 
 
-def test_restore_probe_skips_aligned_prefix_without_restoring(restore_diff_probe):
+def test_restore_probe_skips_aligned_prefix_without_restoring(nano_tail_debug_on):
     torch = pytest.importorskip("torch")
     kwargs, _ = _restore_probe_fixture(torch)
     kwargs["tail_lengths"] = torch.zeros((1, 2), dtype=torch.int32)
@@ -281,72 +246,13 @@ def test_restore_probe_skips_aligned_prefix_without_restoring(restore_diff_probe
     assert torch.count_nonzero(kwargs["ring_k"]) == 0
 
 
-def test_restore_probe_stops_after_log_cap(restore_diff_probe):
+def test_restore_probe_stops_after_log_cap(nano_tail_debug_on):
     torch = pytest.importorskip("torch")
     emitted = 0
     for _ in range(nano_tail_debug._MAX_RESTORE_DIFF_LOGS + 2):
         kwargs, _ = _restore_probe_fixture(torch)
         emitted += _probe_restore(kwargs) is not None
     assert emitted == nano_tail_debug._MAX_RESTORE_DIFF_LOGS
-
-
-def test_restore_probe_reports_a_write_back_that_did_not_win(restore_diff_probe):
-    torch = pytest.importorskip("torch")
-
-    class _DropsWriteBacks(torch.Tensor):
-        """Stands in for a restore DMA that lands after the write-back."""
-
-        def copy_(self, other, *args, **kwargs):
-            del other, args, kwargs
-            return self
-
-    kwargs, _ = _restore_probe_fixture(torch)
-    kwargs["ring_k"][256:368] = 0.5
-    kwargs["ring_k"] = kwargs["ring_k"].as_subclass(_DropsWriteBacks)
-    kwargs["ring_v"] = kwargs["ring_v"].as_subclass(_DropsWriteBacks)
-    span = _probe_restore(kwargs)["spans"][0]
-    assert span["k"]["mismatch_tokens"] > 0
-    assert span["k"]["writeback_residual"] > 0
-    assert span["v"]["writeback_residual"] > 0
-
-
-def test_sync_probe_waits_every_step_without_touching_the_tail(monkeypatch, nano_tail_debug_on):
-    torch = pytest.importorskip("torch")
-    monkeypatch.setenv("VLLM_ASCEND_NANO_TAIL_PROBE", str(nano_tail_debug.NANO_TAIL_PROBE_SYNC))
-    calls = {"sync": 0, "restore": 0}
-    monkeypatch.setattr(
-        nano_tail_debug.torch,
-        "npu",
-        SimpleNamespace(synchronize=lambda: calls.__setitem__("sync", calls["sync"] + 1)),
-        raising=False,
-    )
-    steps = nano_tail_debug._MAX_RESTORE_DIFF_LOGS + 3
-    emitted = 0
-    for _ in range(steps):
-        kwargs, _ = _restore_probe_fixture(torch)
-        kwargs["restore"] = lambda: calls.__setitem__("restore", calls["restore"] + 1)
-        emitted += _probe_restore(kwargs) is not None
-        assert torch.count_nonzero(kwargs["ring_k"]) == 0
-    assert calls["sync"] == steps
-    assert calls["restore"] == 0
-    assert emitted == nano_tail_debug._MAX_RESTORE_DIFF_LOGS
-
-
-def test_observe_mode_neither_syncs_nor_restores(monkeypatch, nano_tail_debug_on):
-    torch = pytest.importorskip("torch")
-    monkeypatch.delenv("VLLM_ASCEND_NANO_TAIL_PROBE", raising=False)
-    calls = {"sync": 0, "restore": 0}
-    monkeypatch.setattr(
-        nano_tail_debug.torch,
-        "npu",
-        SimpleNamespace(synchronize=lambda: calls.__setitem__("sync", calls["sync"] + 1)),
-        raising=False,
-    )
-    kwargs, _ = _restore_probe_fixture(torch)
-    kwargs["restore"] = lambda: calls.__setitem__("restore", calls["restore"] + 1)
-    assert _probe_restore(kwargs) is None
-    assert calls == {"sync": 0, "restore": 0}
-    assert torch.count_nonzero(kwargs["ring_k"]) == 0
 
 
 def test_restore_probe_is_silent_when_disabled(monkeypatch):
