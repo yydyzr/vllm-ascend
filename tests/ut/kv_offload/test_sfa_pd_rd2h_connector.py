@@ -1623,3 +1623,28 @@ def test_nano_tail_d2d_skips_when_last_block_is_not_in_chunk():
     assert peer == [1000 + 1280, 2000 + 2560]
     assert lengths == [1280, 2560]
 
+
+def test_pd_tail_geom_debug_logs_skip_once():
+    layer = _make_layer(k_cpu_ptr=3000, v_cpu_ptr=4000, has_indexer=False)
+    layer["p_k_len"] = 1280
+    layer["p_v_len"] = 2560
+    thread = _make_tail_read_thread()
+    thread._state.nano_tail_by_req["req-0"] = NanoTailDest(pool_slot=1, tail_tokens=3, tail_block_index=8)
+
+    with (
+        patch(
+            "vllm_ascend.distributed.kv_transfer.kv_p2p.sfa_pd_rd2h.read_thread.pd_tail_geom_debug_enabled",
+            return_value=True,
+        ),
+        patch("vllm_ascend.distributed.kv_transfer.kv_p2p.sfa_pd_rd2h.read_thread.logger.info") as info,
+    ):
+        thread._append_nano_tail_descriptors(layer, "req-0", [1], 0, [], [], [])
+        thread._append_nano_tail_descriptors(layer, "req-0", [1], 0, [], [], [])
+
+    assert info.call_count == 1
+    args = info.call_args.args
+    assert args[1] == "[PD_TAIL_GEOM]"
+    assert args[4] == 8
+    assert args[6] == 1
+    assert args[8] is True
+

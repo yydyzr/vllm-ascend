@@ -11,6 +11,14 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
 )
 
 BATCH_KV_TRANSFER_PARAMS = "batch_kv_transfer_params"
+PD_TAIL_GEOM_LOG_PREFIX = "[PD_TAIL_GEOM]"
+
+
+def pd_tail_geom_debug_enabled() -> bool:
+    """Return True when busy-P / D tail-block geometry logs are on."""
+    from vllm_ascend import envs
+
+    return bool(envs.VLLM_ASCEND_PD_TAIL_GEOM_DEBUG)
 MF_META = b"mf_meta"
 READ_READY_BATCH = b"read_ready_batch"
 READ_DONE = b"read_done"

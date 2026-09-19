@@ -20,11 +20,13 @@ from vllm.utils.network_utils import get_ip
 from vllm_ascend.distributed.kv_transfer.kv_p2p.sfa_pd_rd2h.protocol import (
     MF_META,
     MF_META_ACK,
+    PD_TAIL_GEOM_LOG_PREFIX,
     READ_DONE,
     READ_FAILED,
     READ_READY_BATCH,
     SFAPD_PROTOCOL_VERSION,
     NanoTailDest,
+    pd_tail_geom_debug_enabled,
 )
 
 READ_THREAD_POLL_TIMEOUT_MS = 100
@@ -117,6 +119,7 @@ class MembPullReadThread(threading.Thread):
         # Request completion needs every flattened PP/TP contributor.
         self._done_contributors: dict[str, set[int]] = {}
         self._expected_ratio: dict[str, int] = {}
+        self._tail_geom_logged: set[str] = set()
         self._lock = threading.Lock()
         self._host = get_ip()
         self._stop_event = threading.Event()
@@ -515,9 +518,31 @@ class MembPullReadThread(threading.Thread):
         if state.block_size <= 0 or state.topk_row_tokens <= 0:
             return
         local_idx = tail.tail_block_index - main_start_block
-        if local_idx < 0 or local_idx >= len(p_main_block_ids):
-            return
+        skipped = local_idx < 0 or local_idx >= len(p_main_block_ids)
         offload_id = layer["offload_id"]
+        logged = getattr(self, "_tail_geom_logged", None)
+        if logged is None:
+            self._tail_geom_logged = set()
+            logged = self._tail_geom_logged
+        if pd_tail_geom_debug_enabled() and offload_id == 0 and ext_req_id not in logged:
+            logged.add(ext_req_id)
+            p_block_id = None if skipped else int(p_main_block_ids[local_idx])
+            logger.info(
+                "%s D pull req=%s layer=%s tail_block_index=%d main_start=%d "
+                "p_main_blocks=%d local_idx=%d skipped=%s p_block_id=%s tail_tokens=%d",
+                PD_TAIL_GEOM_LOG_PREFIX,
+                ext_req_id,
+                layer["layer_name"],
+                tail.tail_block_index,
+                main_start_block,
+                len(p_main_block_ids),
+                local_idx,
+                skipped,
+                p_block_id,
+                tail.tail_tokens,
+            )
+        if skipped:
+            return
         if offload_id >= len(state.topk_k_bases) or offload_id >= len(state.topk_v_bases):
             raise RuntimeError(
                 f"MembPull nano tail is missing topk buffer bases for {layer['layer_name']}"
