@@ -1624,7 +1624,7 @@ def test_nano_tail_d2d_skips_when_last_block_is_not_in_chunk():
     assert lengths == [1280, 2560]
 
 
-def test_pd_tail_geom_debug_logs_skip_once():
+def test_pd_tail_geom_debug_logs_each_chunk_once():
     layer = _make_layer(k_cpu_ptr=3000, v_cpu_ptr=4000, has_indexer=False)
     layer["p_k_len"] = 1280
     layer["p_v_len"] = 2560
@@ -1640,11 +1640,14 @@ def test_pd_tail_geom_debug_logs_skip_once():
     ):
         thread._append_nano_tail_descriptors(layer, "req-0", [1], 0, [], [], [])
         thread._append_nano_tail_descriptors(layer, "req-0", [1], 0, [], [], [])
+        thread._append_nano_tail_descriptors(layer, "req-0", list(range(8, 16)), 8, [], [], [])
 
-    assert info.call_count == 1
-    args = info.call_args.args
-    assert args[1] == "[PD_TAIL_GEOM]"
-    assert args[4] == 8
-    assert args[6] == 1
-    assert args[8] is True
+    assert info.call_count == 2
+    first, second = info.call_args_list[0].args, info.call_args_list[1].args
+    assert first[1] == "[PD_TAIL_GEOM]"
+    assert first[5] == 0
+    assert first[8] is True
+    assert second[5] == 8
+    assert second[8] is False
+    assert second[9] == 8
 
