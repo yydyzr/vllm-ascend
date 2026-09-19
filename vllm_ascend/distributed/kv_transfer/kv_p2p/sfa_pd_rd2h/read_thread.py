@@ -524,8 +524,9 @@ class MembPullReadThread(threading.Thread):
         if logged is None:
             self._tail_geom_logged = set()
             logged = self._tail_geom_logged
-        if pd_tail_geom_debug_enabled() and offload_id == 0 and ext_req_id not in logged:
-            logged.add(ext_req_id)
+        log_key = (ext_req_id, main_start_block)
+        if pd_tail_geom_debug_enabled() and offload_id == 0 and log_key not in logged:
+            logged.add(log_key)
             p_block_id = None if skipped else int(p_main_block_ids[local_idx])
             logger.info(
                 "%s D pull req=%s layer=%s tail_block_index=%d main_start=%d "
