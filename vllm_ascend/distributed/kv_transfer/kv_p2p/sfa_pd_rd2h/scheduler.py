@@ -27,10 +27,12 @@ from vllm.v1.kv_cache_interface import KVCacheConfig
 
 from vllm_ascend.distributed.kv_transfer.kv_p2p.sfa_pd_rd2h.protocol import (
     BATCH_KV_TRANSFER_PARAMS,
+    PD_TAIL_GEOM_LOG_PREFIX,
     SfaPDConsumerMetadata,
     SfaPDProducerMetadata,
     get_external_request_id,
     infer_sfa_component_group_ids,
+    pd_tail_geom_debug_enabled,
 )
 from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.nano_topk_slots import (
     NanoTopkSlotAllocator,
@@ -340,6 +342,17 @@ class SFAPDRD2HScheduler:
                 tail_block_index,
                 kv_tokens,
             )
+            if pd_tail_geom_debug_enabled():
+                logger.info(
+                    "%s D bind req=%s kv_tokens=%d tail_tokens=%d "
+                    "tail_block_index=%d d_main_blocks=%d",
+                    PD_TAIL_GEOM_LOG_PREFIX,
+                    request.request_id,
+                    kv_tokens,
+                    tail_tokens,
+                    tail_block_index,
+                    len(main_block_ids),
+                )
 
         # Notify P via the metaserver rendezvous that D is ready to pull this
         # request. D does NOT send its block ids to P — D keeps them (passed to

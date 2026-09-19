@@ -17,6 +17,7 @@ from vllm.utils.network_utils import make_zmq_path
 from vllm_ascend.distributed.kv_transfer.kv_p2p.sfa_pd_rd2h.protocol import (
     MF_META,
     MF_META_ACK,
+    PD_TAIL_GEOM_LOG_PREFIX,
     READ_DONE,
     READ_FAILED,
     READ_READY_BATCH,
@@ -24,6 +25,7 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.sfa_pd_rd2h.protocol import (
     LayerMetadata,
     SendTask,
     get_external_request_id,
+    pd_tail_geom_debug_enabled,
 )
 
 THREAD_SHUTDOWN_TIMEOUT_SECONDS = 5.0
@@ -226,6 +228,28 @@ class MembPullSendingThread(threading.Thread):
             else:
                 p_indexer_block_ids, indexer_start_block = [], 0
             ext_id = get_external_request_id(req_id)
+            if (
+                pd_tail_geom_debug_enabled()
+                and layer_idx == self._state.last_layer_idx
+                and rm.chunk_finish
+                and int(getattr(rm, "group_member_idx", 0) or 0) == 0
+            ):
+                logger.info(
+                    "%s P ready req=%s layer=%d member=%s main_start=%d "
+                    "main_blocks=%d first=%s last=%s computed=%d transferred=%d "
+                    "chunk_finish=%s",
+                    PD_TAIL_GEOM_LOG_PREFIX,
+                    ext_id,
+                    layer_idx,
+                    getattr(rm, "group_member_idx", 0),
+                    main_start_block,
+                    len(p_main_block_ids),
+                    p_main_block_ids[0] if p_main_block_ids else None,
+                    p_main_block_ids[-1] if p_main_block_ids else None,
+                    rm.local_computed_tokens,
+                    rm.local_transed_tokens,
+                    rm.chunk_finish,
+                )
             has_endpoint = bool(rm.remote_host) and bool(rm.remote_port)
             chunk_done = layer_idx == self.last_layer_idx and rm.chunk_finish and has_endpoint
             if (p_main_block_ids or p_indexer_block_ids or chunk_done) and has_endpoint:
