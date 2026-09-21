@@ -36,6 +36,10 @@ from vllm.utils.math_utils import cdiv
 
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
+from vllm_ascend.attention.indexer import (
+    INDEXER_K_CACHE_SLOT,
+    INDEXER_SCALE_CACHE_SLOT,
+)
 from vllm_ascend.attention.sfa_v1 import (
     AscendSFAImpl,
     AscendSFAMetadata,
@@ -500,8 +504,6 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
         self.nano_indexer_owner = self
         self._nano_metadata = None
         if self.use_nano:
-            if self.enable_sparse_li_c8:
-                raise NotImplementedError("MTP C8 LIM is built but nano C8 serving is not enabled yet")
             self.nano_hot_tokens = offload_cfg.topk_buffer_size
             requests = self.vllm_config.scheduler_config.max_num_seqs + 2
             tokens = self.vllm_config.scheduler_config.max_num_batched_tokens
@@ -675,13 +677,13 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
             active = attn_metadata.nano_token_active[: slots.numel()]
             indexer_metadata.slot_mapping = torch.where(active, slots, -1)
 
-    def _nano_select(self, query, weights, indexer, indexer_metadata):
+    def _nano_select(self, query, weights, indexer, indexer_metadata, query_scale=None):
         metadata = self._nano_metadata
         count = metadata.nano_pool_entries.numel()
         tokens = metadata.num_decode_tokens
         prefix = metadata.nano_prefix_lens
         cache = metadata.nano_cache_tokens
-        index_cache = indexer.k_cache.kv_cache[0].view(-1, 128, 1, 128)
+        index_cache = indexer.k_cache.kv_cache[INDEXER_K_CACHE_SLOT].view(-1, 128, 1, 128)
         table = indexer_metadata.block_table[:count].contiguous()
         if table.shape[1] * 128 != self.nano_slot_map.shape[1]:
             # The scheduler may pad its logical block-table width. This is
@@ -700,32 +702,70 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
                 -3,
             )
             metadata.nano_states[:count].copy_(rebuild)
-        if self.nano_key_scale is None:
-            self.nano_key_scale = torch.empty(index_cache.shape[:3], dtype=torch.float32, device=query.device)
-            self.nano_query_scale = torch.empty(
-                (self.nano_topk_src.shape[0], query.shape[1]), dtype=torch.float32, device=query.device
+        if self.enable_sparse_li_c8:
+            # Indexer already Hadamard-rotates and int8-quantizes q (matching
+            # the int8 key cache). Fold the per-(token, head) fp16 scale into
+            # npu_fused_li_manage_mtp_c8; do not re-quantize here.
+            n_head = indexer.n_head
+            head_dim = indexer.head_dim
+            if n_head not in (32, 64):
+                raise RuntimeError(f"nano C8 LIM expects 32 or 64 index heads, got {n_head}")
+            if head_dim != 128:
+                raise RuntimeError(f"nano C8 LIM expects head_dim=128, got {head_dim}")
+            query_i8 = query.view(-1, n_head, head_dim)[:tokens].contiguous()
+            if query_scale is None:
+                raise RuntimeError("nano C8 LIM requires query_dequant_scale from the indexer")
+            q_scale = query_scale.view(-1, n_head)[:tokens].to(self.c8_k_scale_cache_dtype).contiguous()
+            key_scale = indexer.k_cache.kv_cache[INDEXER_SCALE_CACHE_SLOT]
+            key_scale = key_scale.view(index_cache.shape[0], 128, 1).to(self.c8_k_scale_cache_dtype).contiguous()
+            torch.ops._C_ascend.npu_fused_li_manage_mtp_c8(
+                weights[:tokens].contiguous().to(torch.bfloat16),
+                q_scale,
+                query_i8,
+                key_scale,
+                index_cache.contiguous(),
+                table,
+                metadata.nano_query_ends,
+                metadata.nano_seq_lens,
+                prefix,
+                cache,
+                metadata.nano_states[:count],
+                metadata.nano_pool_entries,
+                self.nano_slot_map,
+                self.nano_topk_src[:tokens],
+                self.nano_topk_dst[:tokens],
+                self.nano_topk_misses[:tokens],
+                self.nano_miss_src[:count],
+                self.nano_miss_dst[:count],
+                self.nano_misses[:count],
             )
-        torch.ops._C_ascend.npu_fused_li_manage_mtp(
-            weights[:tokens].contiguous(),
-            self.nano_query_scale[:tokens],
-            query[:tokens].contiguous(),
-            self.nano_key_scale,
-            index_cache,
-            table,
-            metadata.nano_query_ends,
-            metadata.nano_seq_lens,
-            prefix,
-            cache,
-            metadata.nano_states[:count],
-            metadata.nano_pool_entries,
-            self.nano_slot_map,
-            self.nano_topk_src[:tokens],
-            self.nano_topk_dst[:tokens],
-            self.nano_topk_misses[:tokens],
-            self.nano_miss_src[:count],
-            self.nano_miss_dst[:count],
-            self.nano_misses[:count],
-        )
+        else:
+            if self.nano_key_scale is None:
+                self.nano_key_scale = torch.empty(index_cache.shape[:3], dtype=torch.float32, device=query.device)
+                self.nano_query_scale = torch.empty(
+                    (self.nano_topk_src.shape[0], query.shape[1]), dtype=torch.float32, device=query.device
+                )
+            torch.ops._C_ascend.npu_fused_li_manage_mtp(
+                weights[:tokens].contiguous(),
+                self.nano_query_scale[:tokens],
+                query[:tokens].contiguous(),
+                self.nano_key_scale,
+                index_cache,
+                table,
+                metadata.nano_query_ends,
+                metadata.nano_seq_lens,
+                prefix,
+                cache,
+                metadata.nano_states[:count],
+                metadata.nano_pool_entries,
+                self.nano_slot_map,
+                self.nano_topk_src[:tokens],
+                self.nano_topk_dst[:tokens],
+                self.nano_topk_misses[:tokens],
+                self.nano_miss_src[:count],
+                self.nano_miss_dst[:count],
+                self.nano_misses[:count],
+            )
         # MTP draft step 0 owns the only LIM invocation. Preserve its cache
         # budget so later draft steps can reuse the compacted LIM outputs
         # without rebuilding source-to-slot metadata.
