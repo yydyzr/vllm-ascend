@@ -691,7 +691,7 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
                 indexer.k_cache.kv_cache[INDEXER_SCALE_CACHE_SLOT],
                 index_cache.shape[0],
             )
-            torch.ops._C_ascend.npu_fused_li_manage_mtp_c8(
+            torch.ops._C_ascend.npu_fused_quant_lightning_indexer_manage(
                 self.nano_c8_weights[:tokens],
                 self.nano_c8_query_scale[:tokens],
                 self.nano_c8_query[:tokens],
