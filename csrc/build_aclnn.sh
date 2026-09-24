@@ -143,6 +143,7 @@ elif [[ "$SOC_VERSION" =~ ^ascend910b ]]; then
         "k2q_csr"
         "msa_index_score"
         "fused_sparse_attention_overlap"
+        "fused_quant_lightning_indexer_manage"
     )
 
     CUSTOM_OPS=$(IFS=';'; echo "${CUSTOM_OPS_ARRAY[*]}")
@@ -205,6 +206,7 @@ elif [[ "$SOC_VERSION" =~ ^ascend910_93 ]]; then
         "k2q_csr"
         "msa_index_score"
         "fused_sparse_attention_overlap"
+        "fused_quant_lightning_indexer_manage"
     )
     CUSTOM_OPS=$(IFS=';'; echo "${CUSTOM_OPS_ARRAY[*]}")
     SOC_ARG="ascend910_93"
