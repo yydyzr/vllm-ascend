@@ -39,6 +39,10 @@ from vllm.v1.utils import CpuGpuBuffer
 
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
+from vllm_ascend.attention.indexer import (
+    INDEXER_K_CACHE_SLOT,
+    INDEXER_SCALE_CACHE_SLOT,
+)
 from vllm_ascend.attention.sfa_v1 import (
     AscendSFAImpl,
     AscendSFAMetadata,
@@ -97,6 +101,8 @@ class AscendSFAOffloadMetadata(AscendSFAMetadata):
 
 M = TypeVar("M", bound=AscendSFAOffloadMetadata)
 _FSA_SELECTION_STATUS_ALIGNMENT = 8
+_LIM_C8_HEAD_DIM = 128
+_LIM_C8_SUPPORTED_HEADS = (32, 64)
 
 
 def prepare_copy_sfa_queries(query, query_rope):
@@ -497,8 +503,6 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
         self.lim_indexer_owner = self
         self._copy_sfa_metadata: AscendSFAOffloadMetadata | None = None
         if self.use_fused_copy_sfa:
-            if self.enable_sparse_li_c8:
-                raise NotImplementedError("Fused Copy-SFA offload does not support sparse LI C8 serving yet")
             self.copy_sfa_hot_tokens = offload_cfg.topk_buffer_size
             requests = self.vllm_config.scheduler_config.max_num_seqs + 2
             tokens = self.vllm_config.scheduler_config.max_num_batched_tokens
@@ -527,6 +531,10 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
                 self.lim_reuse_request_count = 0
                 self.lim_query_scale = None
                 self.lim_key_scale = None
+                self.lim_c8_query = None
+                self.lim_c8_query_scale = None
+                self.lim_c8_weights = None
+                self.lim_c8_key_scale = None
             # Descriptor storage belongs to the attention implementation;
             # per-step source/destination geometry is supplied by metadata.
             self.copy_sfa_copy_src = torch.empty(requests * 4, dtype=torch.int64, device=device)
@@ -665,7 +673,40 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
             self._lim_select if attn_metadata.fused_copy_sfa_enabled and not self.skip_topk else None
         )
 
-    def _lim_select(self, query, weights, indexer, indexer_metadata):
+    def _ensure_lim_c8_buffers(self, n_head: int, device: torch.device, num_blocks: int) -> None:
+        max_tokens = self.lim_topk_src.shape[0]
+        if self.lim_c8_query is None:
+            self.lim_c8_query = torch.empty(
+                (max_tokens, n_head, _LIM_C8_HEAD_DIM), dtype=torch.int8, device=device
+            )
+            self.lim_c8_query_scale = torch.empty((max_tokens, n_head), dtype=torch.float16, device=device)
+            self.lim_c8_weights = torch.empty((max_tokens, n_head), dtype=torch.bfloat16, device=device)
+        if self.lim_c8_key_scale is None:
+            self.lim_c8_key_scale = torch.empty(
+                (num_blocks, _LIM_C8_HEAD_DIM, 1), dtype=torch.float16, device=device
+            )
+
+    def _view_c8_key_scale(self, key_scale: torch.Tensor, num_blocks: int) -> torch.Tensor:
+        """Fold the live indexer scale cache into the C8 LIM ABI [blocks, 128, 1].
+
+        Lightning squeezes the N=1 axis of the 4-D PA_BSND scale cache. A hard
+        ``view(blocks, 128, 1)`` only works when numel already matches; squeeze
+        then reshape covers both ``[B, S, 1, 1]`` and ``[B, S, 1]`` without
+        copying the paged cache.
+        """
+        if key_scale.dim() == 4:
+            key_scale = key_scale.squeeze(2)
+        expected = (num_blocks, _LIM_C8_HEAD_DIM, 1)
+        if tuple(key_scale.shape) != expected:
+            key_scale = key_scale.reshape(*expected)
+        if key_scale.dtype != torch.float16 or not key_scale.is_contiguous():
+            self.lim_c8_key_scale.copy_(
+                key_scale if key_scale.dtype == torch.float16 else key_scale.to(torch.float16)
+            )
+            return self.lim_c8_key_scale
+        return key_scale
+
+    def _lim_select(self, query, weights, indexer, indexer_metadata, query_scale=None):
         metadata = self._copy_sfa_metadata
         assert metadata is not None and metadata.copy_sfa_pool_entries is not None
         count = metadata.copy_sfa_pool_entries.numel()
@@ -673,35 +714,83 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
         request_state = metadata.lim_request_state
         prefix = metadata.copy_sfa_prefix_lens
         cache = metadata.copy_sfa_cache_tokens
-        index_cache = indexer.k_cache.kv_cache[0].view(-1, 128, 1, 128)
+        # Keep the paged cache view; do not contiguous() the full key arena.
+        index_cache = indexer.k_cache.kv_cache[INDEXER_K_CACHE_SLOT].view(-1, 128, 1, 128)
         table = indexer_metadata.block_table[:count].contiguous()
-        if self.lim_key_scale is None:
-            self.lim_key_scale = torch.empty(index_cache.shape[:3], dtype=torch.float32, device=query.device)
-            self.lim_query_scale = torch.empty(
-                (self.lim_topk_src.shape[0], query.shape[1]), dtype=torch.float32, device=query.device
+        if self.enable_sparse_li_c8:
+            n_head = indexer.n_head
+            if n_head not in _LIM_C8_SUPPORTED_HEADS:
+                raise RuntimeError(f"C8 LIM expects 32 or 64 index heads, got {n_head}")
+            if indexer.head_dim != _LIM_C8_HEAD_DIM:
+                raise RuntimeError(f"C8 LIM expects head_dim={_LIM_C8_HEAD_DIM}, got {indexer.head_dim}")
+            if query_scale is None:
+                raise RuntimeError("C8 LIM requires query_dequant_scale from the indexer")
+            self._ensure_lim_c8_buffers(n_head, query.device, index_cache.shape[0])
+            # Indexer already Hadamard-rotates and int8-quantizes q. Copy into
+            # graph-fixed buffers so ACLGraph does not capture per-step
+            # contiguous()/to() allocations.
+            self.lim_c8_query[:tokens].copy_(query.view(-1, n_head, _LIM_C8_HEAD_DIM)[:tokens])
+            q_scale = query_scale.view(-1, n_head)[:tokens]
+            if q_scale.dtype != torch.float16:
+                q_scale = q_scale.to(self.c8_k_scale_cache_dtype)
+            self.lim_c8_query_scale[:tokens].copy_(q_scale)
+            w = weights[:tokens]
+            if w.dtype != torch.bfloat16:
+                w = w.to(torch.bfloat16)
+            self.lim_c8_weights[:tokens].copy_(w)
+            key_scale = self._view_c8_key_scale(
+                indexer.k_cache.kv_cache[INDEXER_SCALE_CACHE_SLOT],
+                index_cache.shape[0],
             )
-        assert self.lim_query_scale is not None
-        torch.ops._C_ascend.npu_fused_lightning_indexer_manage(
-            weights[:tokens].contiguous(),
-            self.lim_query_scale[:tokens],
-            query[:tokens].contiguous(),
-            self.lim_key_scale,
-            index_cache,
-            table,
-            metadata.copy_sfa_query_ends,
-            metadata.copy_sfa_seq_lens,
-            prefix,
-            cache,
-            request_state,
-            metadata.copy_sfa_pool_entries,
-            self.lim_slot_map,
-            self.lim_topk_src[:tokens],
-            self.lim_topk_dst[:tokens],
-            self.lim_topk_misses[:tokens],
-            self.lim_miss_src[:count],
-            self.lim_miss_dst[:count],
-            self.lim_misses[:count],
-        )
+            torch.ops._C_ascend.npu_fused_quant_lightning_indexer_manage(
+                self.lim_c8_weights[:tokens],
+                self.lim_c8_query_scale[:tokens],
+                self.lim_c8_query[:tokens],
+                key_scale,
+                index_cache,
+                table,
+                metadata.copy_sfa_query_ends,
+                metadata.copy_sfa_seq_lens,
+                prefix,
+                cache,
+                request_state,
+                metadata.copy_sfa_pool_entries,
+                self.lim_slot_map,
+                self.lim_topk_src[:tokens],
+                self.lim_topk_dst[:tokens],
+                self.lim_topk_misses[:tokens],
+                self.lim_miss_src[:count],
+                self.lim_miss_dst[:count],
+                self.lim_misses[:count],
+            )
+        else:
+            if self.lim_key_scale is None:
+                self.lim_key_scale = torch.empty(index_cache.shape[:3], dtype=torch.float32, device=query.device)
+                self.lim_query_scale = torch.empty(
+                    (self.lim_topk_src.shape[0], query.shape[1]), dtype=torch.float32, device=query.device
+                )
+            assert self.lim_query_scale is not None
+            torch.ops._C_ascend.npu_fused_lightning_indexer_manage(
+                weights[:tokens].contiguous(),
+                self.lim_query_scale[:tokens],
+                query[:tokens].contiguous(),
+                self.lim_key_scale,
+                index_cache,
+                table,
+                metadata.copy_sfa_query_ends,
+                metadata.copy_sfa_seq_lens,
+                prefix,
+                cache,
+                request_state,
+                metadata.copy_sfa_pool_entries,
+                self.lim_slot_map,
+                self.lim_topk_src[:tokens],
+                self.lim_topk_dst[:tokens],
+                self.lim_topk_misses[:tokens],
+                self.lim_miss_src[:count],
+                self.lim_miss_dst[:count],
+                self.lim_misses[:count],
+            )
         if metadata.copy_sfa_reuse_logical_lens is not None:
             # Only draft step 0 saves the selection for later MTP forwards.
             # Target layers consume their current metadata directly.
